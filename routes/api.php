@@ -1,7 +1,9 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\AuthorizationController;
 use App\Http\Controllers\Api\FeeHeadController;
+use App\Http\Controllers\Api\FinancialController;
 use App\Http\Controllers\Api\MasterSettingsController;
 use App\Http\Controllers\Api\RegistrationController;
 use App\Http\Controllers\Api\SmsTemplateController;
@@ -19,6 +21,7 @@ use App\Http\Controllers\Api\AmendmentController;
 use App\Http\Controllers\Api\CertificateController;
 use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\ReportController;
+use App\Http\Controllers\College\FeesController;
 use Illuminate\Support\Facades\Route;
 
 // ─── Public Routes ─────────────────────────────────────────────────────────────
@@ -86,11 +89,39 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('students/statistics', [StudentController::class, 'statistics']);
 
         // Applications (Office view)
-        Route::get('applications', [ApplicationController::class, 'index']);
-        Route::get('applications/{application}', [ApplicationController::class, 'show']);
-        Route::post('applications/{application}/approve', [ApplicationController::class, 'approve']);
-        Route::post('applications/{application}/reject', [ApplicationController::class, 'reject']);
-        Route::get('applications/statistics', [ApplicationController::class, 'statistics']);
+        Route::prefix('applications')->group(function () {
+
+            // Fresh Applications
+            Route::get('/', [ApplicationController::class, 'index']);
+            Route::get('/{id}', [ApplicationController::class, 'show']);
+            Route::get('/lookup-student', [ApplicationController::class, 'lookupStudent']);
+
+            // Hold management
+            Route::get('/hold', [ApplicationController::class, 'holdIndex']);
+            Route::post('/hold', [ApplicationController::class, 'holdStore']);
+            Route::patch('/{id}/release-hold', [ApplicationController::class, 'holdRelease']);
+
+            // Back Paper
+            Route::prefix('back-paper')->group(function () {
+                Route::get('/', [ApplicationController::class, 'backPaperIndex']);
+                Route::get('/papers', [ApplicationController::class, 'backPaperPapers']);
+                Route::post('/', [ApplicationController::class, 'backPaperStore']);
+            });
+
+            // Semester Upgrade
+            Route::prefix('upgrade')->group(function () {
+                Route::get('/', [ApplicationController::class, 'upgradeIndex']);
+                Route::post('/', [ApplicationController::class, 'upgradeStore']);
+                Route::patch('/{id}/status', [ApplicationController::class, 'upgradeUpdateStatus']);
+            });
+
+            // Registration Form Status (summary)
+            Route::get('/registration-form-status', [ApplicationController::class, 'registrationFormStatus']);
+
+            // Document upload/delete
+            Route::post('/documents', [ApplicationController::class, 'uploadDocument']);
+            Route::delete('/documents/{id}', [ApplicationController::class, 'deleteDocument']);
+        });
 
         // Admissions
         Route::apiResource('admissions', AdmissionController::class)->except(['store', 'destroy']);
@@ -214,11 +245,122 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('lookup-student', [ExaminationController::class, 'lookupStudent']);
         });
 
-        // Amendments
-        Route::get('amendments', [AmendmentController::class, 'index']);
-        Route::get('amendments/{amendment}', [AmendmentController::class, 'show']);
-        Route::post('amendments/{amendment}/approve', [AmendmentController::class, 'approve']);
-        Route::post('amendments/{amendment}/reject', [AmendmentController::class, 'reject']);
+        // ── Amendment ───────────────────────────────────────────────────────
+        Route::prefix('amendments')->group(function () {
+
+            // Search
+            Route::get('/search', [AmendmentController::class, 'search']);
+
+            // Modify student data
+            Route::get('/modify-data', [AmendmentController::class, 'modifyGet']);
+            Route::patch('/modify-data', [AmendmentController::class, 'modifyUpdate']);
+
+            // Subject change
+            Route::get('/subject-change', [AmendmentController::class, 'subjectChangeGet']);
+            Route::post('/subject-change', [AmendmentController::class, 'subjectChangeStore']);
+
+            // Update mobile
+            Route::get('/update-mobile', [AmendmentController::class, 'updateMobileGet']);
+            Route::post('/update-mobile', [AmendmentController::class, 'updateMobileStore']);
+            Route::post('/update-mobile/send-otp', [AmendmentController::class, 'sendOtp']);
+
+            // Update TC & Migration
+            Route::get('/update-tc', [AmendmentController::class, 'updateTcGet']);
+            Route::post('/update-tc', [AmendmentController::class, 'updateTcStore']);
+
+            // Update paper for student
+            Route::get('/update-paper', [AmendmentController::class, 'updatePaperIndex']);
+            Route::post('/update-paper', [AmendmentController::class, 'updatePaperStore']);
+
+            // Download documents
+            Route::get('/download-documents', [AmendmentController::class, 'downloadDocuments']);
+
+            // Import / export data
+            Route::post('/import-data', [AmendmentController::class, 'importData']);
+
+            // Fee value change
+            Route::get('/fee-value-change', [AmendmentController::class, 'feeValueChangeGet']);
+            Route::post('/fee-value-change', [AmendmentController::class, 'feeValueChangeStore']);
+
+            // Fee reset
+            Route::get('/fee-reset', [AmendmentController::class, 'feeResetGet']);
+            Route::post('/fee-reset', [AmendmentController::class, 'feeResetStore']);
+
+            // Block / Unblock
+            Route::get('/block-unblock', [AmendmentController::class, 'blockUnblockGet']);
+            Route::post('/block-unblock', [AmendmentController::class, 'blockUnblockStore']);
+
+            // Restriction
+            Route::get('/restriction', [AmendmentController::class, 'restrictionIndex']);
+            Route::post('/restriction', [AmendmentController::class, 'restrictionStore']);
+            Route::delete('/restriction/{studentId}', [AmendmentController::class, 'restrictionRemove']);
+
+            // Admission cancel
+            Route::get('/admission-cancel', [AmendmentController::class, 'admissionCancelGet']);
+            Route::post('/admission-cancel', [AmendmentController::class, 'admissionCancelStore']);
+
+            // Hold or cancel — by college
+            Route::get('/hold-cancel', [AmendmentController::class, 'holdCancelIndex']);
+            Route::post('/hold-cancel', [AmendmentController::class, 'holdCancelStore']);
+
+            // Amendment log / approval
+            Route::get('/logs', [AmendmentController::class, 'logIndex']);
+            Route::patch('/logs/{id}/approve', [AmendmentController::class, 'logApprove']);
+        });
+
+        Route::prefix('authorizations')->group(function () {
+            // 1. Admission Verification — Odd semesters (1,3,5,7)
+            Route::get('/admission-verification', [AuthorizationController::class, 'admissionVerificationIndex']);
+            Route::get('/admission-verification/{admissionId}', [AuthorizationController::class, 'admissionVerificationShow']);
+            Route::post('/admission-verification/{admissionId}/action', [AuthorizationController::class, 'admissionVerificationAction']);
+
+            // 2. Semester Registration Approval — Even semesters (2,4,6,8)
+            Route::get('/semester-approval', [AuthorizationController::class, 'semesterApprovalIndex']);
+            Route::post('/semester-approval/{admissionId}/action', [AuthorizationController::class, 'semesterApprovalAction']);
+
+            // 3. Fee Receipt Verification
+            Route::get('/fee-receipt', [AuthorizationController::class, 'feeReceiptIndex']);
+            Route::post('/fee-receipt/{id}/verify', [AuthorizationController::class, 'feeReceiptVerify']);
+
+            // 4. Misc. Activity Verification
+            Route::get('/misc-activity', [AuthorizationController::class, 'miscActivityIndex']);
+            Route::post('/misc-activity/{id}/action', [AuthorizationController::class, 'miscActivityAction']);
+
+            // 5. Block / Unblock User
+            Route::get('/block-unblock', [AuthorizationController::class, 'blockUnblockSearch']);
+            Route::post('/block-unblock', [AuthorizationController::class, 'blockUnblockAction']);
+        });
+
+        Route::prefix('financial')->group(function () {
+
+            // 1. Create Fee Transfer Voucher
+            Route::get('/fee-transfer-voucher', [FinancialController::class, 'feeTransferVoucherIndex']);
+            Route::post('/fee-transfer-voucher', [FinancialController::class, 'feeTransferVoucherStore']);
+
+            // 2. Online Fee Accept
+            Route::get('/online-fee-accept', [FinancialController::class, 'onlineFeeAcceptSearch']);
+            Route::post('/online-fee-accept', [FinancialController::class, 'onlineFeeAcceptStore']);
+
+            // 3. Update Transaction
+            Route::get('/update-transaction', [FinancialController::class, 'updateTransactionSearch']);
+            Route::post('/update-transaction', [FinancialController::class, 'updateTransactionStore']);
+        });
+
+        Route::prefix('fees')->group(function () {
+
+            // All Fee Receipts — paginated list with filters
+            Route::get('receipts', [FeesController::class, 'receiptsIndex']);
+
+            // Verify Fee Receipts — list pending, verify/reject
+            Route::get('verify', [FeesController::class, 'verifyIndex']);
+            Route::post('verify/{id}/{act}', [FeesController::class, 'verifyAction']);  // act = verify|reject
+
+            // Student Ledger — per-student transaction history
+            Route::get('ledger', [FeesController::class, 'ledgerIndex']);
+
+            // Financial Summary — aggregate stats
+            Route::get('summary', [FeesController::class, 'summaryIndex']);
+        });
 
         // Certificates
         Route::apiResource('certificates', CertificateController::class)->except('destroy');
@@ -336,40 +478,73 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // ── STUDENT PORTAL ────────────────────────────────────────────────────
-    Route::middleware('portal:student')->prefix('student')->group(function () {
+    // Route::middleware('portal:student')->prefix('student')->group(function () {
 
-        // Profile
+    //     // Profile
+    //     Route::get('profile', [StudentController::class, 'myProfile']);
+    //     Route::put('profile', [StudentController::class, 'updateProfile']);
+
+    //     // Applications
+    //     Route::get('applications/{application}', [ApplicationController::class, 'show']);
+    //     Route::get('applications', [ApplicationController::class, 'myApplications']);
+    //     Route::post('applications', [ApplicationController::class, 'store']);
+    //     Route::put('applications/{application}/part/{part}', [ApplicationController::class, 'updatePart']);
+    //     Route::post('applications/{application}/submit', [ApplicationController::class, 'submit']);
+
+    //     // Documents
+    //     Route::post('documents', [\App\Http\Controllers\Api\DocumentController::class, 'upload']);
+    //     Route::get('documents', [\App\Http\Controllers\Api\DocumentController::class, 'myDocuments']);
+
+    //     // Fee Receipts
+    //     Route::get('fee-receipts', [FeeReceiptController::class, 'myReceipts']);
+    //     Route::get('fee-receipts/{r}/download', [FeeReceiptController::class, 'download']);
+
+    //     // Exam
+    //     Route::get('examinations', [ExaminationController::class, 'available']);
+    //     Route::post('exam-applications', [ExaminationController::class, 'applyExam']);
+    //     Route::get('exam-applications/my', [ExaminationController::class, 'myApplications']);
+    //     Route::get('exam-applications/{app}/admit-card', [ExaminationController::class, 'myAdmitCard']);
+
+    //     // Certificates
+    //     Route::get('certificates', [CertificateController::class, 'myCertificates']);
+    //     Route::get('certificates/{c}/download', [CertificateController::class, 'download']);
+
+    //     // Amendments
+    //     Route::post('amendments', [AmendmentController::class, 'store']);
+    //     Route::get('amendments', [AmendmentController::class, 'myAmendments']);
+
+    //     Route::get('programs', [ProgramController::class, 'index']);
+    // });
+
+    Route::middleware(['auth:sanctum', 'portal:student'])->prefix('student')->group(function () {
+
+        // ── Lookup ────────────────────────────────────────────────────────────────
+        // FIX: was missing — /programs was behind portal:college, blocking students
+        Route::get('programs', [ProgramController::class, 'index']);
+
+        // ── Student profile ───────────────────────────────────────────────────────
         Route::get('profile', [StudentController::class, 'myProfile']);
         Route::put('profile', [StudentController::class, 'updateProfile']);
 
-        // Applications
-        Route::get('applications', [ApplicationController::class, 'myApplications']);
-        Route::post('applications', [ApplicationController::class, 'store']);
-        Route::get('applications/{application}', [ApplicationController::class, 'show']);
-        Route::put('applications/{application}/part/{part}', [ApplicationController::class, 'updatePart']);
-        Route::post('applications/{application}/submit', [ApplicationController::class, 'submit']);
+        // ── Student Applications ──────────────────────────────────────────────────
+        // These were MISSING — caused "Application not found" when opening /student/applications/{id}
+        Route::prefix('applications')->group(function () {
 
-        // Documents
-        Route::post('documents', [\App\Http\Controllers\Api\DocumentController::class, 'upload']);
-        Route::get('documents', [\App\Http\Controllers\Api\DocumentController::class, 'myDocuments']);
+            // List + Create
+            Route::get('/', [ApplicationController::class, 'myApplications']);
+            Route::post('/', [ApplicationController::class, 'store']);
 
-        // Fee Receipts
-        Route::get('fee-receipts', [FeeReceiptController::class, 'myReceipts']);
-        Route::get('fee-receipts/{r}/download', [FeeReceiptController::class, 'download']);
+            // Single application — show, update a part, submit
+            Route::get('/{id}', [ApplicationController::class, 'show']);
+            Route::put('/{id}/part/{part}', [ApplicationController::class, 'updatePart']);
+            Route::post('/{id}/submit', [ApplicationController::class, 'submit']);
 
-        // Exam
-        Route::get('examinations', [ExaminationController::class, 'available']);
-        Route::post('exam-applications', [ExaminationController::class, 'applyExam']);
-        Route::get('exam-applications/my', [ExaminationController::class, 'myApplications']);
-        Route::get('exam-applications/{app}/admit-card', [ExaminationController::class, 'myAdmitCard']);
+            // Document upload for an application
+            Route::post('/{id}/documents', [ApplicationController::class, 'uploadStudentDocument']);
+        });
 
-        // Certificates
-        Route::get('certificates', [CertificateController::class, 'myCertificates']);
-        Route::get('certificates/{c}/download', [CertificateController::class, 'download']);
-
-        // Amendments
-        Route::post('amendments', [AmendmentController::class, 'store']);
-        Route::get('amendments', [AmendmentController::class, 'myAmendments']);
+        // ── Program subjects (used by Part 6 subject selection) ───────────────────
+        Route::get('programs/{programId}/subjects', [ProgramController::class, 'subjects']);
     });
 
     // ── UNIVERSITY PORTAL ────────────────────────────────────────────────

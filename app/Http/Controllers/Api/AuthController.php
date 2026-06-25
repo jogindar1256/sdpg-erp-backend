@@ -14,18 +14,23 @@ use Illuminate\Validation\ValidationException;
 class AuthController extends Controller
 {
     /**
-     * Login for College Staff / Admin / University portals
+     * Employee login — all staff roles (Admin, Verifier, Super Admin, etc.)
+     * belong to portal = 'college'. The role itself is returned via Spatie roles[].
      */
     public function login(Request $request): JsonResponse
     {
         $request->validate([
             'email'    => 'required|email',
             'password' => 'required|string',
-            'portal'   => 'required|in:college,university,super_admin',
+            'portal'   => 'required|in:college',   // only college portal for employees
+            'session'  => 'nullable|string',
         ]);
 
+        // Accept college, super_admin, AND legacy 'university' portal values.
+        // All employee accounts belong to 'college' conceptually — 'university' was
+        // the old value before the rename. We auto-migrate them below.
         $user = User::where('email', $request->email)
-                    ->where('portal', $request->portal)
+                    ->whereIn('portal', ['college', 'super_admin', 'university'])
                     ->first();
 
         if (!$user || !Hash::check($request->password, $user->password)) {
@@ -35,11 +40,18 @@ class AuthController extends Controller
         }
 
         if (!$user->is_active) {
-            return response()->json(['message' => 'Your account has been deactivated. Contact admin.'], 403);
+            return response()->json([
+                'message' => 'Your account has been deactivated. Contact the administrator.',
+            ], 403);
         }
 
-        // Record last login
+        // Auto-migrate legacy portal values to 'college' on successful login
+        if (in_array($user->portal, ['university', 'super_admin'])) {
+            $user->portal = 'college';
+        }
+
         $user->update([
+            'portal'        => $user->portal,
             'last_login_at' => now(),
             'last_login_ip' => $request->ip(),
         ]);
@@ -47,14 +59,15 @@ class AuthController extends Controller
         $token = $user->createToken('erp-token', $this->getAbilitiesForUser($user))->plainTextToken;
 
         return response()->json([
-            'user'         => $this->formatUser($user),
-            'token'        => $token,
-            'token_type'   => 'Bearer',
+            'user'       => $this->formatUser($user),
+            'token'      => $token,
+            'token_type' => 'Bearer',
         ]);
     }
 
     /**
-     * Login for Students (mobile number + password or OTP)
+     * Student login — mobile number + password.
+     * Students are separate from employees and always use portal = 'student'.
      */
     public function studentLogin(Request $request): JsonResponse
     {
@@ -66,33 +79,44 @@ class AuthController extends Controller
         $student = Student::where('mobile', $request->mobile)->first();
 
         if (!$student || !$student->user) {
-            throw ValidationException::withMessages(['mobile' => ['Student not found.']]);
+            throw ValidationException::withMessages([
+                'mobile' => ['Student not found. Check your mobile number.'],
+            ]);
         }
 
         $user = $student->user;
 
         if (!Hash::check($request->password, $user->password)) {
-            throw ValidationException::withMessages(['mobile' => ['Invalid credentials.']]);
+            throw ValidationException::withMessages([
+                'mobile' => ['Invalid password.'],
+            ]);
         }
 
         if ($student->is_blocked) {
-            return response()->json(['message' => "Your account is blocked. Reason: {$student->block_reason}"], 403);
+            return response()->json([
+                'message' => "Your account is blocked. Reason: {$student->block_reason}",
+            ], 403);
         }
 
-        $user->update(['last_login_at' => now(), 'last_login_ip' => $request->ip()]);
+        $user->update([
+            'last_login_at' => now(),
+            'last_login_ip' => $request->ip(),
+        ]);
 
         $token = $user->createToken('student-token', ['student:access'])->plainTextToken;
 
         return response()->json([
             'user'       => $this->formatUser($user),
-            'student'    => $student->only(['id', 'enrollment_no', 'full_name', 'mobile', 'photo_path', 'status']),
+            'student'    => $student->only([
+                'id', 'enrollment_no', 'full_name', 'mobile', 'photo_path', 'status',
+            ]),
             'token'      => $token,
             'token_type' => 'Bearer',
         ]);
     }
 
     /**
-     * Logout — revoke current token
+     * Logout — revoke current Sanctum token.
      */
     public function logout(Request $request): JsonResponse
     {
@@ -101,7 +125,7 @@ class AuthController extends Controller
     }
 
     /**
-     * Get authenticated user
+     * Return the authenticated user's profile.
      */
     public function me(Request $request): JsonResponse
     {
@@ -110,7 +134,7 @@ class AuthController extends Controller
     }
 
     /**
-     * Change password
+     * Change password — revokes all other tokens for security.
      */
     public function changePassword(Request $request): JsonResponse
     {
@@ -122,16 +146,20 @@ class AuthController extends Controller
         $user = $request->user();
 
         if (!Hash::check($request->current_password, $user->password)) {
-            throw ValidationException::withMessages(['current_password' => ['Current password is incorrect.']]);
+            throw ValidationException::withMessages([
+                'current_password' => ['Current password is incorrect.'],
+            ]);
         }
 
         $user->update(['password' => Hash::make($request->new_password)]);
 
-        // Revoke all other tokens for security
+        // Revoke all other active tokens
         $user->tokens()->where('id', '!=', $user->currentAccessToken()->id)->delete();
 
         return response()->json(['message' => 'Password changed successfully.']);
     }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────────
 
     private function formatUser(User $user): array
     {
