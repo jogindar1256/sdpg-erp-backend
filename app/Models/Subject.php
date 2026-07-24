@@ -14,7 +14,8 @@ class Subject extends Model
     protected $fillable = [
         'program_id', 'name', 'code', 'semester_no', 'type',
         'paper_type', 'max_marks', 'min_marks', 'internal_marks',
-        'credits', 'is_active',
+        'credits', 'is_active', 'has_practical', 'practical_fee',
+        'additional_fee_applicable', 'additional_fee',
     ];
 
     protected $casts = [

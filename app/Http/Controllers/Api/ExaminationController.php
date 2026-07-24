@@ -2,13 +2,26 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Http\Concerns\ResolvesStudentIdentity;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 
+/**
+ * REBUILT. This entire module referenced 11 tables that were never
+ * migrated — applied now in 2026_07_20_110000_create_examination_tables.php,
+ * matching this controller's own (already coherent) column usage. Also
+ * fixed: students has no name/father_name/mother_name/dob/address (those
+ * live on direct_registrations / students.permanent_address), and
+ * admissions has no roll_no/enrollment_no (real equivalents are
+ * students.university_roll_no and students.enrollment_no — admissions.
+ * account_no is real and unchanged).
+ */
 class ExaminationController extends Controller
 {
+    use ResolvesStudentIdentity;
+
     // ══════════════════════════════════════════════════════════════
     // HELPERS
     // ══════════════════════════════════════════════════════════════
@@ -17,24 +30,59 @@ class ExaminationController extends Controller
         return request('session_year', date('Y') . '-' . (date('Y') + 1));
     }
 
+    /** Shared student-identity join, applied wherever 's.name'/'s.father_name' were used. */
+    private function withIdentity($query, string $studentAlias = 's')
+    {
+        $latestReg = $this->latestRegistrationSub();
+        return $query
+            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', "{$studentAlias}.user_id")
+            ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id');
+    }
+
+    private function identitySelect(string $studentAlias = 's'): array
+    {
+        return [
+            "{$studentAlias}.first_name", "{$studentAlias}.middle_name", "{$studentAlias}.last_name",
+            'dr.name as reg_name', 'dr.father_name', 'dr.mother_name',
+        ];
+    }
+
+    private function decorate($row)
+    {
+        if (!$row) return $row;
+        $row->name = !empty($row->reg_name) ? $row->reg_name
+            : trim(implode(' ', array_filter([$row->first_name ?? null, $row->middle_name ?? null, $row->last_name ?? null])));
+        return $row;
+    }
+
+    private function decorateCollection($rows)
+    {
+        foreach ($rows as $r) $this->decorate($r);
+        return $rows;
+    }
+
     // ══════════════════════════════════════════════════════════════
     // 1. ACCEPT EXAM FORM
     // ══════════════════════════════════════════════════════════════
     public function acceptFormIndex(Request $req)
     {
-        $q = DB::table('exam_forms as ef')
-            ->join('admissions as a', 'a.id', 'ef.admission_id')
-            ->join('students as s', 's.id', 'a.student_id')
-            ->join('programs as p', 'p.id', 'a.program_id')
-            ->select('ef.*', 's.name', 's.father_name', 's.mobile',
-                     'a.roll_no', 'a.account_no', 'p.short_name as class')
+        $q = $this->withIdentity(
+            DB::table('exam_forms as ef')
+                ->join('admissions as a', 'a.id', 'ef.admission_id')
+                ->join('students as s', 's.id', 'a.student_id')
+                ->join('programs as p', 'p.id', 'a.program_id')
+        )
+            ->select(array_merge(['ef.*', 's.university_roll_no as roll_no', 'a.account_no', 'p.short_name as class'], $this->identitySelect()))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
             ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
             ->when($req->status,      fn($q) => $q->where('ef.status',      $req->status));
 
-        return response()->json($q->paginate(50));
+        $records = $q->paginate(50);
+        $records->getCollection()->transform(fn ($r) => $this->decorate($r));
+
+        return response()->json($records);
     }
 
     public function acceptFormUpdate(Request $req, $id)
@@ -52,7 +100,6 @@ class ExaminationController extends Controller
 
     public function acceptFormBulk(Request $req)
     {
-        // Accept all filtered records
         DB::table('exam_forms')
             ->where('session_year', $req->session_year)
             ->when($req->program_id,  fn($q) => $q->whereIn('admission_id',
@@ -68,17 +115,22 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function formIdIndex(Request $req)
     {
-        return DB::table('exam_forms as ef')
-            ->join('admissions as a', 'a.id', 'ef.admission_id')
-            ->join('students as s', 's.id', 'a.student_id')
-            ->join('programs as p', 'p.id', 'a.program_id')
-            ->select('ef.*', 's.name', 's.father_name', 's.gender',
-                     'a.roll_no', 'a.account_no', 'a.enrollment_no', 'p.short_name as class')
+        $q = $this->withIdentity(
+            DB::table('exam_forms as ef')
+                ->join('admissions as a', 'a.id', 'ef.admission_id')
+                ->join('students as s', 's.id', 'a.student_id')
+                ->join('programs as p', 'p.id', 'a.program_id')
+        )
+            ->select(array_merge(['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as class'], $this->identitySelect()))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
-            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-            ->paginate(50);
+            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type));
+
+        $records = $q->paginate(50);
+        $records->getCollection()->transform(fn ($r) => $this->decorate($r));
+
+        return $records;
     }
 
     public function formIdUpdate(Request $req, $id)
@@ -126,7 +178,7 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('exam_schedules')->insertGetId(array_merge($req->all(), [
+        $id = DB::table('exam_schedules')->insertGetId(array_merge($v->validated(), [
             'created_at' => now(), 'updated_at' => now(),
         ]));
         return response()->json(['id' => $id, 'message' => 'Schedule entry saved.'], 201);
@@ -138,7 +190,6 @@ class ExaminationController extends Controller
         return response()->json(['message' => 'Deleted.']);
     }
 
-    // Schedule — Search
     public function scheduleSearch(Request $req)
     {
         $q = DB::table('exam_schedules as es')
@@ -162,7 +213,6 @@ class ExaminationController extends Controller
         return response()->json($q->orderBy('es.exam_date')->get());
     }
 
-    // Schedule — Update
     public function scheduleUpdate(Request $req, $id)
     {
         DB::table('exam_schedules')->where('id', $id)->update(array_merge(
@@ -176,7 +226,6 @@ class ExaminationController extends Controller
     // 4. EXAM SEATING PLAN
     // ══════════════════════════════════════════════════════════════
 
-    // Room Master
     public function roomMasterIndex()
     {
         return response()->json(DB::table('exam_rooms')->orderBy('room_no')->get());
@@ -195,7 +244,7 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('exam_rooms')->insertGetId(array_merge($req->all(), [
+        $id = DB::table('exam_rooms')->insertGetId(array_merge($v->validated(), [
             'created_at' => now(), 'updated_at' => now(),
         ]));
         return response()->json(['id' => $id, 'message' => 'Room saved.'], 201);
@@ -204,7 +253,7 @@ class ExaminationController extends Controller
     public function roomMasterUpdate(Request $req, $id)
     {
         DB::table('exam_rooms')->where('id', $id)->update(array_merge(
-            $req->only(['room_no','building_name','rows','columns','capacity','extra_seat','is_active']),
+            $req->only(['room_no', 'building_name', 'rows', 'columns', 'capacity', 'extra_seat', 'is_active']),
             ['updated_at' => now()]
         ));
         return response()->json(['message' => 'Updated.']);
@@ -216,7 +265,6 @@ class ExaminationController extends Controller
         return response()->json(['message' => 'Deleted.']);
     }
 
-    // Inning Setting
     public function inningIndex()
     {
         return response()->json(DB::table('exam_innings')->orderBy('id')->get());
@@ -232,7 +280,7 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('exam_innings')->insertGetId(array_merge($req->all(), [
+        $id = DB::table('exam_innings')->insertGetId(array_merge($v->validated(), [
             'created_at' => now(), 'updated_at' => now(),
         ]));
         return response()->json(['id' => $id, 'message' => 'Inning saved.'], 201);
@@ -241,7 +289,7 @@ class ExaminationController extends Controller
     public function inningUpdate(Request $req, $id)
     {
         DB::table('exam_innings')->where('id', $id)->update(array_merge(
-            $req->only(['inning_name','time_start','time_end']),
+            $req->only(['inning_name', 'time_start', 'time_end']),
             ['updated_at' => now()]
         ));
         return response()->json(['message' => 'Updated.']);
@@ -253,7 +301,6 @@ class ExaminationController extends Controller
         return response()->json(['message' => 'Deleted.']);
     }
 
-    // Seating Plan — Create
     public function seatingPlanCreate(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -261,11 +308,10 @@ class ExaminationController extends Controller
             'exam_date'    => 'required|date',
             'inning_id'    => 'required|exists:exam_innings,id',
             'exam_type'    => 'required|in:Regular,Back Paper',
-            'gender'       => 'nullable|in:Male,Female,Trans,All',
+            'gender'       => 'nullable|in:male,female,other,All',
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        // Get eligible exam forms for this date/inning
         $schedules = DB::table('exam_schedules')
             ->where('session_year', $req->session_year)
             ->where('exam_date', $req->exam_date)
@@ -281,12 +327,11 @@ class ExaminationController extends Controller
             ->where('ef.exam_type', $req->exam_type)
             ->when($req->gender && $req->gender !== 'All', fn($q) => $q->where('s.gender', $req->gender))
             ->where('ef.status', 'Accepted')
-            ->select('s.id as student_id', 's.name', 'a.roll_no', 'efp.paper_code')
+            ->select('s.id as student_id', 's.university_roll_no as roll_no', 'efp.paper_code')
             ->get();
 
         $rooms = DB::table('exam_rooms')->where('is_active', true)->orderBy('building_name')->orderBy('room_no')->get();
 
-        // Simple sequential seat allocation
         $seats = [];
         $roomIdx = 0;
         $seatIdx = 0;
@@ -305,8 +350,7 @@ class ExaminationController extends Controller
                 ['room_id' => $room->id, 'row_no' => $row, 'col_no' => $col,
                  'updated_at' => now(), 'created_at' => now()]
             );
-            $seats[] = ['student' => $student->name, 'roll' => $student->roll_no,
-                        'room' => $room->room_no, 'row' => $row, 'col' => $col];
+            $seats[] = ['roll' => $student->roll_no, 'room' => $room->room_no, 'row' => $row, 'col' => $col];
 
             $seatIdx++;
             if ($seatIdx >= $capacity) { $roomIdx++; $seatIdx = 0; }
@@ -315,20 +359,22 @@ class ExaminationController extends Controller
         return response()->json(['message' => count($seats) . ' seats allocated.', 'count' => count($seats)]);
     }
 
-    // Search Examinee Seat
     public function searchSeat(Request $req)
     {
         $v = Validator::make($req->all(), ['roll_no' => 'required|string']);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $admission = DB::table('admissions as a')
-            ->join('students as s', 's.id', 'a.student_id')
-            ->join('programs as p', 'p.id', 'a.program_id')
-            ->where('a.roll_no', $req->roll_no)
-            ->select('a.*', 's.name', 's.father_name', 's.mobile', 's.address', 'p.short_name as class')
+        $admission = $this->withIdentity(
+            DB::table('admissions as a')
+                ->join('students as s', 's.id', 'a.student_id')
+                ->join('programs as p', 'p.id', 'a.program_id')
+        )
+            ->where('s.university_roll_no', $req->roll_no)
+            ->select(array_merge(['a.*', 's.mobile', 's.permanent_address as address', 'p.short_name as class'], $this->identitySelect()))
             ->first();
 
         if (!$admission) return response()->json(['message' => 'Student not found.'], 404);
+        $admission = $this->decorate($admission);
 
         $seats = DB::table('exam_seating as es')
             ->join('exam_rooms as r', 'r.id', 'es.room_id')
@@ -340,7 +386,6 @@ class ExaminationController extends Controller
         return response()->json(['student' => $admission, 'seats' => $seats]);
     }
 
-    // Self Create P7
     public function selfCreateP7(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -352,7 +397,7 @@ class ExaminationController extends Controller
             'subject_id'   => 'required|exists:subjects,id',
             'paper_code'   => 'required|string',
             'exam_type'    => 'required|in:Regular,Back Paper',
-            'gender'       => 'nullable|in:Male,Female,Trans,All',
+            'gender'       => 'nullable|in:male,female,other,All',
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
@@ -369,7 +414,7 @@ class ExaminationController extends Controller
             ->where('a.semester_no', $req->semester_no)
             ->when($req->gender && $req->gender !== 'All', fn($q) => $q->where('s.gender', $req->gender))
             ->where('ef.status', 'Accepted')
-            ->select('s.name', 'a.roll_no', 's.gender')
+            ->select('s.university_roll_no as roll_no', 's.gender')
             ->get();
 
         return response()->json([
@@ -383,7 +428,6 @@ class ExaminationController extends Controller
     // 5. EXAM CONDUCT
     // ══════════════════════════════════════════════════════════════
 
-    // P1 — Create
     public function conductP1Index(Request $req)
     {
         return response()->json(
@@ -404,13 +448,12 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('exam_conduct_p1')->insertGetId(array_merge($req->all(), [
+        $id = DB::table('exam_conduct_p1')->insertGetId(array_merge($v->validated(), [
             'created_at' => now(), 'updated_at' => now(),
         ]));
         return response()->json(['id' => $id, 'message' => 'P1 created.'], 201);
     }
 
-    // P3 — UFM
     public function conductP3Store(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -427,28 +470,37 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $admission = DB::table('admissions')->where('roll_no', $req->roll_no)->first();
+        $admission = DB::table('admissions as a')
+            ->join('students as s', 's.id', 'a.student_id')
+            ->where('s.university_roll_no', $req->roll_no)
+            ->select('a.id')
+            ->first();
         if (!$admission) return response()->json(['message' => 'Roll number not found.'], 404);
 
         $id = DB::table('exam_ufm')->insertGetId(array_merge(
-            $req->all(), ['admission_id' => $admission->id, 'created_at' => now(), 'updated_at' => now()]
+            $v->validated(),
+            ['admission_id' => $admission->id, 'session_year' => $req->session_year ?? $this->sessionYear(),
+             'created_at' => now(), 'updated_at' => now()]
         ));
         return response()->json(['id' => $id, 'message' => "UFM recorded. Ref No: UFM/{$id}"], 201);
     }
 
     public function conductP3Index(Request $req)
     {
-        return response()->json(
+        $q = $this->withIdentity(
             DB::table('exam_ufm as u')
                 ->join('admissions as a', 'a.id', 'u.admission_id')
                 ->join('students as s', 's.id', 'a.student_id')
-                ->select('u.*', 's.name', 's.father_name', 'a.roll_no')
-                ->where('u.session_year', $req->session_year ?? $this->sessionYear())
-                ->paginate(30)
-        );
+        )
+            ->select(array_merge(['u.*', 's.university_roll_no as roll_no'], $this->identitySelect()))
+            ->where('u.session_year', $req->session_year ?? $this->sessionYear())
+            ->paginate(30);
+
+        $q->getCollection()->transform(fn ($r) => $this->decorate($r));
+
+        return response()->json($q);
     }
 
-    // P4 — Absent
     public function conductP4Store(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -462,28 +514,37 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $admission = DB::table('admissions')->where('roll_no', $req->roll_no)->first();
+        $admission = DB::table('admissions as a')
+            ->join('students as s', 's.id', 'a.student_id')
+            ->where('s.university_roll_no', $req->roll_no)
+            ->select('a.id')
+            ->first();
         if (!$admission) return response()->json(['message' => 'Roll number not found.'], 404);
 
         $id = DB::table('exam_absent')->insertGetId(array_merge(
-            $req->all(), ['admission_id' => $admission->id, 'created_at' => now(), 'updated_at' => now()]
+            $v->validated(),
+            ['admission_id' => $admission->id, 'session_year' => $req->session_year ?? $this->sessionYear(),
+             'created_at' => now(), 'updated_at' => now()]
         ));
         return response()->json(['id' => $id, 'message' => "ABS recorded. Ref No: ABS/{$id}"], 201);
     }
 
     public function conductP4Index(Request $req)
     {
-        return response()->json(
+        $q = $this->withIdentity(
             DB::table('exam_absent as ab')
                 ->join('admissions as a', 'a.id', 'ab.admission_id')
                 ->join('students as s', 's.id', 'a.student_id')
-                ->select('ab.*', 's.name', 's.father_name', 'a.roll_no')
-                ->where('ab.session_year', $req->session_year ?? $this->sessionYear())
-                ->paginate(30)
-        );
+        )
+            ->select(array_merge(['ab.*', 's.university_roll_no as roll_no'], $this->identitySelect()))
+            ->where('ab.session_year', $req->session_year ?? $this->sessionYear())
+            ->paginate(30);
+
+        $q->getCollection()->transform(fn ($r) => $this->decorate($r));
+
+        return response()->json($q);
     }
 
-    // P9 — Create Packet
     public function conductP9Store(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -494,7 +555,7 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('exam_packets')->insertGetId(array_merge($req->all(), [
+        $id = DB::table('exam_packets')->insertGetId(array_merge($v->validated(), [
             'created_at' => now(), 'updated_at' => now(),
         ]));
         return response()->json(['id' => $id, 'message' => "Packet No. P9/{$id} created."], 201);
@@ -514,28 +575,39 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function nominalRollIndex(Request $req)
     {
-        return response()->json(
+        $q = $this->withIdentity(
             DB::table('exam_forms as ef')
                 ->join('admissions as a', 'a.id', 'ef.admission_id')
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
                 ->leftJoin('exam_form_papers as efp', 'efp.exam_form_id', 'ef.id')
-                ->select('ef.*', 's.name', 's.father_name', 's.mother_name', 's.gender', 's.dob',
-                         'a.roll_no', 'a.enrollment_no', 'p.short_name as class', 'efp.paper_code')
-                ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
-                ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
-                ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
-                ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-                ->where('ef.status', 'Accepted')
-                ->orderBy('a.roll_no')
-                ->paginate(50)
-        );
+        )
+            ->select(array_merge(
+                ['ef.*', 's.gender', 's.date_of_birth as dob', 's.university_roll_no as roll_no',
+                 's.enrollment_no', 'p.short_name as class', 'efp.paper_code'],
+                $this->identitySelect()
+            ))
+            ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
+            ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
+            ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
+            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
+            ->where('ef.status', 'Accepted')
+            ->orderBy('s.university_roll_no')
+            ->paginate(50);
+
+        $q->getCollection()->transform(function ($r) {
+            $r = $this->decorate($r);
+            $r->dob = $r->dob ?? null; // dr.dob preferred, decorate() doesn't touch dob
+            return $r;
+        });
+
+        return response()->json($q);
     }
 
     public function nominalRollUpdate(Request $req, $id)
     {
         DB::table('exam_forms')->where('id', $id)->update(array_merge(
-            $req->only(['form_id', 'enrollment_no', 'paper_code']),
+            $req->only(['form_id']),
             ['updated_at' => now()]
         ));
         return response()->json(['message' => 'Updated.']);
@@ -546,22 +618,28 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function resultIndex(Request $req)
     {
-        return response()->json(
+        $q = $this->withIdentity(
             DB::table('exam_forms as ef')
                 ->join('admissions as a', 'a.id', 'ef.admission_id')
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
-                ->select('ef.*', 's.name', 's.father_name', 's.gender',
-                         'a.roll_no', 'a.account_no', 'a.enrollment_no', 'p.short_name as class')
-                ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
-                ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
-                ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
-                ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-                ->when($req->gender,      fn($q) => $q->where('s.gender',       $req->gender))
-                ->where('ef.status', 'Accepted')
-                ->orderBy('a.roll_no')
-                ->paginate(50)
-        );
+        )
+            ->select(array_merge(
+                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as class'],
+                $this->identitySelect()
+            ))
+            ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
+            ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
+            ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
+            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
+            ->when($req->gender,      fn($q) => $q->where('s.gender',       $req->gender))
+            ->where('ef.status', 'Accepted')
+            ->orderBy('s.university_roll_no')
+            ->paginate(50);
+
+        $q->getCollection()->transform(fn ($r) => $this->decorate($r));
+
+        return response()->json($q);
     }
 
     public function resultUpdate(Request $req, $id)
@@ -578,6 +656,7 @@ class ExaminationController extends Controller
 
     public function resultBulkUpdate(Request $req)
     {
+        $req->validate(['results' => 'required|array', 'results.*.id' => 'required|integer', 'results.*.result' => 'required|string']);
         foreach ($req->results as $item) {
             DB::table('exam_forms')->where('id', $item['id'])
                 ->update(['result' => $item['result'], 'updated_at' => now()]);
@@ -590,28 +669,34 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function marksheetIndex(Request $req)
     {
-        return response()->json(
+        $q = $this->withIdentity(
             DB::table('exam_forms as ef')
                 ->join('admissions as a', 'a.id', 'ef.admission_id')
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
-                ->select('ef.*', 's.name', 's.father_name', 's.gender',
-                         'a.roll_no', 'a.account_no', 'a.enrollment_no', 'p.short_name as class')
-                ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
-                ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
-                ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
-                ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-                ->when($req->gender,      fn($q) => $q->where('s.gender',       $req->gender))
-                ->where('ef.status', 'Accepted')
-                ->orderBy('a.roll_no')
-                ->paginate(50)
-        );
+        )
+            ->select(array_merge(
+                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as class'],
+                $this->identitySelect()
+            ))
+            ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
+            ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
+            ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
+            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
+            ->when($req->gender,      fn($q) => $q->where('s.gender',       $req->gender))
+            ->where('ef.status', 'Accepted')
+            ->orderBy('s.university_roll_no')
+            ->paginate(50);
+
+        $q->getCollection()->transform(fn ($r) => $this->decorate($r));
+
+        return response()->json($q);
     }
 
     public function marksheetUpdateAvailability(Request $req, $id)
     {
         DB::table('exam_forms')->where('id', $id)
-            ->update(['marksheet_available' => $req->available, 'updated_at' => now()]);
+            ->update(['marksheet_available' => (bool) $req->available, 'updated_at' => now()]);
         return response()->json(['message' => 'Updated.']);
     }
 
@@ -626,8 +711,7 @@ class ExaminationController extends Controller
             ->join('admissions as a', 'a.id', 'ef.admission_id')
             ->join('students as s', 's.id', 'a.student_id')
             ->join('programs as p', 'p.id', 'a.program_id')
-            ->select('p.short_name as class', 'p.level', 's.gender',
-                     DB::raw('count(*) as total'))
+            ->select('p.short_name as class', 'p.level', 's.gender', DB::raw('count(*) as total'))
             ->where('ef.session_year', $sessionYear)
             ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
             ->where('ef.status', 'Accepted')
@@ -647,8 +731,7 @@ class ExaminationController extends Controller
             ->join('students as s', 's.id', 'a.student_id')
             ->join('programs as p', 'p.id', 'a.program_id')
             ->join('subjects as sub', 'sub.id', 'efp.subject_id')
-            ->select('p.short_name as class', 'sub.name as subject',
-                     'efp.exam_type', DB::raw('count(*) as total'))
+            ->select('p.short_name as class', 'sub.name as subject', 'efp.exam_type', DB::raw('count(*) as total'))
             ->where('ef.session_year', $sessionYear)
             ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
@@ -662,7 +745,7 @@ class ExaminationController extends Controller
     }
 
     // ══════════════════════════════════════════════════════════════
-    // 10. ADD OTHER EXAM CENTRE
+    // 10. EXAM CENTRE
     // ══════════════════════════════════════════════════════════════
     public function examCentreIndex()
     {
@@ -679,7 +762,7 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('exam_centres')->insertGetId(array_merge($req->all(), [
+        $id = DB::table('exam_centres')->insertGetId(array_merge($v->validated(), [
             'created_at' => now(), 'updated_at' => now(),
         ]));
         return response()->json(['id' => $id, 'message' => 'Centre added.'], 201);
@@ -688,7 +771,7 @@ class ExaminationController extends Controller
     public function examCentreUpdate(Request $req, $id)
     {
         DB::table('exam_centres')->where('id', $id)->update(array_merge(
-            $req->only(['center_code','center_name','college_code','college_name']),
+            $req->only(['center_code', 'center_name', 'college_code', 'college_name']),
             ['updated_at' => now()]
         ));
         return response()->json(['message' => 'Updated.']);
@@ -700,39 +783,47 @@ class ExaminationController extends Controller
         return response()->json(['message' => 'Deleted.']);
     }
 
-    // Students at centre
     public function examCentreStudents(Request $req)
     {
-        return response()->json(
+        $q = $this->withIdentity(
             DB::table('exam_forms as ef')
                 ->join('admissions as a', 'a.id', 'ef.admission_id')
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
                 ->leftJoin('exam_form_papers as efp', 'efp.exam_form_id', 'ef.id')
-                ->select('ef.*', 's.name', 's.father_name', 's.gender',
-                         'a.roll_no', 'p.short_name as class', 'efp.paper_code')
-                ->where('ef.center_code', $req->center_code)
-                ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
-                ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
-                ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-                ->paginate(50)
-        );
+        )
+            ->select(array_merge(
+                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'p.short_name as class', 'efp.paper_code'],
+                $this->identitySelect()
+            ))
+            ->where('ef.center_code', $req->center_code)
+            ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
+            ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
+            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
+            ->paginate(50);
+
+        $q->getCollection()->transform(fn ($r) => $this->decorate($r));
+
+        return response()->json($q);
     }
 
     // Lookup student by roll_no (used in P3/P4 forms)
     public function lookupStudent(Request $req)
     {
-        $admission = DB::table('admissions as a')
-            ->join('students as s', 's.id', 'a.student_id')
-            ->join('programs as p', 'p.id', 'a.program_id')
-            ->where('a.roll_no', $req->roll_no)
-            ->select('a.*', 's.name', 's.father_name', 's.mobile', 's.address', 'p.short_name as class')
+        $admission = $this->withIdentity(
+            DB::table('admissions as a')
+                ->join('students as s', 's.id', 'a.student_id')
+                ->join('programs as p', 'p.id', 'a.program_id')
+        )
+            ->where('s.university_roll_no', $req->roll_no)
+            ->select(array_merge(['a.*', 's.mobile', 's.permanent_address as address', 'p.short_name as class'], $this->identitySelect()))
             ->first();
 
         if (!$admission) return response()->json(['message' => 'Not found.'], 404);
+        $admission = $this->decorate($admission);
 
         $examForm = DB::table('exam_forms')
-            ->where('admission_id', $admission->id)
+            ->where('admission_id', $admission->admission_id ?? $admission->id)
             ->where('session_year', $req->session_year ?? $this->sessionYear())
             ->first();
 

@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\FeeReceipt;
-use Barryvdh\Snappy\Facades\SnappyPdf;
+use Barryvdh\DomPDF\Facade\Pdf;   // pure-PHP PDF (no wkhtmltopdf binary needed)
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -25,12 +25,8 @@ class GenerateFeeReceiptPdf implements ShouldQueue
             'student', 'organization', 'admission.program', 'generatedBy'
         ])->findOrFail($this->receiptId);
 
-        $pdf = SnappyPdf::loadView('pdf.fee-receipt', compact('receipt'))
-            ->setPaper('A4')
-            ->setOption('margin-top', '10mm')
-            ->setOption('margin-bottom', '10mm')
-            ->setOption('margin-left', '10mm')
-            ->setOption('margin-right', '10mm');
+        // dompdf takes page margins from the Blade's CSS @page rule, not setOption().
+        $pdf = Pdf::loadView('pdf.fee-receipt', compact('receipt'))->setPaper('a4');
 
         $path = "receipts/{$receipt->organization_id}/{$receipt->academic_year}/{$receipt->receipt_no}.pdf";
 

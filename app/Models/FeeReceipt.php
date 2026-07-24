@@ -52,4 +52,26 @@ class FeeReceipt extends Model
                      ->count() + 1;
         return "{$prefix}-{$orgId}-{$year}-" . str_pad($count, 6, '0', STR_PAD_LEFT);
     }
+
+    /**
+     * Spec-format Fee Receipt No.  (YY + mode(3) + serial(4), e.g. 251010001)
+     * Delegates to AdmissionNumberService.
+     *
+     * $mode accepts either the service modes (regular | self_finance | back_paper | other)
+     * or the fee_receipts.receipt_type values (regular_admission | semester_upgrade |
+     * back_paper | miscellaneous). Pass $isSelfFinance=true to flip 101 -> 201.
+     */
+    public static function feeReceiptNo(string $session, string $mode = 'regular', bool $isSelfFinance = false): string
+    {
+        $mode = match ($mode) {
+            'regular_admission', 'semester_upgrade' => 'regular',
+            'miscellaneous'                         => 'other',
+            default                                 => $mode,   // already a service mode
+        };
+        if ($isSelfFinance && $mode === 'regular') {
+            $mode = 'self_finance';
+        }
+
+        return app(\App\Services\AdmissionNumberService::class)->feeReceiptNo($session, $mode);
+    }
 }

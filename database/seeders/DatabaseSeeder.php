@@ -158,6 +158,13 @@ class DatabaseSeeder extends Seeder
             );
         }
 
+        // ── 7. Reference data (universities & PIN codes for address/university
+        //      autofill on application & registration forms) ────────────────
+        $this->call([
+            UniversitySeeder::class,
+            PincodeSeeder::class,
+        ]);
+
         $this->command->info('✅ Database seeded successfully!');
         $this->command->info('   Super Admin: admin@sdpgcollege.ac.in / Admin@1234');
         $this->command->info('   College Admin: principal@sdpgcollege.ac.in / College@1234');

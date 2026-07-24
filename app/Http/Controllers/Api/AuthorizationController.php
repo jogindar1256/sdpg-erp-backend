@@ -2,284 +2,261 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Http\Concerns\ResolvesStudentIdentity;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
+/**
+ * REBUILT against the real schema. The original file joined `classes` and
+ * `registrations` (neither exists — the real registration table is
+ * `direct_registrations`) and `admission_documents` (doesn't exist — real
+ * table is `student_application_documents`), and treated `admissions` as if
+ * applicants sat in it in a "Pending" state waiting for approval.
+ *
+ * That last part is now structurally wrong on purpose: per the business
+ * rule implemented in ApplicationController::updateStatus(), an `admissions`
+ * row is only ever created AT approval time (after the education fee is
+ * paid). So "admission verification" / "semester approval" here operate on
+ * the real pending queue — student_applications with status
+ * submitted/under_review — and the actual approve/reject/admissions-
+ * creation/student-confirmation logic is delegated to
+ * ApplicationController::updateStatus() rather than duplicated, so there is
+ * one source of truth for what "approved" means.
+ *
+ * Fee-receipt verification here delegates to FeesController for the same
+ * reason — it already queries fee_receipts correctly.
+ *
+ * amendment_logs was designed but never migrated (see
+ * 2026_06_18_130439_create_amendment_table.php — commented out). Applied via
+ * 2026_07_20_100000_create_amendment_logs_table.php so misc-activity and
+ * block/unblock have a real audit trail to write to.
+ */
 class AuthorizationController extends Controller
 {
+    use ResolvesStudentIdentity;
+
     // ─────────────────────────────────────────────────────────────────────────
-    // SHARED: build base student/admission query with common filters
+    // SHARED: base application queue (student_applications, not admissions —
+    // see class docblock for why).
     // ─────────────────────────────────────────────────────────────────────────
-    private function baseAdmissionQuery(Request $request)
+    private function baseApplicationQueue(Request $request, array $types)
     {
-        $q = DB::table('admissions as a')
-            ->join('students as s',      's.id',        '=', 'a.student_id')
-            ->join('programs as p',      'p.id',        '=', 'a.program_id')
-            ->join('classes as c',       'c.id',        '=', 'a.class_id')
-            ->leftJoin('registrations as r', 'r.admission_id', '=', 'a.id')
-            ->leftJoin('fee_receipts as fr', function ($join) {
-                $join->on('fr.admission_id', '=', 'a.id')
-                     ->where('fr.fee_type', '=', 'Admission');
-            })
-            ->leftJoin('fee_receipts as rr', function ($join) {
-                $join->on('rr.admission_id', '=', 'a.id')
-                     ->where('rr.fee_type', '=', 'Registration');
-            })
+        $latestReg = $this->latestRegistrationSub();
+
+        $q = DB::table('student_applications as sa')
+            ->join('students as s', 's.id', '=', 'sa.student_id')
+            ->join('programs as p', 'p.id', '=', 'sa.program_id')
+            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
+            ->leftJoin('admissions as a', 'a.application_id', '=', 'sa.id')
+            ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'sa.fee_receipt_id')
+            ->whereIn('sa.application_type', $types)
+            ->whereNull('sa.deleted_at')
             ->select(
-                'a.id as admission_id',
-                'a.student_id',
-                'a.application_no',
-                'a.reg_no',
-                'a.university_roll_no as uni_roll_no',
-                'a.admission_mode',
-                'a.session',
-                'a.status as adm_status',
-                'a.subject_basic',
-                'a.subject_drop',
-                'a.subject_practical',
-                'a.tc_status',
-                'a.migration_status',
-                'a.fine_amount',
-                'a.required_fee',
-                'a.documents_verified',
-                's.name',
-                's.father_name',
-                's.mother_name',
-                's.dob',
-                's.gender',
-                's.category',
-                's.mobile',
-                's.aadhar_no',
-                's.state',
-                's.is_blocked',
-                'p.name as subject_name',
-                'c.name as class_name',
-                'a.semester_no',
-                DB::raw("COALESCE(fr.amount, 0) as adm_paid_fee"),
-                DB::raw("COALESCE(fr.utr_no, '') as adm_utr_no"),
-                DB::raw("COALESCE(fr.status, 'Pending') as adm_fee_status"),
-                DB::raw("COALESCE(rr.amount, 0) as reg_paid_fee"),
-                DB::raw("COALESCE(rr.utr_no, '') as reg_utr_no"),
-                DB::raw("COALESCE(rr.status, 'Pending') as reg_fee_status"),
-                DB::raw("COALESCE(rr.paid_date, null) as reg_fee_paid_date"),
-                'r.application_form_no'
+                'sa.id as application_id',
+                'sa.student_id',
+                'sa.application_no',
+                'sa.academic_year as session',
+                'sa.semester_no',
+                'sa.status',
+                'sa.fee_paid',
+                'sa.remarks',
+                'sa.created_at',
+                's.first_name', 's.middle_name', 's.last_name',
+                'dr.name as reg_name', 'dr.father_name', 'dr.mother_name', 'dr.dob',
+                's.gender', 's.category', 's.mobile', 's.aadhar_no', 's.is_blocked',
+                'p.short_name as class_name', 'p.full_name as program_name',
+                'a.id as admission_id', 'a.admission_no', 'a.status as admission_status',
+                DB::raw('COALESCE(fr.net_amount, 0) as paid_fee'),
+                DB::raw("COALESCE(fr.transaction_id, '') as utr_no"),
+                DB::raw("CASE WHEN sa.fee_paid THEN 'Paid' ELSE 'Pending' END as fee_status")
             );
 
-        // Session filter
-        if ($s = $request->input('session')) {
-            $q->where('a.session', $s);
-        }
-        // Class filter
-        if ($cid = $request->input('class_id')) {
-            $q->where('a.class_id', $cid);
-        }
-        // Semester filter
-        if ($sem = $request->input('semester')) {
-            $q->where('a.semester_no', $sem);
-        }
-        // Date range
-        if ($from = $request->input('date_from')) {
-            $q->whereDate('a.created_at', '>=', $from);
-        }
-        if ($to = $request->input('date_to')) {
-            $q->whereDate('a.created_at', '<=', $to);
-        }
-        // Status filter
+        if ($s = $request->input('session'))    $q->where('sa.academic_year', $s);
+        if ($cid = $request->input('class_id')) $q->where('sa.program_id', $cid);
+        if ($sem = $request->input('semester')) $q->where('sa.semester_no', $sem);
+        if ($from = $request->input('date_from')) $q->whereDate('sa.created_at', '>=', $from);
+        if ($to = $request->input('date_to'))     $q->whereDate('sa.created_at', '<=', $to);
+
+        // Frontend sends Pending/Approved/Rejected — map onto the real status enum.
         if ($status = $request->input('status')) {
-            $q->where('a.status', $status);
+            $map = ['Pending' => ['submitted', 'under_review'], 'Approved' => ['approved'], 'Rejected' => ['rejected']];
+            $q->whereIn('sa.status', $map[$status] ?? [$status]);
+        } else {
+            // Default: only the actionable queue (not drafts, not already decided).
+            $q->whereIn('sa.status', ['submitted', 'under_review']);
         }
-        // Search text
+
         if ($search = $request->input('search')) {
             $q->where(function ($qb) use ($search) {
-                $qb->where('a.application_no',     'like', "%$search%")
-                   ->orWhere('a.reg_no',            'like', "%$search%")
-                   ->orWhere('a.university_roll_no','like', "%$search%")
-                   ->orWhere('s.mobile',            'like', "%$search%")
-                   ->orWhere('s.name',              'like', "%$search%");
+                $qb->where('sa.application_no', 'ilike', "%$search%")
+                   ->orWhere('a.admission_no', 'ilike', "%$search%")
+                   ->orWhere('s.mobile', 'ilike', "%$search%")
+                   ->orWhere('dr.name', 'ilike', "%$search%")
+                   ->orWhere('s.first_name', 'ilike', "%$search%")
+                   ->orWhere('s.last_name', 'ilike', "%$search%");
             });
         }
 
         return $q;
     }
 
+    private function decorate($row)
+    {
+        $row->name = !empty($row->reg_name) ? $row->reg_name
+            : trim(implode(' ', array_filter([$row->first_name, $row->middle_name, $row->last_name])));
+        return $row;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
-    // 1. ADMISSION VERIFICATION — Odd semesters (1,3,5,7)
+    // 1. ADMISSION VERIFICATION — fresh / lateral applications
     // GET /authorizations/admission-verification
     // ─────────────────────────────────────────────────────────────────────────
     public function admissionVerificationIndex(Request $request)
     {
-        $q = $this->baseAdmissionQuery($request)
-            ->whereIn('a.semester_no', [1, 3, 5, 7]);
+        $q = $this->baseApplicationQueue($request, ['fresh', 'lateral']);
 
-        $total   = (clone $q)->count();
-        $pending = (clone $q)->where('a.status', 'Pending')->count();
-        $approved = (clone $q)->where('a.status', 'Approved')->count();
-        $rejected = (clone $q)->where('a.status', 'Rejected')->count();
+        $counts = $this->baseApplicationQueue($request, ['fresh', 'lateral'])
+            ->reorder()
+            ->selectRaw("
+                COUNT(*) as total,
+                SUM(CASE WHEN sa.status IN ('submitted','under_review') THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN sa.status = 'approved' THEN 1 ELSE 0 END) as approved,
+                SUM(CASE WHEN sa.status = 'rejected' THEN 1 ELSE 0 END) as rejected
+            ")->first();
 
-        $records = $q->orderBy('a.created_at', 'desc')
-                     ->paginate($request->input('per_page', 20));
+        $records = $q->orderByDesc('sa.created_at')
+            ->paginate($request->input('per_page', 20));
+        $records->getCollection()->transform(fn ($r) => $this->decorate($r));
 
         return response()->json([
-            'stats'   => compact('total', 'pending', 'approved', 'rejected'),
+            'stats'   => $counts,
             'records' => $records,
         ]);
     }
 
-    // GET /authorizations/admission-verification/{admissionId}
-    public function admissionVerificationShow(int $admissionId)
+    // GET /authorizations/admission-verification/{applicationId}
+    public function admissionVerificationShow(int $applicationId)
     {
-        $rec = DB::table('admissions as a')
-            ->join('students as s',  's.id', '=', 'a.student_id')
-            ->join('programs as p',  'p.id', '=', 'a.program_id')
-            ->join('classes as c',   'c.id', '=', 'a.class_id')
-            ->leftJoin('registrations as r', 'r.admission_id', '=', 'a.id')
-            ->leftJoin('fee_receipts as fr', 'fr.admission_id', '=', 'a.id')
-            ->leftJoin('admission_documents as ad', 'ad.admission_id', '=', 'a.id')
-            ->where('a.id', $admissionId)
-            ->select('a.*', 's.name', 's.father_name', 's.mother_name', 's.dob',
-                     's.gender', 's.category', 's.mobile', 's.aadhar_no',
-                     's.state', 'p.name as subject_name', 'c.name as class_name',
-                     'r.application_form_no', DB::raw("JSON_AGG(DISTINCT fr.*) as fee_details"),
-                     DB::raw("JSON_AGG(DISTINCT ad.*) as documents"))
-            ->groupBy('a.id','s.id','p.id','c.id','r.id')
-            ->first();
+        $rows = $this->baseApplicationQueue(new Request(['status' => null]), ['fresh', 'lateral', 'semester_upgrade', 'back_paper'])
+            ->reorder()
+            ->where('sa.id', $applicationId)
+            ->get();
+
+        $rec = $rows->first();
+        if (!$rec) return response()->json(['message' => 'Application not found.'], 404);
+
+        $rec = $this->decorate($rec);
+        $rec->documents = DB::table('student_application_documents')
+            ->where('application_id', $applicationId)
+            ->get(['document_type', 'filename', 'path', 'status', 'created_at']);
 
         return response()->json($rec);
     }
 
-    // POST /authorizations/admission-verification/{admissionId}/action
-    public function admissionVerificationAction(Request $request, int $admissionId)
+    // POST /authorizations/admission-verification/{applicationId}/action
+    public function admissionVerificationAction(Request $request, int $applicationId)
+    {
+        return $this->handleAction($request, $applicationId);
+    }
+
+    /** Shared approve/reject/rollback handler for both queues below. */
+    private function handleAction(Request $request, int $applicationId)
     {
         $request->validate([
-            'action'      => 'required|in:Approved,Rejected,RollBack',
-            'documents_verified' => 'nullable|boolean',
-            'remarks'     => 'nullable|string',
+            'action'  => 'required|in:Approved,Rejected,RollBack',
+            'remarks' => 'nullable|string',
         ]);
 
         $action = $request->input('action');
-        $newStatus = match($action) {
-            'Approved'  => 'Approved',
-            'Rejected'  => 'Rejected',
-            'RollBack'  => 'Pending',
-        };
 
-        DB::table('admissions')->where('id', $admissionId)->update([
-            'status'             => $newStatus,
-            'documents_verified' => $request->input('documents_verified', false),
-            'approved_by'        => auth()->id(),
-            'approved_at'        => now(),
-            'updated_at'         => now(),
-        ]);
+        if ($action === 'Approved') {
+            // Delegate — this is the ONE place fee-gate + admissions-row
+            // creation + student confirmation happens. Don't duplicate it.
+            $approveReq = Request::create('', 'PATCH', [
+                'status' => 'approved',
+                'reason' => $request->input('remarks'),
+            ]);
+            $approveReq->setUserResolver($request->getUserResolver());
+            $response = app(ApplicationController::class)->updateStatus($approveReq, $applicationId);
 
-        // Log the action
+            if ($response->getStatusCode() >= 400) {
+                return $response; // e.g. "Education fee must be paid before approval"
+            }
+        } else {
+            $app = DB::table('student_applications')->where('id', $applicationId)->whereNull('deleted_at')->first();
+            if (!$app) return response()->json(['message' => 'Application not found.'], 404);
+
+            $newStatus = $action === 'Rejected' ? 'rejected' : ($app->fee_paid ? 'under_review' : 'submitted');
+
+            DB::table('student_applications')->where('id', $applicationId)->update([
+                'status'      => $newStatus,
+                'remarks'     => $request->input('remarks') ?? $app->remarks,
+                'reviewed_by' => $request->user()?->id,
+                'reviewed_at' => now(),
+                'updated_at'  => now(),
+            ]);
+        }
+
         DB::table('authorization_logs')->insert([
-            'admission_id' => $admissionId,
+            'admission_id' => DB::table('admissions')->where('application_id', $applicationId)->value('id'),
             'action'       => $action,
             'action_type'  => 'AdmissionVerification',
-            'performed_by' => auth()->id(),
+            'reference_id' => $applicationId,
+            'performed_by' => $request->user()?->id,
             'remarks'      => $request->input('remarks'),
             'created_at'   => now(),
             'updated_at'   => now(),
         ]);
 
-        return response()->json(['message' => "Admission $action successfully."]);
+        return response()->json(['message' => "Application {$action} successfully."]);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 2. SEMESTER REGISTRATION APPROVAL — Even semesters (2,4,6,8)
+    // 2. SEMESTER (UPGRADE) APPROVAL
     // GET /authorizations/semester-approval
     // ─────────────────────────────────────────────────────────────────────────
     public function semesterApprovalIndex(Request $request)
     {
-        $q = $this->baseAdmissionQuery($request)
-            ->whereIn('a.semester_no', [2, 4, 6, 8]);
+        $q = $this->baseApplicationQueue($request, ['semester_upgrade']);
 
-        $total    = (clone $q)->count();
-        $pending  = (clone $q)->where('a.status', 'Pending')->count();
-        $approved = (clone $q)->where('a.status', 'Approved')->count();
-        $rejected = (clone $q)->where('a.status', 'Rejected')->count();
+        $counts = $this->baseApplicationQueue($request, ['semester_upgrade'])
+            ->reorder()
+            ->selectRaw("
+                COUNT(*) as total,
+                SUM(CASE WHEN sa.status IN ('submitted','under_review') THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN sa.status = 'approved' THEN 1 ELSE 0 END) as approved,
+                SUM(CASE WHEN sa.status = 'rejected' THEN 1 ELSE 0 END) as rejected
+            ")->first();
 
-        $records = $q->orderBy('a.created_at', 'desc')
-                     ->paginate($request->input('per_page', 20));
+        $records = $q->orderByDesc('sa.created_at')->paginate($request->input('per_page', 20));
+        $records->getCollection()->transform(fn ($r) => $this->decorate($r));
 
-        return response()->json([
-            'stats'   => compact('total', 'pending', 'approved', 'rejected'),
-            'records' => $records,
-        ]);
+        return response()->json(['stats' => $counts, 'records' => $records]);
     }
 
-    // POST /authorizations/semester-approval/{admissionId}/action — reuse same logic
-    public function semesterApprovalAction(Request $request, int $admissionId)
+    // POST /authorizations/semester-approval/{applicationId}/action
+    public function semesterApprovalAction(Request $request, int $applicationId)
     {
-        return $this->admissionVerificationAction($request, $admissionId);
+        return $this->handleAction($request, $applicationId);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 3. FEE RECEIPT VERIFICATION
-    // GET /authorizations/fee-receipt
+    // 3. FEE RECEIPT VERIFICATION — delegates to FeesController, which
+    //    already queries the real fee_receipts columns correctly.
     // ─────────────────────────────────────────────────────────────────────────
     public function feeReceiptIndex(Request $request)
     {
-        $q = DB::table('fee_receipts as fr')
-            ->join('admissions as a',  'a.id',  '=', 'fr.admission_id')
-            ->join('students as s',    's.id',  '=', 'a.student_id')
-            ->join('classes as c',     'c.id',  '=', 'a.class_id')
-            ->leftJoin('users as u',   'u.id',  '=', 'fr.issued_by')
-            ->select(
-                'fr.id',
-                'fr.receipt_no',
-                'fr.amount',
-                'fr.fee_type',
-                'fr.status',
-                'fr.paid_date',
-                'fr.utr_no',
-                'fr.issued_at',
-                'a.student_id',
-                'a.application_no',
-                'a.semester_no',
-                's.name',
-                's.father_name',
-                's.category',
-                'c.name as class_name',
-                'u.name as issued_by_name'
-            );
-
-        if ($sess = $request->input('session'))   $q->where('a.session', $sess);
-        if ($cid  = $request->input('class_id'))  $q->where('a.class_id', $cid);
-        if ($sem  = $request->input('semester'))  $q->where('a.semester_no', $sem);
-        if ($from = $request->input('date_from')) $q->whereDate('fr.created_at', '>=', $from);
-        if ($to   = $request->input('date_to'))   $q->whereDate('fr.created_at', '<=', $to);
-
-        $records = $q->orderBy('fr.created_at', 'desc')
-                     ->paginate($request->input('per_page', 20));
-
-        return response()->json($records);
+        return app(FeesController::class)->receiptsIndex($request);
     }
 
     // POST /authorizations/fee-receipt/{id}/verify
     public function feeReceiptVerify(Request $request, int $id)
     {
         $request->validate(['action' => 'required|in:Verified,Rejected']);
-
-        DB::table('fee_receipts')->where('id', $id)->update([
-            'status'      => $request->input('action') === 'Verified' ? 'Paid' : 'Rejected',
-            'verified_by' => auth()->id(),
-            'verified_at' => now(),
-            'updated_at'  => now(),
-        ]);
-
-        DB::table('authorization_logs')->insert([
-            'action'       => $request->input('action'),
-            'action_type'  => 'FeeReceiptVerification',
-            'reference_id' => $id,
-            'performed_by' => auth()->id(),
-            'remarks'      => $request->input('remarks'),
-            'created_at'   => now(),
-            'updated_at'   => now(),
-        ]);
-
-        return response()->json(['message' => "Receipt {$request->input('action')} successfully."]);
+        $act = $request->input('action') === 'Verified' ? 'verify' : 'reject';
+        return app(FeesController::class)->verifyAction($request, $id, $act);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -288,44 +265,42 @@ class AuthorizationController extends Controller
     // ─────────────────────────────────────────────────────────────────────────
     public function miscActivityIndex(Request $request)
     {
+        $latestReg = $this->latestRegistrationSub();
+
         $q = DB::table('amendment_logs as al')
-            ->join('students as s',    's.id',   '=', 'al.student_id')
+            ->join('students as s', 's.id', '=', 'al.student_id')
+            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->leftJoin('admissions as a', 'a.id', '=', 'al.admission_id')
-            ->leftJoin('classes as c',   'c.id',  '=', 'a.class_id')
+            ->leftJoin('programs as p', 'p.id', '=', 'a.program_id')
             ->select(
-                'al.id',
-                'al.ref_no',
-                'al.action_type',
-                'al.status',
-                'al.changed_data',
-                'al.modified_by',
-                'al.created_at',
-                'al.student_id',
-                's.name',
-                's.father_name',
-                's.mobile',
-                DB::raw("COALESCE(a.university_roll_no, '') as uni_roll_no"),
+                'al.id', 'al.ref_no', 'al.action_type', 'al.status',
+                'al.changed_data', 'al.modified_by', 'al.created_at', 'al.student_id',
+                's.first_name', 's.middle_name', 's.last_name',
+                'dr.name as reg_name', 'dr.father_name', 's.mobile',
+                DB::raw("COALESCE(a.admission_no, '') as admission_no"),
                 DB::raw("COALESCE(a.semester_no::text, '') as semester_no"),
-                DB::raw("COALESCE(c.name, '') as class_name")
+                DB::raw("COALESCE(p.short_name, '') as class_name")
             );
 
-        if ($status = $request->input('status')) $q->where('al.status', $status);
+        if ($status = $request->input('status'))   $q->where('al.status', $status);
         if ($type   = $request->input('activity')) $q->where('al.action_type', $type);
         if ($from   = $request->input('date_from')) $q->whereDate('al.created_at', '>=', $from);
         if ($to     = $request->input('date_to'))   $q->whereDate('al.created_at', '<=', $to);
         if ($search = $request->input('search')) {
             $q->where(function ($qb) use ($search) {
-                $qb->where('al.ref_no',      'like', "%$search%")
-                   ->orWhere('s.name',       'like', "%$search%")
-                   ->orWhere('a.university_roll_no', 'like', "%$search%");
+                $qb->where('al.ref_no', 'ilike', "%$search%")
+                   ->orWhere('dr.name', 'ilike', "%$search%")
+                   ->orWhere('s.first_name', 'ilike', "%$search%")
+                   ->orWhere('a.admission_no', 'ilike', "%$search%");
             });
         }
 
         $total   = (clone $q)->count();
         $pending = (clone $q)->where('al.status', 'Pending')->count();
 
-        $records = $q->orderBy('al.created_at', 'desc')
-                     ->paginate($request->input('per_page', 20));
+        $records = $q->orderByDesc('al.created_at')->paginate($request->input('per_page', 20));
+        $records->getCollection()->transform(fn ($r) => $this->decorate($r));
 
         return response()->json([
             'stats'   => compact('total', 'pending'),
@@ -338,7 +313,7 @@ class AuthorizationController extends Controller
     {
         $request->validate(['action' => 'required|in:Approved,Rejected,RollBack']);
 
-        $newStatus = match($request->input('action')) {
+        $newStatus = match ($request->input('action')) {
             'Approved' => 'Approved',
             'Rejected' => 'Rejected',
             'RollBack' => 'Pending',
@@ -346,12 +321,11 @@ class AuthorizationController extends Controller
 
         DB::table('amendment_logs')->where('id', $id)->update([
             'status'      => $newStatus,
-            'approved_by' => auth()->id(),
+            'approved_by' => (string) $request->user()?->id,
             'approved_at' => now(),
             'updated_at'  => now(),
         ]);
 
-        // If Approved, apply the actual change from changed_data
         if ($newStatus === 'Approved') {
             $log = DB::table('amendment_logs')->find($id);
             $this->applyAmendmentLog($log);
@@ -361,7 +335,7 @@ class AuthorizationController extends Controller
             'action'       => $request->input('action'),
             'action_type'  => 'MiscActivityVerification',
             'reference_id' => $id,
-            'performed_by' => auth()->id(),
+            'performed_by' => $request->user()?->id,
             'remarks'      => $request->input('remarks'),
             'created_at'   => now(),
             'updated_at'   => now(),
@@ -370,7 +344,7 @@ class AuthorizationController extends Controller
         return response()->json(['message' => "Activity {$request->input('action')} successfully."]);
     }
 
-    // Apply approved amendment to the actual tables
+    // Apply an approved amendment to the actual tables.
     private function applyAmendmentLog(object $log): void
     {
         $data = json_decode($log->changed_data, true);
@@ -378,61 +352,90 @@ class AuthorizationController extends Controller
 
         switch ($log->action_type) {
             case 'ModifyData':
-                DB::table('students')->where('id', $log->student_id)->update($data);
+                // Only ever touch real students columns — never blindly mass-assign.
+                $allowed = ['religion', 'nationality', 'bank_name', 'bank_branch', 'bank_ifsc', 'bank_account_no',
+                    'permanent_address', 'permanent_city', 'permanent_district', 'permanent_state', 'permanent_pin',
+                    'correspondence_address', 'correspondence_city', 'correspondence_district', 'correspondence_state', 'correspondence_pin'];
+                DB::table('students')->where('id', $log->student_id)
+                    ->update(array_intersect_key($data, array_flip($allowed)));
                 break;
+
             case 'SubjectChange':
-                if ($log->admission_id) {
-                    DB::table('admissions')->where('id', $log->admission_id)
-                        ->update(array_intersect_key($data, array_flip(['subject_basic','subject_drop','subject_practical'])));
+                // Selected subjects live on student_applications, not admissions.
+                if ($log->admission_id && isset($data['selected_subjects'])) {
+                    $appId = DB::table('admissions')->where('id', $log->admission_id)->value('application_id');
+                    if ($appId) {
+                        DB::table('student_applications')->where('id', $appId)
+                            ->update(['selected_subjects' => json_encode($data['selected_subjects']), 'updated_at' => now()]);
+                    }
                 }
                 break;
+
             case 'MobileUpdate':
                 if (isset($data['new_mobile'])) {
                     DB::table('students')->where('id', $log->student_id)->update(['mobile' => $data['new_mobile']]);
                 }
                 break;
+
             case 'BlockUnblock':
                 if (isset($data['action'])) {
                     DB::table('students')->where('id', $log->student_id)
-                        ->update(['is_blocked' => $data['action'] === 'block']);
+                        ->update([
+                            'is_blocked'   => $data['action'] === 'block',
+                            'block_reason' => $data['reason'] ?? null,
+                        ]);
                 }
                 break;
+
             case 'AdmissionCancel':
                 if ($log->admission_id) {
-                    DB::table('admissions')->where('id', $log->admission_id)->update(['status' => 'Cancelled']);
+                    DB::table('admissions')->where('id', $log->admission_id)->update([
+                        'status'       => 'cancelled',
+                        'cancel_date'  => now()->toDateString(),
+                        'cancel_reason'=> $data['reason'] ?? null,
+                    ]);
                 }
                 break;
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 5. BLOCK / UNBLOCK USER (Authorization version — direct action)
+    // 5. BLOCK / UNBLOCK STUDENT
     // GET /authorizations/block-unblock?query=...
     // ─────────────────────────────────────────────────────────────────────────
     public function blockUnblockSearch(Request $request)
     {
-        $search = $request->input('query', '');
+        $search  = $request->input('query', '');
         $session = $request->input('session');
+        $latestReg = $this->latestRegistrationSub();
 
-        $q = DB::table('admissions as a')
-            ->join('students as s', 's.id', '=', 'a.student_id')
-            ->join('classes as c',  'c.id', '=', 'a.class_id')
+        $q = DB::table('students as s')
+            ->leftJoin('admissions as a', function ($j) {
+                $j->on('a.student_id', '=', 's.id')->where('a.status', 'active');
+            })
+            ->leftJoin('programs as p', 'p.id', '=', 'a.program_id')
+            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->select(
-                'a.id as admission_id', 'a.student_id', 'a.application_no',
-                'a.university_roll_no', 'a.session', 'a.semester_no',
-                's.name', 's.father_name', 's.mother_name', 's.spouse_name',
-                's.gender', 's.category', 's.mobile', 's.aadhar_no', 's.is_blocked',
-                'c.name as class_name'
+                'a.id as admission_id', 's.id as student_id', 'a.admission_no',
+                'a.academic_year as session', 'a.semester_no',
+                's.first_name', 's.middle_name', 's.last_name',
+                'dr.name as reg_name', 'dr.father_name', 'dr.mother_name',
+                's.gender', 's.category', 's.mobile', 's.aadhar_no', 's.is_blocked', 's.block_reason',
+                'p.short_name as class_name'
             )
             ->where(function ($qb) use ($search) {
-                $qb->where('a.application_no',      'like', "%$search%")
-                   ->orWhere('a.reg_no',             'like', "%$search%")
-                   ->orWhere('a.university_roll_no', 'like', "%$search%");
+                $qb->where('a.admission_no', 'ilike', "%$search%")
+                   ->orWhere('s.mobile', 'ilike', "%$search%")
+                   ->orWhere('s.aadhar_no', 'ilike', "%$search%")
+                   ->orWhere('s.abc_id', 'ilike', "%$search%")
+                   ->orWhere('dr.name', 'ilike', "%$search%");
             });
 
-        if ($session) $q->where('a.session', $session);
+        if ($session) $q->where('a.academic_year', $session);
 
-        $result = $q->first();
+        $result = $q->orderByDesc('a.created_at')->first();
+        if ($result) $result = $this->decorate($result);
 
         return response()->json($result ? ['data' => $result] : ['data' => null, 'message' => 'Not found']);
     }
@@ -441,29 +444,29 @@ class AuthorizationController extends Controller
     public function blockUnblockAction(Request $request)
     {
         $request->validate([
-            'student_id' => 'required|integer',
+            'student_id' => 'required|integer|exists:students,id',
             'action'     => 'required|in:block,unblock',
             'reason'     => 'nullable|string',
         ]);
 
         DB::table('students')->where('id', $request->input('student_id'))
             ->update([
-                'is_blocked' => $request->input('action') === 'block',
-                'updated_at' => now(),
+                'is_blocked'   => $request->input('action') === 'block',
+                'block_reason' => $request->input('action') === 'block' ? $request->input('reason') : null,
+                'updated_at'   => now(),
             ]);
 
-        // Also log to amendment_logs for audit
         DB::table('amendment_logs')->insert([
             'student_id'   => $request->input('student_id'),
             'action_type'  => 'BlockUnblock',
             'changed_data' => json_encode(['action' => $request->input('action'), 'reason' => $request->input('reason')]),
-            'modified_by'  => auth()->id(),
+            'modified_by'  => (string) $request->user()?->id,
             'status'       => 'Completed',
             'created_at'   => now(),
             'updated_at'   => now(),
         ]);
 
-        $msg = $request->input('action') === 'block' ? 'User blocked.' : 'User unblocked.';
+        $msg = $request->input('action') === 'block' ? 'Student blocked.' : 'Student unblocked.';
         return response()->json(['message' => $msg]);
     }
 }

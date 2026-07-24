@@ -2,39 +2,70 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Http\Concerns\ResolvesStudentIdentity;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use NumberFormatter;
 
+/**
+ * REBUILT against the real schema. Was joining a `classes` table that never
+ * existed and reading admissions/fee_receipts columns that never existed
+ * (application_no, reg_no, university_roll_no, session, required_fee,
+ * fine_amount on admissions; fee_type/amount/utr_no/payment_date/created_by
+ * on fee_receipts). See FeesController.php's header comment for the full
+ * rundown of what the real columns actually are.
+ */
 class FinancialController extends Controller
 {
+    use ResolvesStudentIdentity;
+
     // ─────────────────────────────────────────────────────────────────────────
     // SHARED: lookup student by any identifier
     // ─────────────────────────────────────────────────────────────────────────
     private function findStudent(string $key): ?object
     {
-        return DB::table('admissions as a')
+        $latestReg = $this->latestRegistrationSub();
+
+        $row = DB::table('admissions as a')
             ->join('students as s',  's.id', '=', 'a.student_id')
-            ->join('classes as c',   'c.id', '=', 'a.class_id')
             ->leftJoin('programs as p', 'p.id', '=', 'a.program_id')
+            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->select(
-                'a.id as admission_id', 'a.student_id', 'a.application_no',
-                'a.reg_no', 'a.university_roll_no', 'a.session',
-                'a.semester_no', 'a.required_fee', 'a.fine_amount',
-                's.name', 's.father_name', 's.mother_name', 's.spouse_name',
-                's.gender', 's.category', 's.mobile', 's.aadhar_no',
-                'c.name as class_name', 'p.name as program_name'
+                'a.id as admission_id', 'a.student_id', 'a.admission_no',
+                'a.academic_year as session', 'a.semester_no', 'a.program_id', 'a.admission_type',
+                's.first_name', 's.middle_name', 's.last_name',
+                'dr.name as reg_name', 'dr.father_name', 'dr.mother_name',
+                's.gender', 's.category', 's.mobile', 's.aadhar_no', 's.abc_id',
+                'p.short_name as class_name', 'p.full_name as program_name'
             )
             ->where(function ($q) use ($key) {
-                $q->where('a.application_no',      $key)
-                  ->orWhere('a.reg_no',             $key)
-                  ->orWhere('a.university_roll_no', $key)
-                  ->orWhere('a.student_id',         $key)
-                  ->orWhere('s.mobile',             $key);
+                $q->where('a.admission_no',  $key)
+                  ->orWhere('a.student_id',  $key)
+                  ->orWhere('s.mobile',      $key)
+                  ->orWhere('s.aadhar_no',   $key)
+                  ->orWhere('s.abc_id',      $key);
             })
             ->orderByDesc('a.created_at')
             ->first();
+
+        if (!$row) return null;
+
+        $row->name = !empty($row->reg_name) ? $row->reg_name
+            : trim(implode(' ', array_filter([$row->first_name, $row->middle_name, $row->last_name])));
+
+        // Required fee — computed on the fly from fee_structures (admissions
+        // has nowhere to store a per-admission required/fine amount).
+        $row->required_fee = (float) DB::table('fee_structures')
+            ->where('program_id', $row->program_id)
+            ->where('academic_year', $row->session)
+            ->whereIn('semester_no', array_unique([0, (int) $row->semester_no]))
+            ->where('admission_type', $row->admission_type)
+            ->where('is_active', true)
+            ->sum('amount');
+
+        return $row;
     }
 
     // Convert number to words (INR)
@@ -52,15 +83,30 @@ class FinancialController extends Controller
         }
     }
 
+    /** Build the mandatory fee_receipts.fee_breakdown JSON for a single-line manual entry. */
+    private function singleLineBreakdown(string $label, float $amount): array
+    {
+        return [['fee_head_id' => null, 'fee_head_name' => $label, 'amount' => $amount]];
+    }
+
+    private function nextReceiptNo(string $prefix): string
+    {
+        return $prefix . date('Y') . str_pad(
+            (int) (DB::table('fee_receipts')->max('id') ?? 0) + 1, 6, '0', STR_PAD_LEFT
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // 1. CREATE FEE TRANSFER VOUCHER
     // GET /financial/fee-transfer-voucher?search=...&session=...&category=...&gender=...
     // ─────────────────────────────────────────────────────────────────────────
     public function feeTransferVoucherIndex(Request $request)
     {
-        // Return fee-head definitions + optional student data
+        // fee_heads has no sort_order column — order by category then name instead.
         $feeHeads = DB::table('fee_heads')
-            ->orderBy('sort_order')
+            ->where('is_active', true)
+            ->orderBy('category')
+            ->orderBy('name')
             ->get();
 
         $student = null;
@@ -68,19 +114,26 @@ class FinancialController extends Controller
             $student = $this->findStudent($search);
         }
 
-        // Fetch voucher rows for a student if found
         $voucher = null;
         if ($student) {
             $voucher = DB::table('fee_transfer_vouchers as v')
                 ->where('v.admission_id', $student->admission_id)
                 ->where('v.session', $request->input('session', $student->session))
-                ->with('items')
                 ->first();
 
-            // Also attach fee breakdown from fee_receipts
+            if ($voucher) {
+                // DB::table() query builder has no with() — load items separately.
+                $voucher->items = DB::table('fee_transfer_voucher_items')
+                    ->where('voucher_id', $voucher->id)
+                    ->get();
+            }
+
             $paidFees = DB::table('fee_receipts')
                 ->where('admission_id', $student->admission_id)
-                ->select('fee_type', 'amount', 'bank_account', 'receipt_no')
+                ->select(
+                    'receipt_type as fee_type', 'net_amount as amount',
+                    'bank_ref_no as bank_account', 'receipt_no'
+                )
                 ->get();
             $student->paid_fees = $paidFees;
         }
@@ -96,7 +149,7 @@ class FinancialController extends Controller
     public function feeTransferVoucherStore(Request $request)
     {
         $request->validate([
-            'admission_id'      => 'required|integer',
+            'admission_id'      => 'required|integer|exists:admissions,id',
             'session'           => 'required|string',
             'items'             => 'required|array',
             'items.*.fee_type'  => 'required|string',
@@ -108,7 +161,6 @@ class FinancialController extends Controller
         $grandTotal = collect($request->input('items'))->sum('amount');
 
         DB::transaction(function () use ($request, $grandTotal) {
-            // Upsert voucher header
             $voucherId = DB::table('fee_transfer_vouchers')->insertGetId([
                 'admission_id'    => $request->input('admission_id'),
                 'session'         => $request->input('session'),
@@ -125,7 +177,6 @@ class FinancialController extends Controller
                 'updated_at'      => now(),
             ]);
 
-            // Insert items
             foreach ($request->input('items') as $item) {
                 if ((float) $item['amount'] > 0) {
                     DB::table('fee_transfer_voucher_items')->insert([
@@ -149,7 +200,7 @@ class FinancialController extends Controller
 
     // ─────────────────────────────────────────────────────────────────────────
     // 2. ONLINE FEE ACCEPT
-    // GET /financial/online-fee-accept?reg_no=...
+    // GET /financial/online-fee-accept?query=...
     // ─────────────────────────────────────────────────────────────────────────
     public function onlineFeeAcceptSearch(Request $request)
     {
@@ -161,16 +212,12 @@ class FinancialController extends Controller
         $history = [];
         if ($student) {
             $history = DB::table('fee_receipts as fr')
-                ->join('admissions as a', 'a.id', '=', 'fr.admission_id')
-                ->join('students as s',   's.id', '=', 'a.student_id')
-                ->join('classes as c',    'c.id', '=', 'a.class_id')
-                ->where('a.student_id', $student->student_id)
+                ->where('fr.student_id', $student->student_id)
                 ->select(
-                    'fr.id', 'fr.fee_type as paid_for', 'fr.amount as paid_fee',
-                    'fr.paid_date as pay_date', 'fr.receipt_no as pay_ref_no',
-                    'fr.bank_ref_no', 'fr.utr_no', 'fr.status',
-                    'a.reg_no', 'a.semester_no', 's.name', 's.father_name',
-                    'c.name as class_name'
+                    'fr.id', 'fr.receipt_type as paid_for', 'fr.net_amount as paid_fee',
+                    'fr.receipt_date as pay_date', 'fr.receipt_no as pay_ref_no',
+                    'fr.bank_ref_no', 'fr.transaction_id as utr_no',
+                    DB::raw('CASE WHEN fr.status = \'cancelled\' THEN \'Rejected\' WHEN fr.is_verified THEN \'Verified\' ELSE \'Pending\' END as status')
                 )
                 ->orderByDesc('fr.created_at')
                 ->get();
@@ -183,7 +230,7 @@ class FinancialController extends Controller
     public function onlineFeeAcceptStore(Request $request)
     {
         $request->validate([
-            'admission_id' => 'required|integer',
+            'admission_id' => 'required|integer|exists:admissions,id',
             'payment_for'  => 'required|string',
             'bank_ref_no'  => 'required|string',
             'utr_no'       => 'required|string',
@@ -191,27 +238,36 @@ class FinancialController extends Controller
             'amount'       => 'required|numeric|min:1',
         ]);
 
-        $receiptNo = 'RCP' . date('Y') . str_pad(
-            DB::table('fee_receipts')->max('id') + 1, 6, '0', STR_PAD_LEFT
-        );
+        $admission = DB::table('admissions')->where('id', $request->input('admission_id'))->first();
+        if (!$admission) return response()->json(['message' => 'Admission not found.'], 404);
+
+        $receiptNo = $this->nextReceiptNo('RCP');
+        $amount    = (float) $request->input('amount');
 
         DB::table('fee_receipts')->insert([
-            'admission_id' => $request->input('admission_id'),
-            'fee_type'     => $request->input('payment_for'),
-            'amount'       => $request->input('amount'),
-            'paid_date'    => $request->input('payment_date'),
-            'bank_ref_no'  => $request->input('bank_ref_no'),
-            'utr_no'       => $request->input('utr_no'),
-            'receipt_no'   => $receiptNo,
-            'status'       => 'Paid',
-            'issued_by'    => auth()->id(),
-            'created_at'   => now(),
-            'updated_at'   => now(),
+            'organization_id' => $admission->organization_id,
+            'student_id'      => $admission->student_id,
+            'admission_id'    => $admission->id,
+            'academic_year'   => $admission->academic_year,
+            'semester_no'     => $admission->semester_no,
+            'receipt_type'    => 'miscellaneous',
+            'receipt_no'      => $receiptNo,
+            'receipt_date'    => $request->input('payment_date'),
+            'total_amount'    => $amount,
+            'net_amount'      => $amount,
+            'payment_mode'    => 'online',
+            'transaction_id'  => $request->input('utr_no'),
+            'bank_ref_no'     => $request->input('bank_ref_no'),
+            'fee_breakdown'   => json_encode($this->singleLineBreakdown($request->input('payment_for'), $amount)),
+            'is_verified'     => false,
+            'generated_by'    => auth()->id(),
+            'status'          => 'active',
+            'created_at'      => now(),
+            'updated_at'      => now(),
         ]);
 
-        // Update admission fee status
         DB::table('admissions')
-            ->where('id', $request->input('admission_id'))
+            ->where('id', $admission->id)
             ->update(['fee_status' => 'Paid', 'updated_at' => now()]);
 
         return response()->json([
@@ -234,18 +290,13 @@ class FinancialController extends Controller
         $history = [];
         if ($student) {
             $history = DB::table('transaction_updates as tu')
-                ->join('admissions as a', 'a.id', '=', 'tu.admission_id')
-                ->join('students as s',   's.id', '=', 'a.student_id')
-                ->join('classes as c',    'c.id', '=', 'a.class_id')
-                ->where('a.student_id', $student->student_id)
+                ->where('tu.admission_id', $student->admission_id)
                 ->select(
                     'tu.id', 'tu.fee_update_for', 'tu.amount as update_fee',
                     'tu.paid_date as pay_date', 'tu.payment_ref_no',
                     'tu.utr_no', 'tu.bank_ref_no', 'tu.gateway_status',
                     'tu.ref_no', 'tu.update_date', 'tu.status',
-                    'tu.created_by', 'tu.approved_by',
-                    'a.reg_no', 'a.semester_no', 's.name', 's.father_name',
-                    'c.name as class_name'
+                    'tu.created_by', 'tu.approved_by'
                 )
                 ->orderByDesc('tu.created_at')
                 ->get();
@@ -258,7 +309,7 @@ class FinancialController extends Controller
     public function updateTransactionStore(Request $request)
     {
         $request->validate([
-            'admission_id'    => 'required|integer',
+            'admission_id'    => 'required|integer|exists:admissions,id',
             'fee_update_for'  => 'required|string',
             'amount'          => 'required|numeric|min:0',
             'paid_date'       => 'required|date',
@@ -269,7 +320,7 @@ class FinancialController extends Controller
         ]);
 
         $refNo = 'TXU' . date('Y') . str_pad(
-            DB::table('transaction_updates')->max('id') + 1, 6, '0', STR_PAD_LEFT
+            (int) (DB::table('transaction_updates')->max('id') ?? 0) + 1, 6, '0', STR_PAD_LEFT
         );
 
         $id = DB::table('transaction_updates')->insertGetId([
@@ -283,21 +334,25 @@ class FinancialController extends Controller
             'ref_no'          => $refNo,
             'update_date'     => now()->toDateString(),
             'status'          => 'Pending',
-            'created_by'      => $request->input('update_created_by') ?? auth()->id(),
+            'created_by'      => (string) ($request->input('update_created_by') ?? auth()->id()),
             'created_at'      => now(),
             'updated_at'      => now(),
         ]);
 
-        // Also update the matching fee_receipt if found
+        // Best-effort: reflect the corrected reference numbers on the most
+        // recent receipt for this admission (fee_receipts has no fee_type
+        // column to match "fee_update_for" against, so this matches on
+        // admission_id + most recent rather than a specific fee line).
         if ($request->input('utr_no')) {
             DB::table('fee_receipts')
                 ->where('admission_id', $request->input('admission_id'))
-                ->where('fee_type', $request->input('fee_update_for'))
+                ->orderByDesc('created_at')
+                ->limit(1)
                 ->update([
-                    'utr_no'     => $request->input('utr_no'),
-                    'bank_ref_no'=> $request->input('bank_ref_no'),
-                    'paid_date'  => $request->input('paid_date'),
-                    'updated_at' => now(),
+                    'transaction_id' => $request->input('utr_no'),
+                    'bank_ref_no'    => $request->input('bank_ref_no'),
+                    'receipt_date'   => $request->input('paid_date'),
+                    'updated_at'     => now(),
                 ]);
         }
 

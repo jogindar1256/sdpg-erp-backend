@@ -14,6 +14,10 @@ class Program extends Model
     protected $fillable = [
         'organization_id', 'name', 'short_name', 'code', 'level',
         'duration_years', 'total_semesters', 'semester_type', 'description', 'is_active',
+        // Real columns added by later migrations that were never added here —
+        // meant these fields silently dropped out of every mass-assignment
+        // (Program::create()/update()) even though the columns existed.
+        'full_name', 'course_code', 'is_self_finance', 'approval_type', 'exam_mode',
     ];
 
     protected $casts = ['is_active' => 'boolean'];

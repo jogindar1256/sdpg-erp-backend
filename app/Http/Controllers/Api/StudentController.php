@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Concerns\LocksStudentIdentity;
 use App\Models\Student;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
@@ -13,6 +14,8 @@ use Illuminate\Support\Facades\Storage;
 
 class StudentController extends Controller
 {
+    use LocksStudentIdentity;
+
     public function index(Request $request): JsonResponse
     {
         $query = Student::with(['currentAdmission.program', 'organization'])
@@ -48,6 +51,106 @@ class StudentController extends Controller
         ]);
 
         return response()->json($student);
+    }
+
+    /**
+     * GET /student/profile
+     * Self-service profile used by the student portal's "Registered Details
+     * (locked)" card. `students` has first_name/middle_name/last_name (no
+     * name/father_name/mother_name columns), so those identity fields come
+     * from the direct_registrations snapshot — same source and matching
+     * pattern used by parseApp()/studentRegistrationDashboard() elsewhere.
+     * This route previously pointed at a controller method that didn't
+     * exist at all (Call to undefined method), which is why every load of
+     * this card silently failed.
+     */
+    public function myProfile(Request $request): JsonResponse
+    {
+        $student = DB::table('students')->where('user_id', $request->user()->id)->first();
+        if (!$student) {
+            return response()->json(['message' => 'Student profile not found.'], 404);
+        }
+
+        $registration = DB::table('direct_registrations')
+            ->where(function ($q) use ($request, $student) {
+                $q->where('user_id', $request->user()->id);
+                if (!empty($student->mobile)) {
+                    $q->orWhereRaw('RIGHT(mobile, 10) = RIGHT(?, 10)', [$student->mobile]);
+                }
+            })
+            ->whereNull('deleted_at')
+            ->orderByDesc('id')
+            ->first();
+
+        $fullName = trim(implode(' ', array_filter([
+            $student->first_name ?? null,
+            $student->middle_name ?? null,
+            $student->last_name ?? null,
+        ])));
+
+        return response()->json(['data' => [
+            'id'                  => $student->id,
+            'full_name'           => $registration->name ?? $fullName,
+            'first_name'          => $student->first_name,
+            'middle_name'         => $student->middle_name,
+            'last_name'           => $student->last_name,
+            'father_name'         => $registration->father_name ?? null,
+            'mother_name'         => $registration->mother_name ?? null,
+            'date_of_birth'       => $student->date_of_birth,
+            'gender'              => $student->gender,
+            'category'            => $student->category,
+            'religion'            => $student->religion,
+            'nationality'         => $student->nationality,
+            'aadhar_no'           => $student->aadhar_no,
+            'abc_id'              => $student->abc_id,
+            'ddurn'               => $student->ddurn,
+            'family_id'           => $student->family_id,
+            'mobile'              => $student->mobile,
+            'alternate_mobile'    => $student->alternate_mobile,
+            'email'               => $student->email,
+            'whatsapp_no'         => $student->whatsapp_no,
+            'permanent_address'   => $student->permanent_address,
+            'permanent_city'      => $student->permanent_city,
+            'permanent_district'  => $student->permanent_district,
+            'permanent_state'     => $student->permanent_state,
+            'permanent_pin'       => $student->permanent_pin,
+            'enrollment_no'       => $student->enrollment_no,
+            'student_code'        => $student->student_code,
+            'photo_path'          => $student->photo_path,
+            'has_registration_snapshot' => (bool) $registration,
+        ]]);
+    }
+
+    /**
+     * PUT /student/profile
+     * Students may only update non-identity contact fields here — name,
+     * DOB, gender, category, aadhar/ABC/DDURN/family id, and permanent
+     * address stay locked to the registration snapshot to keep ERP data
+     * integrity (same locked-field list as the application form).
+     */
+    public function updateProfile(Request $request): JsonResponse
+    {
+        $student = DB::table('students')->where('user_id', $request->user()->id)->first();
+        if (!$student) {
+            return response()->json(['message' => 'Student profile not found.'], 404);
+        }
+
+        $clean = $this->stripLockedIdentity($request->all(), $request->user()->id);
+
+        $allowed = array_intersect_key($clean, array_flip([
+            'alternate_mobile', 'whatsapp_no', 'correspondence_address',
+            'correspondence_city', 'correspondence_district',
+            'correspondence_state', 'correspondence_pin', 'same_as_permanent',
+        ]));
+
+        if (empty($allowed)) {
+            return response()->json(['message' => 'No editable fields were provided.'], 422);
+        }
+
+        $allowed['updated_at'] = now();
+        DB::table('students')->where('id', $student->id)->update($allowed);
+
+        return response()->json(['message' => 'Profile updated.']);
     }
 
     public function store(Request $request): JsonResponse

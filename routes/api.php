@@ -21,25 +21,137 @@ use App\Http\Controllers\Api\AmendmentController;
 use App\Http\Controllers\Api\CertificateController;
 use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\ReportController;
-use App\Http\Controllers\College\FeesController;
+use App\Http\Controllers\Api\FeesController;
+use App\Http\Controllers\Api\SecurityController;
+use App\Http\Controllers\Api\LookupController;
+use App\Http\Controllers\PaymentLedgerController;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Http\Request;
 
 // ─── Public Routes ─────────────────────────────────────────────────────────────
 
 Route::prefix('auth')->group(function () {
     Route::post('login', [AuthController::class, 'login']);
     Route::post('student/login', [AuthController::class, 'studentLogin']);
-    Route::post('student/register', [StudentRegistrationController::class, 'register']);      // remove the extra "auth/"
-    Route::post('student/check-mobile', [StudentRegistrationController::class, 'checkMobile']);  // remove the extra "auth/"
+    Route::get('student/lookup', [StudentRegistrationController::class, 'loginLookup']);
+    Route::post('student/register', [StudentRegistrationController::class, 'register']);
+    Route::post('student/check-mobile', [StudentRegistrationController::class, 'checkMobile']);
+    Route::post('forgot-password', [AuthController::class, 'forgotPassword']);
+    Route::post('reset-password', [AuthController::class, 'resetPassword']);
+    Route::post('student/forgot-password', [AuthController::class, 'studentForgotPassword']);
+    Route::post('student/reset-password', [AuthController::class, 'studentResetPassword']);
+});
+
+Route::prefix('student/register')->group(function () {
+    // Public catalog for the registration form (form is public — must not need auth)
+    Route::get('courses', [StudentRegistrationController::class, 'publicCourses']);
+    Route::get('programs/{program}/subjects', [StudentRegistrationController::class, 'publicSubjects']);
+    Route::get('meta', [StudentRegistrationController::class, 'registrationMeta']);
+    // Groupwise (A/B/C) subjects for the public registration form dropdowns
+    Route::get('subject-groups', [MasterSettingsController::class, 'publicSubjectGroups']);
+    // Vocational / co-curricular papers — populates the Minor Subject dropdown
+    Route::get('vocational-papers', [MasterSettingsController::class, 'publicVocationalPapers']);
+
+
+    // Step-1 OTP — verify mobile + email BEFORE anything is created (keyed by contact).
+    Route::post('otp/phone/send', [StudentRegistrationController::class, 'preSendPhoneOtp']);
+    Route::post('otp/phone/verify', [StudentRegistrationController::class, 'preVerifyPhoneOtp']);
+    Route::post('otp/email/send', [StudentRegistrationController::class, 'preSendEmailOtp']);
+    Route::post('otp/email/verify', [StudentRegistrationController::class, 'preVerifyEmailOtp']);
+
+    // Create the draft (only succeeds once both OTPs are verified).
+    Route::post('init', [StudentRegistrationController::class, 'initiate']);
+
+    // Edit an unpaid draft (college "Modify" + student editing while payment pending).
+    Route::get('draft/{id}', [StudentRegistrationController::class, 'showDraft']);
+    Route::put('draft/{id}', [StudentRegistrationController::class, 'updateDraft']);
+
+    Route::post('payment/initiate', [StudentRegistrationController::class, 'initiatePayment']);
+    Route::post('payment/verify', [StudentRegistrationController::class, 'verifyPayment']);
+    Route::post('payment/failed', [StudentRegistrationController::class, 'paymentFailed']);
+
+    Route::get('receipt/{id}', [StudentRegistrationController::class, 'receipt']);
+    // Registration slip — full details + payment status (available once paid).
+    Route::get('slip/{id}', [StudentRegistrationController::class, 'registrationSlip']);
 });
 
 
-// IFSC lookup (public)
-Route::get(
-    'bank/ifsc/{code}',
-    fn(string $code) =>
-    response()->json(\App\Models\BankBranch::where('ifsc_code', strtoupper($code))->firstOrFail())
-);
+Route::get('bank/search', function (Request $request) {
+    $q = trim($request->query('q', ''));
+
+    if (strlen($q) < 2) {
+        return response()->json([]);
+    }
+
+    $like = '%' . strtoupper($q) . '%';
+    $upper = strtoupper($q);
+
+    $branches = DB::table('bank_branches')
+        ->where(function ($query) use ($like) {
+            $query->whereRaw('UPPER(ifsc_code)   LIKE ?', [$like])
+                ->orWhereRaw('UPPER(branch_name) LIKE ?', [$like])
+                ->orWhereRaw('UPPER(city)        LIKE ?', [$like])
+                ->orWhereRaw('UPPER(district)    LIKE ?', [$like])
+                ->orWhereRaw('UPPER(bank_name)   LIKE ?', [$like]);
+        })
+        ->select('id', 'ifsc_code', 'bank_name', 'branch_name', 'city', 'district', 'state', 'micr_code', 'address')
+        // Exact IFSC first; branch_name tiebreak so shared-IFSC rows don't
+        // come back in arbitrary order (2000 rows all matched rank 0 before).
+        ->orderByRaw('CASE WHEN UPPER(ifsc_code) = ? THEN 0 ELSE 1 END', [$upper])
+        ->orderBy('bank_name')
+        ->orderBy('branch_name')
+        ->limit(20)
+        ->get();
+
+    return response()->json($branches);
+});
+
+
+Route::get('bank/ifsc/{code}', function (Request $request, string $code) {
+    $ifsc = strtoupper(trim($code));
+    $q = trim($request->query('q', ''));
+
+    $base = DB::table('bank_branches')->where('ifsc_code', $ifsc);
+
+    $total = (clone $base)->count();
+    if ($total === 0) {
+        return response()->json(['message' => 'IFSC not found.'], 404);
+    }
+
+    if ($q !== '') {
+        $like = '%' . strtoupper($q) . '%';
+        $base->where(function ($query) use ($like) {
+            $query->whereRaw('UPPER(branch_name) LIKE ?', [$like])
+                ->orWhereRaw('UPPER(city)        LIKE ?', [$like])
+                ->orWhereRaw('UPPER(district)    LIKE ?', [$like]);
+        });
+    }
+
+    $branches = $base
+        ->select('id', 'ifsc_code', 'bank_name', 'branch_name', 'city', 'district', 'state', 'micr_code', 'address', 'phone')
+        ->orderBy('branch_name')
+        ->limit(50)
+        ->get();
+
+    return response()->json([
+        'ifsc_code' => $ifsc,
+        'bank_name' => $branches->first()->bank_name ?? null,
+        'multiple' => $total > 1,
+        'total' => $total,
+        'branches' => $branches,
+    ]);
+});
+
+// PIN code -> district/state autofill, and University name autocomplete.
+// Public: also backs the public student registration/application forms.
+Route::get('pincode/search', [LookupController::class, 'pincodeSearch']);
+Route::get('pincode/states', [LookupController::class, 'states']);
+Route::get('pincode/districts', [LookupController::class, 'districts']);
+Route::get('pincode/{code}', [LookupController::class, 'pincode']);
+
+Route::get('university/search', [LookupController::class, 'universitySearch']);
+Route::get('university/states', [LookupController::class, 'universityStates']);
 
 // ─── Authenticated Routes ───────────────────────────────────────────────────────
 
@@ -91,51 +203,72 @@ Route::middleware('auth:sanctum')->group(function () {
         // Applications (Office view)
         Route::prefix('applications')->group(function () {
 
-            // Fresh Applications
+            // GET  /applications
             Route::get('/', [ApplicationController::class, 'index']);
-            Route::get('/{id}', [ApplicationController::class, 'show']);
-            Route::get('/lookup-student', [ApplicationController::class, 'lookupStudent']);
 
-            // Hold management
+            // POST /applications   (office creates back-paper / upgrade app on behalf of student)
+            Route::post('/', [ApplicationController::class, 'storeOffice']);
+
+            // GET  /applications/office-lookup?q=
+            Route::get('/office-lookup', [ApplicationController::class, 'officeLookup']);
+
+            // GET  /applications/hold
+            // POST /applications/hold
             Route::get('/hold', [ApplicationController::class, 'holdIndex']);
             Route::post('/hold', [ApplicationController::class, 'holdStore']);
-            Route::patch('/{id}/release-hold', [ApplicationController::class, 'holdRelease']);
 
-            // Back Paper
-            Route::prefix('back-paper')->group(function () {
-                Route::get('/', [ApplicationController::class, 'backPaperIndex']);
-                Route::get('/papers', [ApplicationController::class, 'backPaperPapers']);
-                Route::post('/', [ApplicationController::class, 'backPaperStore']);
-            });
+            // GET  /applications/back-paper/papers?admission_id=&semester_no=
+            Route::get('/back-paper/papers', [ApplicationController::class, 'backPaperPapers']);
 
-            // Semester Upgrade
-            Route::prefix('upgrade')->group(function () {
-                Route::get('/', [ApplicationController::class, 'upgradeIndex']);
-                Route::post('/', [ApplicationController::class, 'upgradeStore']);
-                Route::patch('/{id}/status', [ApplicationController::class, 'upgradeUpdateStatus']);
-            });
-
-            // Registration Form Status (summary)
+            // GET  /applications/registration-form-status  (alias — old frontend URL)
             Route::get('/registration-form-status', [ApplicationController::class, 'registrationFormStatus']);
 
-            // Document upload/delete
-            Route::post('/documents', [ApplicationController::class, 'uploadDocument']);
-            Route::delete('/documents/{id}', [ApplicationController::class, 'deleteDocument']);
+            // ── Wildcard — MUST be last inside this prefix group ─────────────────────
+
+            // GET  /applications/{id}
+            Route::get('/{id}', [ApplicationController::class, 'show'])->whereNumber('id');
+
+            // PUT  /applications/{id}/part/{part}   (office edits any part — no ownership check)
+            Route::put('/{id}/part/{part}', [ApplicationController::class, 'updatePartOffice']);
+
+            // GET  /applications/{id}/print   (full application PDF — completed & fee-paid only)
+            Route::get('/{id}/print', [ApplicationController::class, 'printForm']);
+
+            // Education fee (fresh / semester_upgrade / lateral) — office
+            Route::post('/{id}/pay/initiate', [ApplicationController::class, 'applicationPayInitiate']);
+            Route::post('/{id}/pay/verify', [ApplicationController::class, 'applicationPayVerify']);
+            Route::post('/{id}/pay/failed', [ApplicationController::class, 'applicationPayFailed']);
+
+            // Back paper — office save / pay / print (fee comes from fee_structures master)
+            Route::put('/{id}/back-paper', [ApplicationController::class, 'saveBackPaperSelection']);
+            Route::post('/{id}/back-paper/pay/initiate', [ApplicationController::class, 'backPaperPayInitiate']);
+            Route::post('/{id}/back-paper/pay/verify', [ApplicationController::class, 'backPaperPayVerify']);
+            Route::post('/{id}/back-paper/pay/failed', [ApplicationController::class, 'backPaperPayFailed']);
+            Route::get('/{id}/back-paper/print', [ApplicationController::class, 'printBackPaperForm']);
+
+            // PATCH /applications/{id}/status   (approve / reject / reopen)
+            Route::patch('/{id}/status', [ApplicationController::class, 'updateStatus']);
+
+            // PATCH /applications/{id}/release-hold
+            Route::patch('/{id}/release-hold', [ApplicationController::class, 'holdRelease']);
         });
 
         // Admissions
-        Route::apiResource('admissions', AdmissionController::class)->except(['store', 'destroy']);
-        Route::post('admissions/{admission}/verify', [AdmissionController::class, 'verify']);
-        Route::post('admissions/{admission}/cancel', [AdmissionController::class, 'cancel']);
-        Route::get('admissions/statistics', [AdmissionController::class, 'statistics']);
-        Route::get('admissions/upgrade-list', [AdmissionController::class, 'upgradeList']);
-        Route::post('admissions/{admission}/upgrade', [AdmissionController::class, 'upgrade']);
-        Route::get('admissions/biometrics', [AdmissionController::class, 'biometrics']);
-        Route::patch('admissions/biometrics/{student}', [AdmissionController::class, 'updateBiometric']);
-        Route::get('admissions/education-fee', [AdmissionController::class, 'educationFee']);
-        Route::get('admissions/ledger', [AdmissionController::class, 'ledger']);
-        Route::get('admissions/statistics', [AdmissionController::class, 'statistics']);
-        Route::get('admissions/subject-statistics', [AdmissionController::class, 'subjectStatistics']);
+        Route::prefix('admissions')->group(function () {
+            Route::apiResource('/', AdmissionController::class)->except(['store', 'destroy']);
+            Route::post('{admission}/verify', [AdmissionController::class, 'verify']);
+            Route::post('{admission}/cancel', [AdmissionController::class, 'cancel']);
+            Route::get('statistics', [AdmissionController::class, 'statistics']);
+            Route::get('upgrade-list', [AdmissionController::class, 'upgradeList']);
+            Route::post('{admission}/upgrade', [AdmissionController::class, 'upgrade']);
+            Route::get('biometrics', [AdmissionController::class, 'biometrics']);
+            Route::patch('biometrics/{student}', [AdmissionController::class, 'updateBiometric']);
+            Route::get('education-fee', [AdmissionController::class, 'educationFee']);
+            Route::get('ledger', [AdmissionController::class, 'ledger']);
+            Route::get('statistics', [AdmissionController::class, 'statistics']);
+            Route::get('subject-statistics', [AdmissionController::class, 'subjectStatistics']);
+        });
+
 
         // Fee Receipts
         Route::get('fee-receipts', [FeeReceiptController::class, 'index']);
@@ -158,17 +291,22 @@ Route::middleware('auth:sanctum')->group(function () {
             // Registration Status summary
             Route::get('status', [RegistrationController::class, 'registrationStatus']);
 
+            // Office "Modify" — view + edit a registration's details, allowed
+            // even AFTER payment (students are locked out once paid).
+            Route::get('{id}/details', [StudentRegistrationController::class, 'showDraft']);
+            Route::put('{id}/details', [StudentRegistrationController::class, 'adminUpdateDraft']);
+
+            // Cancel — the only way the same mobile/aadhar/abc_id can register
+            // again for the same session + course.
+            Route::post('{id}/cancel', [StudentRegistrationController::class, 'cancelRegistration']);
+
             // Student Status lookup
             Route::get('student-status', [RegistrationController::class, 'studentStatus']);
 
-            // Subject Group
-            Route::get('subject-groups', [RegistrationController::class, 'subjectGroupIndex']);
-            Route::post('subject-groups', [RegistrationController::class, 'subjectGroupStore']);
-            Route::delete('subject-groups/{id}', [RegistrationController::class, 'subjectGroupDestroy']);
-            Route::post('subject-groups/auto-assign', [RegistrationController::class, 'subjectGroupAutoAssign']);
-
             // Stats
             Route::get('stats', [RegistrationController::class, 'stats']);
+            Route::get('self-registered', [StudentRegistrationController::class, 'adminIndex']);
+
         });
 
         // ── Examination ───────────────────────────────────────────────────────
@@ -379,6 +517,22 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::apiResource('sms-templates', SmsTemplateController::class);
         Route::post('sms-templates/{smsTemplate}/preview', [SmsTemplateController::class, 'preview']);
 
+        Route::prefix('security')->group(function () {
+            Route::get('users', [SecurityController::class, 'users']);
+            Route::post('users', [SecurityController::class, 'createUser']);
+            Route::patch('users/{id}/deactivate', [SecurityController::class, 'deactivateUser']);
+            Route::post('users/{id}/reset-password', [SecurityController::class, 'resetPassword']);
+            Route::get('permissions', [SecurityController::class, 'permissions']);
+            Route::get('users/{id}/permissions', [SecurityController::class, 'getUserPermissions']);
+            Route::put('users/{id}/permissions', [SecurityController::class, 'updateUserPermissions']);
+            Route::get('login-status', [SecurityController::class, 'loginStatus']);
+            Route::get('active-sessions', [SecurityController::class, 'activeSessions']);
+            Route::post('sessions/{tokenId}/force-logout', [SecurityController::class, 'forceLogout']);
+            Route::get('session-summary', [SecurityController::class, 'sessionSummary']);
+            Route::get('menu-shortcodes', [SecurityController::class, 'menuShortcodes']);
+            Route::put('menu-shortcodes', [SecurityController::class, 'saveMenuShortcodes']);
+        });
+
         // ── Admission Settings ────────────────────────────────────────────────────────
         Route::prefix('settings/admission')->group(function () {
             // Application Schedule
@@ -395,6 +549,7 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('enclosure', [MasterSettingsController::class, 'enclosureMasterIndex']);
             Route::post('enclosure', [MasterSettingsController::class, 'enclosureMasterStore']);
             Route::delete('enclosure/{id}', [MasterSettingsController::class, 'enclosureMasterDestroy']);
+            Route::post('enclosure/bulk', [MasterSettingsController::class, 'enclosureMasterBulkStore']);
 
             // Fee Head
             Route::get('fee-heads', [MasterSettingsController::class, 'feeHeadIndex']);
@@ -406,6 +561,7 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('fee-structure', [MasterSettingsController::class, 'feeStructureIndex']);
             Route::post('fee-structure', [MasterSettingsController::class, 'feeStructureStore']);
             Route::post('fee-structure/copy', [MasterSettingsController::class, 'feeStructureCopyYear']);
+            Route::post('reg-fee/copy', [MasterSettingsController::class, 'registrationFeeCopyYear']);
 
             // Registration Fee
             Route::get('reg-fee', [MasterSettingsController::class, 'registrationFeeIndex']);
@@ -441,7 +597,9 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::delete('allotted-subjects/{id}', [MasterSettingsController::class, 'allottedSubjectDestroy']);
 
             Route::get('subject-papers', [MasterSettingsController::class, 'subjectPaperIndex']);
+            Route::get('subject-papers/print', [MasterSettingsController::class, 'subjectPaperPrint']);
             Route::post('subject-papers', [MasterSettingsController::class, 'subjectPaperStore']);
+            Route::put('subject-papers/{id}', [MasterSettingsController::class, 'subjectPaperUpdate']);
             Route::delete('subject-papers/{id}', [MasterSettingsController::class, 'subjectPaperDestroy']);
 
             Route::get('subject-seats', [MasterSettingsController::class, 'subjectSeatIndex']);
@@ -449,11 +607,17 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::delete('subject-seats/{id}', [MasterSettingsController::class, 'subjectSeatDestroy']);
 
             Route::get('subject-selection', [MasterSettingsController::class, 'subjectSelectionIndex']);
+            Route::get('subject-selection/print', [MasterSettingsController::class, 'subjectSelectionPrint']);
             Route::post('subject-selection', [MasterSettingsController::class, 'subjectSelectionStore']);
             Route::delete('subject-selection/{id}', [MasterSettingsController::class, 'subjectSelectionDestroy']);
+            Route::delete('subject-selection-group', [MasterSettingsController::class, 'subjectSelectionGroupDestroy']);
+            // Groupwise subjects for application/registration dropdowns (auth)
+            Route::get('subject-groups', [MasterSettingsController::class, 'subjectGroups']);
 
             Route::get('vocational-papers', [MasterSettingsController::class, 'vocationalPaperIndex']);
+            Route::get('vocational-papers/print', [MasterSettingsController::class, 'vocationalPaperPrint']);
             Route::post('vocational-papers', [MasterSettingsController::class, 'vocationalPaperStore']);
+            Route::put('vocational-papers/{id}', [MasterSettingsController::class, 'vocationalPaperUpdate']);
             Route::delete('vocational-papers/{id}', [MasterSettingsController::class, 'vocationalPaperDestroy']);
         });
 
@@ -475,76 +639,89 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::delete('counselling/{id}', [MasterSettingsController::class, 'counsellingDestroy']);
         });
 
+        // payment ledger
+        Route::prefix('ledger')->group(function () {
+            Route::get('/', [PaymentLedgerController::class, 'index']);
+            Route::get('/summary', [PaymentLedgerController::class, 'summary']);
+            Route::get('/student/{studentId}', [PaymentLedgerController::class, 'studentStatement']);
+            Route::get('/{id}', [PaymentLedgerController::class, 'show']);
+            Route::post('/offline', [PaymentLedgerController::class, 'storeOffline']);
+            Route::post('/{id}/verify', [PaymentLedgerController::class, 'verify']);
+            Route::post('/{id}/refund', [PaymentLedgerController::class, 'refund']);
+        });
+
+
     });
 
     // ── STUDENT PORTAL ────────────────────────────────────────────────────
-    // Route::middleware('portal:student')->prefix('student')->group(function () {
-
-    //     // Profile
-    //     Route::get('profile', [StudentController::class, 'myProfile']);
-    //     Route::put('profile', [StudentController::class, 'updateProfile']);
-
-    //     // Applications
-    //     Route::get('applications/{application}', [ApplicationController::class, 'show']);
-    //     Route::get('applications', [ApplicationController::class, 'myApplications']);
-    //     Route::post('applications', [ApplicationController::class, 'store']);
-    //     Route::put('applications/{application}/part/{part}', [ApplicationController::class, 'updatePart']);
-    //     Route::post('applications/{application}/submit', [ApplicationController::class, 'submit']);
-
-    //     // Documents
-    //     Route::post('documents', [\App\Http\Controllers\Api\DocumentController::class, 'upload']);
-    //     Route::get('documents', [\App\Http\Controllers\Api\DocumentController::class, 'myDocuments']);
-
-    //     // Fee Receipts
-    //     Route::get('fee-receipts', [FeeReceiptController::class, 'myReceipts']);
-    //     Route::get('fee-receipts/{r}/download', [FeeReceiptController::class, 'download']);
-
-    //     // Exam
-    //     Route::get('examinations', [ExaminationController::class, 'available']);
-    //     Route::post('exam-applications', [ExaminationController::class, 'applyExam']);
-    //     Route::get('exam-applications/my', [ExaminationController::class, 'myApplications']);
-    //     Route::get('exam-applications/{app}/admit-card', [ExaminationController::class, 'myAdmitCard']);
-
-    //     // Certificates
-    //     Route::get('certificates', [CertificateController::class, 'myCertificates']);
-    //     Route::get('certificates/{c}/download', [CertificateController::class, 'download']);
-
-    //     // Amendments
-    //     Route::post('amendments', [AmendmentController::class, 'store']);
-    //     Route::get('amendments', [AmendmentController::class, 'myAmendments']);
-
-    //     Route::get('programs', [ProgramController::class, 'index']);
-    // });
 
     Route::middleware(['auth:sanctum', 'portal:student'])->prefix('student')->group(function () {
 
-        // ── Lookup ────────────────────────────────────────────────────────────────
-        // FIX: was missing — /programs was behind portal:college, blocking students
         Route::get('programs', [ProgramController::class, 'index']);
+
 
         // ── Student profile ───────────────────────────────────────────────────────
         Route::get('profile', [StudentController::class, 'myProfile']);
         Route::put('profile', [StudentController::class, 'updateProfile']);
 
-        // ── Student Applications ──────────────────────────────────────────────────
-        // These were MISSING — caused "Application not found" when opening /student/applications/{id}
+        Route::get('programs', [ApplicationController::class, 'studentPrograms']);
+        // Numeric-only so it does not swallow /student/applications, /student/profile, etc.
+        Route::get('/{id}', [ApplicationController::class, 'studentShow'])->whereNumber('id');
+
         Route::prefix('applications')->group(function () {
 
-            // List + Create
+            // GET  /student/applications
             Route::get('/', [ApplicationController::class, 'myApplications']);
+
+            // POST /student/applications
             Route::post('/', [ApplicationController::class, 'store']);
 
-            // Single application — show, update a part, submit
-            Route::get('/{id}', [ApplicationController::class, 'show']);
+            // GET  /student/applications/upgrade/self   (pre-fill upgrade form)
+            Route::get('/upgrade/self', [ApplicationController::class, 'upgradeSelf']);
+
+            // GET  /student/applications/back-paper/papers?semester_no=
+            Route::get('/back-paper/papers', [ApplicationController::class, 'studentBackPaperPapers']);
+
+            // ── Wildcard — MUST be last ───────────────────────────────────────────────
+
+            // GET  /student/applications/{id}
+            Route::get('/{id}', [ApplicationController::class, 'show'])->whereNumber('id');
+
+            // PUT  /student/applications/{id}/part/{part}
             Route::put('/{id}/part/{part}', [ApplicationController::class, 'updatePart']);
+
+            // POST /student/applications/{id}/submit
             Route::post('/{id}/submit', [ApplicationController::class, 'submit']);
 
-            // Document upload for an application
+            // POST /student/applications/{id}/documents
             Route::post('/{id}/documents', [ApplicationController::class, 'uploadStudentDocument']);
+
+            // Back paper — student self-service save / pay / print (ownership-checked)
+            // Education fee (fresh / semester_upgrade / lateral) — student
+            Route::post('/{id}/pay/initiate', [ApplicationController::class, 'studentApplicationPayInitiate']);
+            Route::post('/{id}/pay/verify', [ApplicationController::class, 'studentApplicationPayVerify']);
+            Route::post('/{id}/pay/failed', [ApplicationController::class, 'studentApplicationPayFailed']);
+
+            Route::put('/{id}/back-paper', [ApplicationController::class, 'studentSaveBackPaperSelection']);
+            Route::post('/{id}/back-paper/pay/initiate', [ApplicationController::class, 'studentBackPaperPayInitiate']);
+            Route::post('/{id}/back-paper/pay/verify', [ApplicationController::class, 'studentBackPaperPayVerify']);
+            Route::post('/{id}/back-paper/pay/failed', [ApplicationController::class, 'studentBackPaperPayFailed']);
+            Route::get('/{id}/back-paper/print', [ApplicationController::class, 'studentPrintBackPaperForm']);
+            Route::get('/{id}/back-paper/receipt', [ApplicationController::class, 'studentDownloadBackPaperReceipt']);
         });
+
+
 
         // ── Program subjects (used by Part 6 subject selection) ───────────────────
         Route::get('programs/{programId}/subjects', [ProgramController::class, 'subjects']);
+
+        Route::get('registration-status', [RegistrationController::class, 'studentPortalStatus']);
+
+        // Student Registration Dashboard (identity card + activity rows)
+        Route::get('registration/dashboard', [RegistrationController::class, 'studentRegistrationDashboard']);
+
+        Route::get('registration/pending', [StudentRegistrationController::class, 'studentPending']);
+        Route::post('registration/pay', [StudentRegistrationController::class, 'payPending']);
     });
 
     // ── UNIVERSITY PORTAL ────────────────────────────────────────────────
