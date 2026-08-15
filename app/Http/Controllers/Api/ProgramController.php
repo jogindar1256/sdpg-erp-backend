@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Program;
 use App\Models\Subject;
+use App\Models\SubjectPaper;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -89,5 +90,28 @@ public function subjects(Request $request, $programId)
         'optional' => $subjects->whereIn('type', ['optional', 'elective', 'project'])->values(),
         'all'      => $subjects,
     ]);
+}
+
+// Real paper code/name for a subject — settings/course/subject-papers,
+// NOT the subject's own code/name column (a subject can have more than
+// one paper under the DDU system). Grouped by subject_id so the frontend
+// can show every paper under whichever subject was picked, or "Not
+// configured" when nothing exists for that subject/semester yet — never a
+// fabricated code.
+public function subjectPapers(Request $request, $programId)
+{
+    $semesterNo = $request->query('semester');
+    $sessionYear = $request->query('session_year');
+
+    $papers = SubjectPaper::where('program_id', $programId)
+        ->when($semesterNo, fn($q) => $q->where('semester_no', (string) $semesterNo))
+        ->when($sessionYear, fn($q) => $q->where('session_year', $sessionYear))
+        ->orderBy('subject_id')
+        ->orderBy('paper_code')
+        ->get(['id', 'subject_id', 'paper_code', 'paper_name', 'paper_type', 'session_year', 'semester_no', 'group_label', 'max_marks', 'min_marks']);
+
+    $bySubject = $papers->groupBy('subject_id')->map(fn ($rows) => $rows->values());
+
+    return response()->json(['by_subject' => $bySubject]);
 }
 }

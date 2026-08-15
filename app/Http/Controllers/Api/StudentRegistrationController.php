@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Support\RegistrationInputGuard;
+use App\Support\TextNormalizer;
 use Barryvdh\DomPDF\Facade\Pdf;   // pure-PHP PDF (no wkhtmltopdf binary needed)
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -38,6 +40,10 @@ class StudentRegistrationController extends Controller
             'mobile'      => 'required|digits:10',
             'email'       => 'required|email|max:100',
             'aadhar_no'   => 'required|digits:12',
+            // Only the three gender categories the Government of India legally
+            // recognizes (NALSA v. Union of India, 2014; Transgender Persons
+            // (Protection of Rights) Act, 2019) — no free-text "Other" bypass.
+            'gender'      => 'required|in:Male,Female,Transgender',
             'session'     => 'required|string|max:12',  // e.g. 2025-2026
             'ddurn_no'    => 'required|string|max:50',
             'abc_id'      => 'required|string|max:50',
@@ -47,6 +53,44 @@ class StudentRegistrationController extends Controller
         if ($v->fails()) {
             return response()->json(['errors' => $v->errors()], 422);
         }
+
+        // Server-side port of src/lib/registrationSecurity.tsx — the frontend
+        // already blocks junk names ("wordpress" instead of a real name),
+        // placeholder Aadhaar (checked against the Verhoeff checksum, not just
+        // digit count), placeholder mobile numbers, and junk ABC ID/Family
+        // ID/DDURN values, but that's only enforced in the browser. Anyone
+        // POSTing directly to this endpoint would skip all of it, so the same
+        // checks are re-run here as the authoritative gate before anything is
+        // written to direct_registrations.
+        $guardErrors = [];
+        foreach (['name', 'father_name', 'mother_name'] as $nameField) {
+            if ($msg = RegistrationInputGuard::nameError((string) $req->input($nameField))) {
+                $guardErrors[$nameField] = [$msg];
+            }
+        }
+        if ($msg = RegistrationInputGuard::aadhaarError((string) $req->aadhar_no)) {
+            $guardErrors['aadhar_no'] = [$msg];
+        }
+        if ($msg = RegistrationInputGuard::mobileError((string) $req->mobile)) {
+            $guardErrors['mobile'] = [$msg];
+        }
+        if ($msg = RegistrationInputGuard::ddurnError((string) $req->ddurn_no)) {
+            $guardErrors['ddurn_no'] = [$msg];
+        }
+        if ($msg = RegistrationInputGuard::abcIdError((string) $req->abc_id)) {
+            $guardErrors['abc_id'] = [$msg];
+        }
+        if ($msg = RegistrationInputGuard::familyIdError((string) $req->family_id)) {
+            $guardErrors['family_id'] = [$msg];
+        }
+        if ($guardErrors) {
+            return response()->json(['errors' => $guardErrors], 422);
+        }
+
+        // Backstop: uppercase free text server-side too (frontend already
+        // does this live as the student types) — email/mobile/session etc.
+        // are left alone automatically by TextNormalizer's key exclusions.
+        $req->merge(TextNormalizer::upper($req->all()));
 
         // ── Require mobile + email OTP verification BEFORE anything is created.
         // Nothing is drafted, no registration number is generated, and no email
@@ -190,6 +234,15 @@ class StudentRegistrationController extends Controller
     public function preSendPhoneOtp(Request $req): JsonResponse
     {
         $req->validate(['mobile' => 'required|digits:10']);
+
+        // Reject placeholder/junk numbers (0000000000, 1234567890, etc.)
+        // server-side too — the frontend's mobileError() already blocks these
+        // in the browser, but this endpoint is hit directly by fetch/axios
+        // and would otherwise burn real SMS credits on fake numbers.
+        if ($msg = RegistrationInputGuard::mobileError((string) $req->mobile)) {
+            return response()->json(['message' => $msg, 'errors' => ['mobile' => [$msg]]], 422);
+        }
+
         $otp = rand(100000, 999999);
         Cache::put("pre_phone_otp_{$req->mobile}", $otp, now()->addMinutes(10));
 
@@ -298,7 +351,10 @@ class StudentRegistrationController extends Controller
         ];
         $update = [];
         foreach ($fields as $f) {
-            if ($req->has($f)) $update[$f] = $req->input($f) ?: null;
+            // Backstop: same uppercase normalization as initiate() — none of
+            // these whitelisted fields are email/password, so it's safe to
+            // apply unconditionally here.
+            if ($req->has($f)) $update[$f] = TextNormalizer::upperValue($req->input($f)) ?: null;
         }
         $update['updated_at'] = now();
 
@@ -756,7 +812,10 @@ class StudentRegistrationController extends Controller
             ->orderByDesc('id')
             ->first();
 
-        $genderMap = ['male' => 'Male', 'female' => 'Female', 'other' => 'Trans', 'trans' => 'Trans'];
+        // 'other'/'trans' kept as aliases so pre-migration rows (written before
+        // gender values were standardized to the three GoI-recognized
+        // categories) still map correctly — new rows only ever use 'transgender'.
+        $genderMap = ['male' => 'Male', 'female' => 'Female', 'transgender' => 'Transgender', 'other' => 'Transgender', 'trans' => 'Transgender'];
 
         $data = [
             'name'              => trim("{$student->first_name} " . ($student->middle_name ?? '') . " {$student->last_name}"),
@@ -790,6 +849,53 @@ class StudentRegistrationController extends Controller
             'found'   => true,
             'source'  => $prior ? 'students+prior_registration' : 'students',
             'data'    => array_filter($data, fn ($v) => $v !== null && $v !== ''),
+        ]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 8d. COUNSELLING LOOKUP — for programs whose admission_conditions row is
+    //     "Through Counselling". Unlike fetchOldRecord() above (which looks
+    //     for a RETURNING DDU student), this checks the entrance-counselling
+    //     import for a first-time applicant's allotment, scoped to the exact
+    //     program + session so a roll number from a different year/course
+    //     can't match. Public (pre-registration, no student row exists yet).
+    //     GET /student/register/counselling-lookup?program_id=&session_year=&entrance_roll_no=
+    // ──────────────────────────────────────────────────────────────────────
+    public function counsellingLookup(Request $req): JsonResponse
+    {
+        $req->validate([
+            'program_id'       => 'required|exists:programs,id',
+            'session_year'     => 'required|string',
+            'entrance_roll_no' => 'required|string',
+        ]);
+
+        $row = DB::table('counselling_reports')
+            ->where('program_id', $req->program_id)
+            ->where('session_year', $req->session_year)
+            ->where('entrance_roll_no', trim($req->entrance_roll_no))
+            ->first();
+
+        if (!$row) {
+            return response()->json([
+                'found'   => false,
+                'message' => 'No counselling record found for this roll number under the selected class and session.',
+            ]);
+        }
+
+        // gender/social_category are already stored Title-Case ('Male',
+        // 'General', etc.) matching the registration form's own option
+        // values exactly — no remapping needed, unlike fetchOldRecord()'s
+        // students-table source which stores them lowercase.
+        return response()->json([
+            'found'  => true,
+            'source' => 'counselling_reports',
+            'data'   => [
+                'name'        => $row->name,
+                'father_name' => $row->father_name,
+                'mother_name' => $row->mother_name,
+                'gender'      => $row->gender,
+                'category'    => $row->social_category,
+            ],
         ]);
     }
 
@@ -933,7 +1039,7 @@ class StudentRegistrationController extends Controller
             $last  = $parts ? array_pop($parts) : '';
             $middle = $parts ? implode(' ', $parts) : null;
 
-            $genderMap = ['male' => 'male', 'female' => 'female', 'other' => 'other'];
+            $genderMap = ['male' => 'male', 'female' => 'female', 'transgender' => 'transgender', 'other' => 'transgender', 'trans' => 'transgender'];
             $gender    = $genderMap[strtolower((string) $reg->gender)] ?? null;
 
             $catMap = ['general' => 'general', 'gen' => 'general', 'obc' => 'obc', 'sc' => 'sc', 'st' => 'st', 'ews' => 'ews'];

@@ -38,6 +38,8 @@ class MasterSettingsController extends Controller
             'semester_name' => 'required|string',
             'semester_no' => 'required|string',
             'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
+            // Widened from a bare date to a full timestamp so the office can
+            // set an exact admission open/close TIME, not just a day.
             'start_admission' => 'required|date',
             'close_admission' => 'required|date|after:start_admission',
             'late_fee_applicable' => 'required|boolean',
@@ -63,6 +65,23 @@ class MasterSettingsController extends Controller
 
     public function applicationScheduleUpdate(Request $req, $id)
     {
+        // Update previously had no validation at all, so a bad edit (close
+        // time before start time, missing program) would save silently.
+        // Now enforced the same as create.
+        $v = Validator::make($req->all(), [
+            'program_id' => 'sometimes|required|exists:programs,id',
+            'session_year' => 'sometimes|required|string',
+            'semester_name' => 'sometimes|required|string',
+            'semester_no' => 'sometimes|required|string',
+            'exam_mode' => 'sometimes|required|in:Regular,Back Paper,Upgrade',
+            'start_admission' => 'sometimes|required|date',
+            'close_admission' => 'sometimes|required|date|after:start_admission',
+            'late_fee_applicable' => 'sometimes|required|boolean',
+            'late_fee' => 'nullable|numeric|min:0',
+        ]);
+        if ($v->fails())
+            return response()->json(['errors' => $v->errors()], 422);
+
         DB::table('application_schedules')->where('id', $id)->update(array_merge(
             $req->only([
                 'program_id',
@@ -92,15 +111,23 @@ class MasterSettingsController extends Controller
         // Previously selected admission_conditions.* only, with no join to
         // programs — so the "Class" column the frontend tries to render
         // was always empty even though program_id was saved correctly.
-        return response()->json(
-            DB::table('admission_conditions as ac')
-                ->join('programs as p', 'p.id', 'ac.program_id')
-                ->select('ac.*', 'p.short_name as class', 'p.full_name', 'p.name as program_name')
-                ->when($req->program_id, fn($q) => $q->where('ac.program_id', $req->program_id))
-                ->when($req->session_year, fn($q) => $q->where('ac.session_year', $req->session_year))
-                ->orderByDesc('ac.id')
-                ->get()
-        );
+        $rows = DB::table('admission_conditions as ac')
+            ->join('programs as p', 'p.id', 'ac.program_id')
+            ->select('ac.*', 'p.short_name as class', 'p.full_name', 'p.name as program_name')
+            ->when($req->program_id, fn($q) => $q->where('ac.program_id', $req->program_id))
+            ->when($req->session_year, fn($q) => $q->where('ac.session_year', $req->session_year))
+            ->orderByDesc('ac.id')
+            ->get();
+
+        // category_requirements is stored as a JSON string column — decode it
+        // here so the frontend gets a real object per row instead of having
+        // to JSON.parse it itself.
+        $rows->transform(function ($r) {
+            $r->category_requirements = $r->category_requirements ? json_decode($r->category_requirements, true) : null;
+            return $r;
+        });
+
+        return response()->json($rows);
     }
 
     public function admissionConditionStore(Request $req)
@@ -112,20 +139,45 @@ class MasterSettingsController extends Controller
             'qualifying_class' => 'required|string',
             'condition_type' => 'required|in:Open Admission,Through Counselling,Cut Off Merit List,Out Of Merit List',
             'allotted_seat' => 'required|integer',
-            'required_percent_gen' => 'required|numeric',
-            'required_percent_obc' => 'required|numeric',
-            'required_percent_sc' => 'required|numeric',
-            'required_percent_st' => 'required|numeric',
-            'required_percent_ews' => 'required|numeric',
+            'is_blocked' => 'nullable|boolean',
+            // Required-% by category is keyed by category code (gen/obc/sc/st/ews),
+            // each holding a Mark-vs-CGPA type plus separate Male/Female/Trans
+            // values — replaces the old single-value-per-category columns.
+            'category_requirements'              => 'required|array',
+            'category_requirements.gen'          => 'required|array',
+            'category_requirements.obc'          => 'required|array',
+            'category_requirements.sc'           => 'required|array',
+            'category_requirements.st'           => 'required|array',
+            'category_requirements.ews'          => 'required|array',
+            'category_requirements.*.mark_type'  => 'required|in:Mark,CGPA',
+            'category_requirements.*.male'       => 'nullable|numeric|min:0',
+            'category_requirements.*.female'     => 'nullable|numeric|min:0',
+            'category_requirements.*.trans'      => 'nullable|numeric|min:0',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
         DB::table('admission_conditions')->updateOrInsert(
             ['program_id' => $req->program_id, 'session_year' => $req->session_year, 'semester_no' => $req->semester_no],
-            array_merge($req->all(), ['updated_at' => now()])
+            [
+                'qualifying_class'       => $req->qualifying_class,
+                'condition_type'         => $req->condition_type,
+                'allotted_seat'          => $req->allotted_seat,
+                'is_blocked'             => (bool) $req->is_blocked,
+                'category_requirements'  => json_encode($req->category_requirements),
+                'updated_at'             => now(),
+            ]
         );
         return response()->json(['message' => 'Condition saved.']);
+    }
+
+    public function admissionConditionDestroy($id)
+    {
+        $deleted = DB::table('admission_conditions')->where('id', $id)->delete();
+        if (!$deleted) {
+            return response()->json(['message' => 'Condition not found.'], 404);
+        }
+        return response()->json(['message' => 'Condition deleted.']);
     }
 
     // 3. Enclosure Master ─────────────────────────────────────────────
@@ -278,11 +330,22 @@ class MasterSettingsController extends Controller
             DB::table('fee_structures as fs')
                 ->join('programs as p', 'p.id', 'fs.program_id')
                 ->join('fee_heads as fh', 'fh.id', 'fs.fee_head_id')
-                ->select('fs.*', 'p.short_name as class', 'fh.name as fee_head', 'fh.in_favor_of')
+                ->select(
+                    'fs.id', 'fs.organization_id', 'fs.program_id', 'fs.fee_head_id', 'fs.semester_no',
+                    'fs.academic_year', 'fs.admission_type', 'fs.amount', 'fs.amounts', 'fs.term',
+                    'fs.sdpgc_student', 'fs.ddu_affiliated', 'fs.late_fine_per_day', 'fs.due_date',
+                    'fs.is_active', 'fs.created_at', 'fs.updated_at',
+                    'p.short_name as class',
+                    'fh.name as fee_head',
+                    'fh.in_favor_of as fee_head_default_favor',
+                    DB::raw('COALESCE(fs.in_favor_of, fh.in_favor_of) as in_favor_of')
+                )
                 ->when($req->program_id, fn($q) => $q->where('fs.program_id', $req->program_id))
                 ->when($req->session_year, fn($q) => $q->where('fs.academic_year', $req->session_year))
                 ->when($req->semester_no, fn($q) => $q->where('fs.semester_no', $req->semester_no))
                 ->when($admissionType, fn($q) => $q->where('fs.admission_type', $admissionType))
+                ->when($req->has('sdpgc_student'), fn($q) => $q->where('fs.sdpgc_student', $req->boolean('sdpgc_student')))
+                ->when($req->has('ddu_affiliated'), fn($q) => $q->where('fs.ddu_affiliated', $req->boolean('ddu_affiliated')))
                 ->orderBy('fh.name')
                 ->get()
         );
@@ -298,6 +361,13 @@ class MasterSettingsController extends Controller
             'exam_mode' => 'required|in:Regular,Back Paper,Upgrade,Lateral',
             'term' => 'required|in:Admission,Semester Registration',
             'amounts' => 'required|array',
+            // PG/B.Ed.-only pass-out-source flags. Absent/false for every
+            // other program level — see 2026_08_15_090000_add_pass_out_
+            // flags_to_fee_structures.php for why these are part of the
+            // row's identity rather than a plain attribute.
+            'sdpgc_student' => 'nullable|boolean',
+            'ddu_affiliated' => 'nullable|boolean',
+            'in_favor_of' => 'nullable|in:College,University,Government',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -311,12 +381,15 @@ class MasterSettingsController extends Controller
                 'academic_year' => $req->session_year,
                 'semester_no' => $req->semester_no,
                 'admission_type' => self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? 'regular',
+                'sdpgc_student' => $req->boolean('sdpgc_student'),
+                'ddu_affiliated' => $req->boolean('ddu_affiliated'),
             ],
             [
                 'organization_id' => $orgId,
                 'term' => $req->term,
                 'amounts' => json_encode($req->amounts),
                 'amount' => (float) array_sum($req->amounts), // legacy scalar column kept in sync, unused by this UI
+                'in_favor_of' => $req->in_favor_of,
                 'updated_at' => now(),
             ]
         );
@@ -346,12 +419,15 @@ class MasterSettingsController extends Controller
                     'academic_year' => $req->to_year,
                     'semester_no' => $r->semester_no,
                     'admission_type' => $r->admission_type,
+                    'sdpgc_student' => $r->sdpgc_student,
+                    'ddu_affiliated' => $r->ddu_affiliated,
                 ],
                 [
                     'organization_id' => $r->organization_id,
                     'term' => $r->term,
                     'amounts' => $r->amounts,
                     'amount' => $r->amount,
+                    'in_favor_of' => $r->in_favor_of,
                     'updated_at' => now(),
                 ]
             );
@@ -809,8 +885,11 @@ class MasterSettingsController extends Controller
     {
         return response()->json(
             DB::table('subject_papers as sp')
-                ->join('programs as p', 'p.id', 'sp.program_id')
-                ->join('subjects as s', 's.id', 'sp.subject_id')
+                // left join, not inner — a stale/re-pointed program_id or
+                // subject_id must never silently hide an otherwise-real
+                // subject_papers row from this list.
+                ->leftJoin('programs as p', 'p.id', 'sp.program_id')
+                ->leftJoin('subjects as s', 's.id', 'sp.subject_id')
                 ->select('sp.*', 'p.short_name as class', 's.name as subject_name')
                 ->when($req->program_id, fn($q) => $q->where('sp.program_id', $req->program_id))
                 ->when($req->semester_no, fn($q) => $q->where('sp.semester_no', $req->semester_no))
@@ -939,7 +1018,7 @@ class MasterSettingsController extends Controller
         $isBsc = $this->programIsBsc($program);
 
         $rows = DB::table('subject_papers as sp')
-            ->join('subjects as s', 's.id', 'sp.subject_id')
+            ->leftJoin('subjects as s', 's.id', 'sp.subject_id')
             ->select('sp.*', 's.name as subject_name')
             ->where('sp.program_id', $req->program_id)
             ->where('sp.semester_no', $req->semester_no)
@@ -1229,7 +1308,7 @@ class MasterSettingsController extends Controller
     {
         return response()->json(
             DB::table('vocational_papers as vp')
-                ->join('programs as p', 'p.id', 'vp.program_id')
+                ->leftJoin('programs as p', 'p.id', 'vp.program_id')
                 ->select('vp.*', 'p.short_name as class')
                 ->when($req->program_id, fn($q) => $q->where('vp.program_id', $req->program_id))
                 ->when($req->semester_no, fn($q) => $q->where('vp.semester_no', $req->semester_no))
@@ -1477,7 +1556,7 @@ class MasterSettingsController extends Controller
             'name' => 'required|string|max:255',
             'father_name' => 'required|string|max:255',
             'mother_name' => 'required|string|max:255',
-            'gender' => 'required|in:Male,Female,Trans',
+            'gender' => 'required|in:Male,Female,Transgender',
             'social_category' => 'required|in:General,OBC,SC,ST,EWS',
             'admission_category' => 'required|in:Regular,Private',
             'state_rank' => 'required|integer',

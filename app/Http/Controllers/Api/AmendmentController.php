@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Support\TextNormalizer;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
@@ -64,6 +65,8 @@ class AmendmentController extends Controller
                 'a.enrollment_no',
                 'a.account_no',
                 'a.semester_no',
+                'a.academic_year',
+                'a.admission_date',
                 'a.status as admission_status',
                 's.id as student_id',
                 's.first_name', 's.middle_name', 's.last_name',
@@ -203,11 +206,18 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function modifyGet(Request $req)
     {
-        $v = Validator::make($req->all(), ['search' => 'required|string']);
+        // modify-data/page.tsx doesn't call this directly — it hands
+        // <StudentLookup endpoint="/amendments/modify-data"> the lookup, and
+        // StudentLookup always posts its query under the key `query`
+        // (params: { query }), never `search`.
+        // NOTE: read via input(), not the magic ->query property — Request
+        // already declares a public $query (Symfony's GET InputBag), so
+        // $req->query would silently return that bag instead of the value.
+        $v = Validator::make($req->all(), ['query' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = $this->findStudent($req->search);
+        $student = $this->findStudent($req->input('query'));
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
@@ -270,7 +280,10 @@ class AmendmentController extends Controller
             'caste_cert_date' => 'caste_cert_date',
         ];
 
-        $in = $req->all();
+        // Backstop: uppercase free text server-side too (frontend already
+        // does this live as staff type). None of the mapped fields below are
+        // email/password, so it's safe to normalize the whole payload.
+        $in = TextNormalizer::upper($req->all());
         $studentData = [];
         foreach ($studentFieldMap as $in_key => $col) {
             if (array_key_exists($in_key, $in) && $in[$in_key] !== null) $studentData[$col] = $in[$in_key];
@@ -310,7 +323,7 @@ class AmendmentController extends Controller
             'student_id' => $req->student_id,
             'action_type' => 'ModifyData',
             'changed_data' => json_encode($data),
-            'modified_by' => $req->modified_by ?? 'staff',
+            'modified_by' => TextNormalizer::upperValue($req->modified_by) ?? 'staff',
             'ref_no' => $this->refNo('MD'),
             'status' => 'Pending',
             'created_at' => now(),
@@ -325,18 +338,29 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function subjectChangeGet(Request $req)
     {
-        $v = Validator::make($req->all(), ['search' => 'required|string']);
+        // print/subject-change/page.tsx always sends a `print` key alongside
+        // `queue_no`/`student_id` when looking up an already-submitted
+        // request. subject-change/page.tsx (the live form) only ever sends
+        // `student_id` — same has()-based branching as admissionCancelGet.
+        if ($req->has('print')) {
+            $printData = $this->subjectChangePrintData($req);
+            if (!$printData)
+                return response()->json(['message' => 'Subject change record not found.'], 404);
+
+            return response()->json($printData);
+        }
+
+        // subject-change/page.tsx sends `student_id`, not `search`. It also
+        // reads `available_subjects` and `fee_difference`, which this
+        // endpoint never returned at all — added below.
+        $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = $this->findStudent($req->search);
+        $student = $this->findStudent($req->student_id);
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
-        // Current subjects — application_subjects (the dropped dead table)
-        // never held real data. Subject selections live in
-        // student_applications.selected_subjects (JSON array of subject
-        // ids, or objects with a subject_id/id key).
         $app = DB::table('student_applications')
             ->where('student_id', $student->student_id)
             ->whereNull('deleted_at')
@@ -352,41 +376,178 @@ class AmendmentController extends Controller
             $subjectIds = array_values(array_filter($subjectIds));
         }
 
-        $subjects = $subjectIds
+        $currentRows = $subjectIds
             ? DB::table('subjects')->whereIn('id', $subjectIds)->get()
             : collect();
 
-        return response()->json(array_merge((array) $student, ['current_subjects' => $subjects]));
+        // Frontend reads subject_type/subject_name/paper_code/semester_no —
+        // direct rename off the real `subjects` columns (type/name/code/
+        // semester_no), no invented fields.
+        $shape = fn ($s) => [
+            'subject_type' => $s->type,
+            'subject_name' => $s->name,
+            'paper_code' => $s->code,
+            'semester_no' => $s->semester_no,
+        ];
+
+        $currentSubjects = $currentRows->map($shape)->values();
+
+        // Swap options: other active subjects in the same program & semester
+        // as what the student currently holds. The frontend filters this
+        // list client-side by subject_type per row.
+        $programId = DB::table('admissions')->where('id', $student->admission_id)->value('program_id');
+        $availableSubjects = collect();
+        if ($programId && $currentRows->isNotEmpty()) {
+            $semesters = $currentRows->pluck('semester_no')->unique()->values();
+            $availableSubjects = DB::table('subjects')
+                ->where('program_id', $programId)
+                ->whereIn('semester_no', $semesters)
+                ->where('is_active', true)
+                ->whereNull('deleted_at')
+                ->get()
+                ->map($shape)
+                ->values();
+        }
+
+        return response()->json([
+            'current_subjects' => $currentSubjects,
+            'available_subjects' => $availableSubjects,
+            // No fee-diff logic exists anywhere in this codebase to derive
+            // this from (which fee columns apply on a subject swap, whether
+            // it's prorated, etc.) — that's a product decision, not a
+            // mismatch. Returning 0 rather than guessing.
+            'fee_difference' => 0,
+        ]);
+    }
+
+    /**
+     * Resolves the printable subject-change record for
+     * print/subject-change/page.tsx, keyed by `queue_no` (preferred, backed
+     * by amendment_logs.ref_no) or falling back to the latest SubjectChange
+     * request for `student_id`.
+     */
+    private function subjectChangePrintData(Request $req): ?array
+    {
+        $log = null;
+        if ($req->filled('queue_no')) {
+            $log = DB::table('amendment_logs')
+                ->where('ref_no', $req->queue_no)
+                ->where('action_type', 'SubjectChange')
+                ->first();
+        } elseif ($req->filled('student_id')) {
+            $log = DB::table('amendment_logs')
+                ->where('student_id', $req->student_id)
+                ->where('action_type', 'SubjectChange')
+                ->orderByDesc('id')
+                ->first();
+        }
+
+        if (!$log)
+            return null;
+
+        $changed = $log->changed_data ? json_decode($log->changed_data, true) : [];
+        $newSubjects = $changed['new_subjects'] ?? [];     // {subject_type: paper_code}
+
+        $student = $this->findStudent((string) $log->student_id);
+
+        $adm = $student ? DB::table('admissions as a')
+            ->join('programs as p', 'p.id', 'a.program_id')
+            ->where('a.id', $student->admission_id)
+            ->select('a.academic_year', 'p.short_name as class_name')
+            ->first() : null;
+
+        // "Previous subject" per type comes from the same
+        // student_applications.selected_subjects source subjectChangeGet's
+        // form mode reads — the subjects on file before this request.
+        $app = DB::table('student_applications')
+            ->where('student_id', $log->student_id)
+            ->whereNull('deleted_at')
+            ->orderByDesc('id')
+            ->first();
+
+        $oldIds = [];
+        if ($app && $app->selected_subjects) {
+            $raw = json_decode($app->selected_subjects, true) ?? [];
+            foreach ($raw as $item) {
+                $oldIds[] = is_array($item) ? ($item['subject_id'] ?? $item['id'] ?? null) : $item;
+            }
+            $oldIds = array_values(array_filter($oldIds));
+        }
+        $oldByType = $oldIds
+            ? DB::table('subjects')->whereIn('id', $oldIds)->get()->keyBy('type')
+            : collect();
+
+        $newCodes = array_values(array_filter($newSubjects));
+        $newByCode = $newCodes
+            ? DB::table('subjects')->whereIn('code', $newCodes)->get()->keyBy('code')
+            : collect();
+
+        $changes = [];
+        foreach ($newSubjects as $type => $paperCode) {
+            $old = $oldByType->get($type);
+            $new = $newByCode->get($paperCode);
+            $changes[] = [
+                'subject_type' => $type,
+                'old_subject_name' => $old->name ?? null,
+                'old_paper_code' => $old->code ?? null,
+                'new_subject_name' => $new->name ?? null,
+                'new_paper_code' => $new->code ?? $paperCode,
+            ];
+        }
+
+        return [
+            'record' => [
+                'queue_no' => $log->ref_no,
+                'created_at' => $log->created_at,
+                'reg_no' => $student->reg_no ?? null,
+                'class_name' => $adm->class_name ?? null,
+                'semester_no' => $student->semester_no ?? null,
+                'session' => $adm->academic_year ?? null,
+                'status' => $log->status,
+                'fee_difference' => 0, // same caveat as the form GET above
+            ],
+            'student' => [
+                'name' => $student->name ?? null,
+                'father_name' => $student->father_name ?? null,
+            ],
+            'changes' => $changes,
+        ];
     }
 
     public function subjectChangeStore(Request $req)
     {
+        // subject-change/page.tsx sends `student_id` + `new_subjects` (a
+        // {subject_type: paper_code} map) + `drop_third_year` (an array of
+        // paper codes) — not `admission_id`/`drop_subject_id`, which meant
+        // every real submission 422'd on the missing admission_id alone.
         $v = Validator::make($req->all(), [
-            'admission_id' => 'required|exists:admissions,id',
+            'student_id' => 'required|exists:students,id',
             'new_subjects' => 'required|array',
-            'drop_subject_id' => 'nullable|exists:subjects,id',
+            'drop_third_year' => 'nullable|array',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
+        $admissionId = DB::table('admissions')->where('student_id', $req->student_id)->latest('id')->value('id');
         $refNo = $this->refNo('SUB');
 
         DB::table('amendment_logs')->insert([
-            'student_id' => DB::table('admissions')->find($req->admission_id)?->student_id,
-            'admission_id' => $req->admission_id,
+            'student_id' => $req->student_id,
+            'admission_id' => $admissionId,
             'action_type' => 'SubjectChange',
             'changed_data' => json_encode([
                 'new_subjects' => $req->new_subjects,
-                'drop_subject_id' => $req->drop_subject_id,
+                'drop_third_year' => $req->drop_third_year ?? [],
             ]),
-            'modified_by' => $req->modified_by ?? 'staff',
+            'modified_by' => TextNormalizer::upperValue($req->modified_by) ?? 'staff',
             'ref_no' => $refNo,
             'status' => 'Pending',
             'created_at' => now(),
             'updated_at' => now(),
         ]);
 
-        return response()->json(['message' => 'Subject change request queued.', 'ref_no' => $refNo]);
+        // subject-change/page.tsx reads res.data?.queue_no, not ref_no.
+        return response()->json(['message' => 'Subject change request queued.', 'queue_no' => $refNo]);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -394,11 +555,15 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function updateMobileGet(Request $req)
     {
-        $v = Validator::make($req->all(), ['search' => 'required|string']);
+        // update-mobile/page.tsx doesn't call this GET either — it gets
+        // `student` from the default /amendments/search lookup and posts
+        // straight to send-otp/update-mobile. Same dead-code param bug as
+        // blockUnblockGet; fixed for consistency in case it's ever wired up.
+        $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = $this->findStudent($req->search);
+        $student = $this->findStudent($req->student_id);
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
@@ -423,7 +588,7 @@ class AmendmentController extends Controller
             'student_id' => $req->student_id,
             'action_type' => 'MobileUpdate',
             'changed_data' => json_encode(['new_mobile' => $req->new_mobile, 'without_otp' => $req->without_otp]),
-            'modified_by' => $req->modified_by ?? 'staff',
+            'modified_by' => TextNormalizer::upperValue($req->modified_by) ?? 'staff',
             'ref_no' => $this->refNo('MOB'),
             'status' => 'Pending',
             'created_at' => now(),
@@ -450,11 +615,11 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function updateTcGet(Request $req)
     {
-        $v = Validator::make($req->all(), ['search' => 'required|string']);
+        $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = $this->findStudent($req->search);
+        $student = $this->findStudent($req->student_id);
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
@@ -479,12 +644,12 @@ class AmendmentController extends Controller
     public function updateTcStore(Request $req)
     {
         $v = Validator::make($req->all(), [
-            'admission_id' => 'required|exists:admissions,id',
+            'student_id' => 'required|exists:students,id',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $studentId = DB::table('admissions')->find($req->admission_id)?->student_id;
+        $studentId = $req->student_id;
 
         $app = DB::table('student_applications')
             ->where('student_id', $studentId)
@@ -497,10 +662,10 @@ class AmendmentController extends Controller
         }
 
         $part4 = $app->part_4 ? json_decode($app->part_4, true) : [];
-        if ($req->tc_data)
-            $part4 = array_merge($part4, $req->tc_data);
-        if ($req->migration_data)
-            $part4 = array_merge($part4, $req->migration_data);
+        if ($req->tc)
+            $part4 = array_merge($part4, TextNormalizer::upper($req->tc));
+        if ($req->migration)
+            $part4 = array_merge($part4, TextNormalizer::upper($req->migration));
 
         DB::table('student_applications')->where('id', $app->id)->update([
             'part_4' => json_encode($part4),
@@ -510,7 +675,7 @@ class AmendmentController extends Controller
         DB::table('amendment_logs')->insert([
             'student_id' => $studentId,
             'action_type' => 'TCMigrationUpdate',
-            'modified_by' => $req->modified_by ?? 'staff',
+            'modified_by' => TextNormalizer::upperValue($req->modified_by) ?? 'staff',
             'ref_no' => $this->refNo('TC'),
             'status' => 'Completed',
             'created_at' => now(),
@@ -708,11 +873,22 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function feeValueChangeGet(Request $req)
     {
-        $v = Validator::make($req->all(), ['search' => 'required|string']);
+        // fee-value-change/page.tsx sends `student_id` (+ `value_type`), not
+        // `search`.
+        // NOTE: even after this param fix, the response below is still just
+        // a placeholder — it does not return `current_value`, `fee_impact`,
+        // or `available_values`, which is what the frontend actually reads
+        // (see VALUE_OPTIONS: Category / Scholarship Status / Income Group /
+        // Sub-Category / Fee Waiver in the page). None of those map to real
+        // columns anywhere in the schema I can see, and there's no fee-diff
+        // calculation logic in this codebase to draw on, so I'm not going to
+        // invent one — that's a product decision, not a mismatch fix. Flagged
+        // to Jogindar rather than guessed at.
+        $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = $this->findStudent($req->search);
+        $student = $this->findStudent($req->student_id);
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
@@ -738,8 +914,10 @@ class AmendmentController extends Controller
             'student_id' => DB::table('admissions')->find($req->admission_id)?->student_id,
             'admission_id' => $req->admission_id,
             'action_type' => 'FeeValueChange',
+            // change_type/new_value are dropdown-driven, not free text — left
+            // as-is so they still match the option list on redisplay.
             'changed_data' => json_encode($req->only(['change_type', 'new_value', 'new_fee_amount'])),
-            'modified_by' => $req->modified_by ?? 'staff',
+            'modified_by' => TextNormalizer::upperValue($req->modified_by) ?? 'staff',
             'ref_no' => $refNo,
             'status' => 'Pending',
             'created_at' => now(),
@@ -754,17 +932,35 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function feeResetGet(Request $req)
     {
-        $v = Validator::make($req->all(), ['search' => 'required|string']);
+        // fee-reset/page.tsx sends `student_id`, not `search`.
+        $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = $this->findStudent($req->search);
+        $student = $this->findStudent($req->student_id);
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
-        $fees = DB::table('fee_receipts')->where('admission_id', $student->admission_id)->get();
+        // The frontend also expects a `portal_fees` key (not `fees`), with
+        // each row shaped as fee_type/amount/paid_amount/status/receipt_no —
+        // it renders f.fee_type, f.amount, f.paid_amount, f.status,
+        // f.receipt_no directly. Mapped 1:1 from real fee_receipts columns
+        // (receipt_type/total_amount/net_amount/fee_status/receipt_no); no
+        // invented data.
+        $fees = DB::table('fee_receipts')
+            ->where('admission_id', $student->admission_id)
+            ->orderByDesc('id')
+            ->get()
+            ->map(fn ($f) => [
+                'id' => $f->id,
+                'fee_type' => ucwords(str_replace('_', ' ', $f->receipt_type)),
+                'amount' => (float) $f->total_amount,
+                'paid_amount' => (float) $f->net_amount,
+                'status' => $f->fee_status,
+                'receipt_no' => $f->receipt_no,
+            ]);
 
-        return response()->json(array_merge((array) $student, ['fees' => $fees]));
+        return response()->json(['portal_fees' => $fees]);
     }
 
     public function feeResetStore(Request $req)
@@ -784,7 +980,7 @@ class AmendmentController extends Controller
             'admission_id' => $req->admission_id,
             'action_type' => 'FeeReset',
             'changed_data' => json_encode($req->only(['fee_type', 'new_amount'])),
-            'modified_by' => $req->modified_by ?? 'staff',
+            'modified_by' => TextNormalizer::upperValue($req->modified_by) ?? 'staff',
             'ref_no' => $refNo,
             'status' => 'Pending',
             'created_at' => now(),
@@ -799,35 +995,49 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function blockUnblockGet(Request $req)
     {
-        $v = Validator::make($req->all(), ['search' => 'required|string']);
+        // block-unblock/page.tsx doesn't actually call this GET at all right
+        // now — it reads student.is_blocked off the default /amendments/search
+        // response instead. Fixing the param (search -> student_id) and
+        // response shape anyway so this endpoint is correct if/when it's
+        // ever wired up, rather than leaving a second broken copy sitting here.
+        $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = $this->findStudent($req->search);
+        $student = $this->findStudent($req->student_id);
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
-        return response()->json($student);
+        $isBlocked = DB::table('students')->where('id', $student->student_id)->value('is_blocked');
+
+        return response()->json(array_merge((array) $student, ['is_blocked' => (bool) $isBlocked]));
     }
 
     public function blockUnblockStore(Request $req)
     {
+        // block-unblock/page.tsx posts action as lowercase 'block'/'unblock'
+        // (block.mutate('block') / block.mutate('unblock')) — the validator
+        // required capitalized 'Block'/'Unblock', so every real submission
+        // from this page was rejected with a 422. This was a live bug, not
+        // just the GET's dead-code param mismatch.
         $v = Validator::make($req->all(), [
             'student_id' => 'required|exists:students,id',
-            'action' => 'required|in:Block,Unblock',
-            'reason' => 'required_if:action,Block|nullable|string',
+            'action' => 'required|in:block,unblock',
+            'reason' => 'required_if:action,block|nullable|string',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
         DB::table('students')->where('id', $req->student_id)
-            ->update(['is_blocked' => $req->action === 'Block', 'updated_at' => now()]);
+            ->update(['is_blocked' => $req->action === 'block', 'updated_at' => now()]);
 
         DB::table('amendment_logs')->insert([
             'student_id' => $req->student_id,
             'action_type' => 'BlockUnblock',
+            // 'reason' is a fixed dropdown value on the frontend — left as-is
+            // so it still matches the option list on redisplay.
             'changed_data' => json_encode(['action' => $req->action, 'reason' => $req->reason]),
-            'modified_by' => $req->modified_by ?? 'staff',
+            'modified_by' => TextNormalizer::upperValue($req->modified_by) ?? 'staff',
             'ref_no' => $this->refNo('BLK'),
             'status' => 'Completed',
             'created_at' => now(),
@@ -882,11 +1092,15 @@ class AmendmentController extends Controller
 
         DB::table('student_restrictions')->insert([
             'student_id' => $req->student_id,
+            // 'reason' is a fixed dropdown value (RESTRICTION_REASONS on the
+            // frontend) — left as-is so it still matches the option list on
+            // redisplay. 'other_reason' is a long free-text explanation the
+            // frontend deliberately keeps mixed-case for readability.
             'reason' => $req->reason,
             'other_reason' => $req->other_reason,
-            'restriction_by' => $req->restriction_by,
-            'authority_name' => $req->authority_name,
-            'submitted_by' => $req->submitted_by ?? 'staff',
+            'restriction_by' => TextNormalizer::upperValue($req->restriction_by),
+            'authority_name' => TextNormalizer::upperValue($req->authority_name),
+            'submitted_by' => TextNormalizer::upperValue($req->submitted_by) ?? 'staff',
             'created_at' => now(),
             'updated_at' => now(),
         ]);
@@ -911,41 +1125,128 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function admissionCancelGet(Request $req)
     {
-        $v = Validator::make($req->all(), ['search' => 'required|string']);
+        // print/admission-cancel/page.tsx always sends a `ref_no` key
+        // (possibly empty, alongside `student_id`) when looking up an
+        // *already cancelled* admission for the printable notice. The
+        // pre-cancel form (admission-cancel/page.tsx) only ever sends
+        // `student_id`. That key's presence is what distinguishes the two
+        // response shapes each caller actually expects.
+        if ($req->has('ref_no')) {
+            $printData = $this->admissionCancelPrintData($req);
+            if (!$printData)
+                return response()->json(['message' => 'Cancellation record not found.'], 404);
+
+            return response()->json($printData);
+        }
+
+        $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = $this->findStudent($req->search);
+        $student = $this->findStudent($req->student_id);
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
         $fee = DB::table('fee_receipts')->where('admission_id', $student->admission_id)->latest()->first();
 
-        return response()->json(array_merge((array) $student, ['fee_info' => $fee]));
+        return response()->json([
+            'admission' => [
+                'admission_id' => $student->admission_id,
+                'status' => $student->admission_status,
+                'receipt_date' => $fee->receipt_date ?? null,
+                'deposited_amount' => (float) ($fee->net_amount ?? 0),
+                'session' => $student->academic_year,
+                'class_name' => $student->class,
+            ],
+        ]);
+    }
+
+    /**
+     * Resolves the printable admission-cancellation record for
+     * print/admission-cancel/page.tsx, keyed by `ref_no` (preferred) or
+     * falling back to the latest cancellation for `student_id`.
+     */
+    private function admissionCancelPrintData(Request $req): ?array
+    {
+        $log = null;
+        if ($req->filled('ref_no')) {
+            $log = DB::table('amendment_logs')
+                ->where('ref_no', $req->ref_no)
+                ->where('action_type', 'AdmissionCancel')
+                ->first();
+        } elseif ($req->filled('student_id')) {
+            $log = DB::table('amendment_logs')
+                ->where('student_id', $req->student_id)
+                ->where('action_type', 'AdmissionCancel')
+                ->orderByDesc('id')
+                ->first();
+        }
+
+        if (!$log)
+            return null;
+
+        $changed = $log->changed_data ? json_decode($log->changed_data, true) : [];
+
+        $adm = DB::table('admissions as a')
+            ->join('programs as p', 'p.id', 'a.program_id')
+            ->where('a.id', $log->admission_id)
+            ->select('a.academic_year', 'a.admission_date', 'p.short_name as class_name')
+            ->first();
+
+        $student = $this->findStudent((string) $log->student_id);
+        $fee = DB::table('fee_receipts')->where('admission_id', $log->admission_id)->latest()->first();
+
+        return [
+            'admission' => [
+                'ref_no' => $log->ref_no,
+                'cancel_date' => $changed['cancel_date'] ?? null,
+                'reg_no' => $student->reg_no ?? null,
+                'application_no' => $student->application_no ?? null,
+                'class_name' => $adm->class_name ?? null,
+                'session' => $adm->academic_year ?? null,
+                'admission_date' => $adm->admission_date ?? null,
+                'deposited_amount' => (float) ($fee->net_amount ?? 0),
+                'cancel_charge' => (float) ($changed['cancel_charge'] ?? 0),
+                'reason' => $changed['reason'] ?? null,
+            ],
+            'student' => [
+                'name' => $student->name ?? null,
+                'father_name' => $student->father_name ?? null,
+            ],
+        ];
     }
 
     public function admissionCancelStore(Request $req)
     {
         $v = Validator::make($req->all(), [
+            'student_id' => 'required|exists:students,id',
             'admission_id' => 'required|exists:admissions,id',
-            'cancel_reason' => 'required|string',
+            'reason' => 'required|string',
             'cancel_charge' => 'nullable|numeric',
             'cancel_date' => 'required|date',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        DB::table('admissions')->where('id', $req->admission_id)
-            ->update(['status' => 'Cancelled', 'updated_at' => now()]);
+        DB::table('admissions')->where('id', $req->admission_id)->update([
+            // 'reason' is a fixed dropdown value (CANCEL_REASONS) on the
+            // frontend — left as-is, not uppercased, so it matches the
+            // option list on redisplay (same rule as blockUnblockStore()).
+            'status' => 'cancelled',
+            'cancel_reason' => $req->reason,
+            'cancel_date' => $req->cancel_date,
+            'cancelled_by' => $req->user()?->id,
+            'updated_at' => now(),
+        ]);
 
         $refNo = $this->refNo('CAN');
 
         DB::table('amendment_logs')->insert([
-            'student_id' => DB::table('admissions')->find($req->admission_id)?->student_id,
+            'student_id' => $req->student_id,
             'admission_id' => $req->admission_id,
             'action_type' => 'AdmissionCancel',
-            'changed_data' => json_encode($req->only(['cancel_reason', 'cancel_charge', 'cancel_date'])),
-            'modified_by' => $req->modified_by ?? 'staff',
+            'changed_data' => json_encode($req->only(['reason', 'cancel_charge', 'cancel_date'])),
+            'modified_by' => TextNormalizer::upperValue($req->modified_by) ?? 'staff',
             'ref_no' => $refNo,
             'status' => 'Completed',
             'created_at' => now(),

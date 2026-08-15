@@ -327,14 +327,4 @@ class AdmissionController extends Controller
             'subjects'       => $result,
         ]);
     }
-
-    // University view
-    public function universityView(Request $request): JsonResponse
-    {
-        return response()->json(
-            Admission::with(['student:id,full_name,enrollment_no,mobile', 'program:id,name,level', 'organization:id,name'])
-                ->where('status', 'active')
-                ->paginate(20)
-        );
-    }
 }

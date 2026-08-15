@@ -72,7 +72,7 @@ class DatabaseSeeder extends Seeder
                 'name'            => 'Super Administrator',
                 'mobile'          => '9999999999',
                 'password'        => Hash::make('Admin@1234'),
-                'portal'          => 'super_admin',
+                'portal'          => 'college', // portal enum is college|student only; super_admin is a ROLE, assigned below
                 'is_active'       => true,
             ]
         );

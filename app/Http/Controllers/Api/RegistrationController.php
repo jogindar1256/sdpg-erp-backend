@@ -24,14 +24,8 @@ class RegistrationController extends Controller
     // 1. REGISTRATION (UG / PG / B.Ed)
     //    All three use the same endpoints, filtered by program level
     // ══════════════════════════════════════════════════════════════
-
-    /**
-     * List students eligible/pending/completed registration
-     * level: UG | PG | B.Ed
-     */
     public function index(Request $req)
     {
-        // `students` has no name/father_name columns — those come from the
         // latest direct_registrations snapshot per user (see
         // ResolvesStudentIdentity), with first/middle/last as a fallback.
         $latestReg = $this->latestRegistrationSub();
@@ -145,21 +139,6 @@ class RegistrationController extends Controller
         return response()->json(['id' => $id, 'message' => 'Registration created.'], 201);
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // 2. REGISTRATION STATUS  (Live onboarding funnel — per student)
-    //    Tracks each self/direct registration through the pipeline:
-    //    Registration Process → Reg Fee → Application Form →
-    //    Application Approval → Educational Fee → Educational Receipt
-    //
-    //    Query params:
-    //      session_year   e.g. 2025-2026        (default = current)
-    //      program_id     filter by class
-    //      reg_type       UG | PG | BED
-    //      check_status   all | complete | incomplete | final_submit | approved
-    //      from, to       date range on reg_date (Y-m-d)
-    //      search         name | mobile | registration_no | application_no
-    //      page, per_page pagination
-    // ══════════════════════════════════════════════════════════════
     public function registrationStatus(Request $req)
     {
         $sessionYear = $req->session_year ?? $this->sessionYear();
@@ -182,12 +161,6 @@ class RegistrationController extends Controller
             ->where('status', 'active')
             ->groupBy('admission_id');
 
-        // Base scope: class + date + search (NOT check_status — the Live
-        // Status counters must reflect the whole class/date scope).
-        // NOTE: direct_registrations links to a student via user_id (set by
-        // provisionAccount on payment). We deliberately hop through
-        // students.user_id — both user_id columns are schema-defined, whereas
-        // direct_registrations.student_id is not guaranteed to exist.
         $records = DB::table('direct_registrations as dr')
             ->leftJoin('programs as p', 'p.id', 'dr.program_id')
             ->leftJoin('students as s', 's.user_id', '=', 'dr.user_id')
@@ -236,11 +209,6 @@ class RegistrationController extends Controller
 
         // Derive pipeline flags for each row.
         $rows = $records->map(function ($r) {
-            // The registration form is persisted in full at submit time
-            // (initiate() validates the whole payload before inserting). So any
-            // row that is not 'incomplete' (= payment failed / abandoned) is a
-            // completed registration — this is what lets us surface the real
-            // "registered but not paid" state (status='pending' + unpaid).
             $regComplete = $r->reg_status !== 'incomplete';
             $regFeePaid  = $r->reg_payment_status === 'paid';
             $appSubmit   = $r->app_status && $r->app_status !== 'draft';
@@ -393,16 +361,9 @@ class RegistrationController extends Controller
         $user    = $req->user();
         $student = DB::table('students')->where('user_id', $user->id)->first();
         $sessionYear = $req->session_year ?? $this->sessionYear();
-
-        // A registration the student saved but has not yet paid/verified.
-        // The whole registration form is drafted in one shot at initiate()
-        // (status='pending'), so we surface that draft here — letting the
-        // student resume payment + verification from the status screen.
         $pending = $this->pendingRegistrationFor($user);
 
-        // No student profile yet (typical for "registered but not paid"): return
         // the pending draft so the portal can prompt for payment/verification
-        // instead of dead-ending on a 404.
         if (!$student) {
             return response()->json([
                 'data'                 => null,
@@ -456,13 +417,6 @@ class RegistrationController extends Controller
         ]);
     }
 
-    /**
-     * The most recent unpaid direct_registration belonging to this user
-     * (matched by user_id or mobile), shaped for the student portal so they
-     * can finish payment + OTP verification. Returns null when nothing is
-     * pending. Depends on direct_registrations.fee_amount and programs.full_name
-     * (see 2026_07_06_090000 reconciliation migration).
-     */
     private function pendingRegistrationFor($user): ?array
     {
         $row = DB::table('direct_registrations as dr')
@@ -513,7 +467,6 @@ class RegistrationController extends Controller
             'phone_verified'     => (bool) $row->phone_verified,
             'email_verified'     => (bool) $row->email_verified,
             'reg_date'           => $row->reg_date,
-            // What the student still has to do to complete the registration:
             'needs_payment'      => $row->payment_status !== 'paid',
             'needs_verification' => !$row->phone_verified || !$row->email_verified,
         ];
@@ -521,10 +474,6 @@ class RegistrationController extends Controller
 
     // ══════════════════════════════════════════════════════════════
     // 7. STUDENT PORTAL — Registration Dashboard
-    //    GET /student/registration/dashboard
-    //    Drives the student's Registration Dashboard: identity card +
-    //    the Registration Process / Edit / Fee / Receipt activity rows.
-    //    Sourced from the student's own direct_registration (any status).
     // ══════════════════════════════════════════════════════════════
     public function studentRegistrationDashboard(Request $req)
     {
@@ -576,7 +525,7 @@ class RegistrationController extends Controller
             }
         }
 
-        $regComplete = $reg->status !== 'incomplete';   // form persisted at submit
+        $regComplete = $reg->status !== 'incomplete';
         $feePaid     = $reg->payment_status === 'paid';
 
         return response()->json(['data' => [

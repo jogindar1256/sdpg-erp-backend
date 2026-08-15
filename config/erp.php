@@ -32,9 +32,10 @@ return [
     'enrollment_padding' => 5,
 
     /*
-    | Portals
+    | Portals (matches the users.portal DB enum — role-based access like
+    | super_admin is handled separately via Spatie roles/permissions)
     */
-    'portals' => ['college', 'student', 'university', 'super_admin'],
+    'portals' => ['college', 'student'],
 
     /*
     | Roles

@@ -53,6 +53,13 @@ Route::prefix('student/register')->group(function () {
     // Vocational / co-curricular papers — populates the Minor Subject dropdown
     Route::get('vocational-papers', [MasterSettingsController::class, 'publicVocationalPapers']);
 
+    // Admission-condition-driven record lookups (see MasterSettingsController's
+    // admission_conditions feature). "Open Admission" checks for a returning
+    // DDU student in `students`; "Through Counselling" checks `counselling_reports`.
+    // fetchOldRecord() already existed but was never routed — the PG/BEd "Fetch
+    // Record" button has been calling this exact path and silently 404ing.
+    Route::get('fetch-record', [StudentRegistrationController::class, 'fetchOldRecord']);
+    Route::get('counselling-lookup', [StudentRegistrationController::class, 'counsellingLookup']);
 
     // Step-1 OTP — verify mobile + email BEFORE anything is created (keyed by contact).
     Route::post('otp/phone/send', [StudentRegistrationController::class, 'preSendPhoneOtp']);
@@ -165,7 +172,9 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // ── COLLEGE PORTAL ────────────────────────────────────────────────────
-    Route::middleware('portal:college,super_admin')->group(function () {
+    // portal enum is college|student only — 'super_admin' is a role
+    // (checked via Spatie permissions/roles), not a portal value.
+    Route::middleware('portal:college')->group(function () {
 
         // Dashboard
         Route::get('dashboard', [DashboardController::class, 'index']);
@@ -222,6 +231,14 @@ Route::middleware('auth:sanctum')->group(function () {
 
             // GET  /applications/registration-form-status  (alias — old frontend URL)
             Route::get('/registration-form-status', [ApplicationController::class, 'registrationFormStatus']);
+
+            // Office (read-only) equivalents of the student-portal subjects /
+            // subject-papers lookups used by Part 6 "Subject & Paper Selection"
+            // — same controller methods, reachable from a portal:college token
+            // instead of portal:student, since that form is shared between both
+            // scopes and the student-only routes 403 for office staff.
+            Route::get('/programs/{programId}/subjects', [ProgramController::class, 'subjects']);
+            Route::get('/programs/{programId}/subject-papers', [ProgramController::class, 'subjectPapers']);
 
             // ── Wildcard — MUST be last inside this prefix group ─────────────────────
 
@@ -544,6 +561,7 @@ Route::middleware('auth:sanctum')->group(function () {
             // Admission Condition
             Route::get('condition', [MasterSettingsController::class, 'admissionConditionIndex']);
             Route::post('condition', [MasterSettingsController::class, 'admissionConditionStore']);
+            Route::delete('condition/{id}', [MasterSettingsController::class, 'admissionConditionDestroy']);
 
             // Enclosure / Supporting Documents
             Route::get('enclosure', [MasterSettingsController::class, 'enclosureMasterIndex']);
@@ -693,6 +711,15 @@ Route::middleware('auth:sanctum')->group(function () {
             // POST /student/applications/{id}/submit
             Route::post('/{id}/submit', [ApplicationController::class, 'submit']);
 
+            // Contact (mobile/email) change — OTP-gated; mobile/email are
+            // locked out of the generic /part/{part} save (LocksStudentIdentity),
+            // this is the only way a student can change either from the
+            // application form.
+            Route::post('/{id}/contact/mobile/send-otp', [ApplicationController::class, 'sendContactMobileOtp']);
+            Route::post('/{id}/contact/mobile/verify', [ApplicationController::class, 'verifyContactMobileOtp']);
+            Route::post('/{id}/contact/email/send-otp', [ApplicationController::class, 'sendContactEmailOtp']);
+            Route::post('/{id}/contact/email/verify', [ApplicationController::class, 'verifyContactEmailOtp']);
+
             // POST /student/applications/{id}/documents
             Route::post('/{id}/documents', [ApplicationController::class, 'uploadStudentDocument']);
 
@@ -714,6 +741,9 @@ Route::middleware('auth:sanctum')->group(function () {
 
         // ── Program subjects (used by Part 6 subject selection) ───────────────────
         Route::get('programs/{programId}/subjects', [ProgramController::class, 'subjects']);
+        // Real paper code/name for those subjects — a subject can carry more
+        // than one paper under the DDU system, so this is grouped by subject_id.
+        Route::get('programs/{programId}/subject-papers', [ProgramController::class, 'subjectPapers']);
 
         Route::get('registration-status', [RegistrationController::class, 'studentPortalStatus']);
 
@@ -724,11 +754,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('registration/pay', [StudentRegistrationController::class, 'payPending']);
     });
 
-    // ── UNIVERSITY PORTAL ────────────────────────────────────────────────
-    Route::middleware('portal:university')->prefix('university')->group(function () {
-        Route::get('colleges', [OrganizationController::class, 'list']);
-        Route::get('students', [StudentController::class, 'universityView']);
-        Route::get('admissions', [AdmissionController::class, 'universityView']);
-        Route::get('reports/consolidated', [ReportController::class, 'consolidated']);
-    });
+    // (University portal removed — this is a college system, not a
+    // university system; 'university' was dropped from the users.portal
+    // enum by migration. This whole group was unreachable — its middleware
+    // could never match, and one of its two routes pointed at a
+    // StudentController::universityView() method that didn't exist.)
 });

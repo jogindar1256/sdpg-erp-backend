@@ -24,12 +24,16 @@ trait LocksStudentIdentity
         'aadhar_no', 'aadhar_1', 'aadhar_2', 'aadhar_3',
         'abc_id', 'ddurn_no', 'ddurn', 'ddurn_id', 'family_id',
         'id_proof_type', 'id_proof_no', 'id_proof_number',
-        // caste / eligibility (registration snapshot)
-        'caste_cert_no', 'caste_cert_date', 'caste_cert_state',
-        'eligibility_class', 'eligibility_roll_no', 'passing_year', 'is_divyang',
+        // caste / eligibility (registration snapshot) — caste_cert_no,
+        // eligibility_class, eligibility_roll_no, and is_divyang are
+        // deliberately NOT locked (student-corrigible on the application
+        // form); caste_cert_date/caste_cert_state/passing_year stay locked.
+        'caste_cert_date', 'caste_cert_state', 'passing_year',
         // domicile
         'domestic_state', 'permanent_state',
-        // verified contact — changed only via Amendment > update-mobile (OTP)
+        // verified contact — changed only through the OTP-gated
+        // contact/mobile|email endpoints below, never through a raw
+        // part-save. Still locked here as the backstop for updatePart().
         'mobile', 'email',
         // registration / payment identifiers — system-owned
         'registration_no', 'reg_no', 'reg_type', 'payment_status',

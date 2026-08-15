@@ -10,7 +10,9 @@ class PortalMiddleware
 {
     /**
      * Restrict access based on user's portal type.
-     * Usage in routes: middleware('portal:college,super_admin')
+     * Usage in routes: middleware('portal:college')
+     * (portal enum is college|student only — role-based access, e.g.
+     * super_admin, is a separate check via Spatie roles/permissions.)
      */
     public function handle(Request $request, Closure $next, string ...$portals): Response
     {

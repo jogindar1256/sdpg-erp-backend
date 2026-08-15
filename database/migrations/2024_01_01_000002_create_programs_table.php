@@ -19,6 +19,11 @@ return new class extends Migration
             $table->integer('total_semesters');            // 6, 4, 2
             $table->enum('semester_type', ['semester', 'annual'])->default('semester');
             $table->text('description')->nullable();
+            $table->string('full_name')->nullable();       // backfilled from `name` where missing
+            $table->string('course_code', 2)->nullable();  // 2-digit code used in Student ID (BA=01, BSc=02 …)
+            $table->boolean('is_self_finance')->default(false); // drives Fee Receipt mode 201 vs 101
+            $table->string('approval_type', 30)->default('Under Finance');
+            $table->string('exam_mode', 20)->default('Regular');
             $table->boolean('is_active')->default(true);
             $table->timestamps();
             $table->softDeletes();

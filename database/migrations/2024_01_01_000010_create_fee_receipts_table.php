@@ -31,6 +31,8 @@ return new class extends Migration
             $table->string('bank_name')->nullable();
             $table->string('dd_no')->nullable();
             $table->date('dd_date')->nullable();
+            $table->string('bank_ref_no', 100)->nullable();
+            $table->string('fee_status', 20)->default('Pending');
 
             // Fee breakdown (JSONB: [{fee_head_id, fee_head_name, amount}])
             $table->jsonb('fee_breakdown');

@@ -47,6 +47,39 @@ return new class extends Migration
             // Form completion tracking (parts 1-10)
             $table->jsonb('form_progress')->default('{}'); // {part1: true, part2: false ...}
 
+            // Multi-step form data — one JSONB blob per step, written by
+            // updatePart()/read back by show(). An earlier, superseded
+            // naming scheme (part_personal, part_education, ...) briefly
+            // existed and was fully dropped; part_1..part_8 is the only
+            // live naming scheme.
+            //   part_1 = Course Selection / Personal Details
+            //   part_2 = Address & Communication
+            //   part_3 = Educational Details
+            //   part_4 = TC & Migration Details
+            //   part_5 = Bank Details
+            //   part_6 = Subject & Paper Selection
+            //   part_7 = Upload Photo, Signature & Documents
+            //   part_8 = Shapath Patr / Declaration
+            $table->jsonb('part_1')->nullable();
+            $table->jsonb('part_2')->nullable();
+            $table->jsonb('part_3')->nullable();
+            $table->jsonb('part_4')->nullable();
+            $table->jsonb('part_5')->nullable();
+            $table->jsonb('part_6')->nullable();
+            $table->jsonb('part_7')->nullable();
+            $table->jsonb('part_8')->nullable();
+
+            // Back-paper fee / payment tracking
+            $table->decimal('fee_amount', 10, 2)->nullable();
+            $table->boolean('fee_paid')->default(false);
+            $table->timestamp('paid_at')->nullable();
+            $table->string('payment_ref', 100)->nullable();      // Razorpay payment id once captured
+            $table->string('razorpay_order_id', 100)->nullable();
+            // NOTE: no DB-level FK to fee_receipts — fee_receipts is created
+            // by a later migration and this table must keep its original
+            // creation timestamp/order.
+            $table->unsignedBigInteger('fee_receipt_id')->nullable();
+
             $table->timestamps();
             $table->softDeletes();
 

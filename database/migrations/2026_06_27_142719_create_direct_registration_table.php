@@ -13,6 +13,7 @@ return new class extends Migration
             $table->unsignedBigInteger('organization_id')->nullable()->index();
             $table->unsignedBigInteger('program_id')->nullable()->index();
             $table->unsignedBigInteger('user_id')->nullable()->index(); // set after account creation
+            $table->unsignedBigInteger('student_id')->nullable()->index();
 
             // Registration Identity
             $table->string('registration_no', 20)->unique();
@@ -100,6 +101,19 @@ return new class extends Migration
             $table->unsignedBigInteger('approved_by')->nullable();
             $table->timestamp('approved_at')->nullable();
             $table->text('remarks')->nullable();
+
+            // Cancellation — cancelling lets the same mobile/aadhar/abc_id
+            // register again for the same program/type (otherwise it's
+            // treated as a duplicate).
+            $table->unsignedBigInteger('cancelled_by')->nullable();
+            $table->timestamp('cancelled_at')->nullable();
+            $table->text('cancel_reason')->nullable();
+
+            // Post-registration linkage / receipt tracking
+            $table->decimal('fee_amount', 10, 2)->default(0);
+            $table->string('course_group', 50)->nullable();
+            $table->string('receipt_no', 40)->nullable()->index();
+            $table->string('pdf_path')->nullable();
 
             $table->timestamps();
             $table->softDeletes();

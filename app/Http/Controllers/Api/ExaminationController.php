@@ -308,7 +308,7 @@ class ExaminationController extends Controller
             'exam_date'    => 'required|date',
             'inning_id'    => 'required|exists:exam_innings,id',
             'exam_type'    => 'required|in:Regular,Back Paper',
-            'gender'       => 'nullable|in:male,female,other,All',
+            'gender'       => 'nullable|in:male,female,transgender,All',
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
@@ -397,7 +397,7 @@ class ExaminationController extends Controller
             'subject_id'   => 'required|exists:subjects,id',
             'paper_code'   => 'required|string',
             'exam_type'    => 'required|in:Regular,Back Paper',
-            'gender'       => 'nullable|in:male,female,other,All',
+            'gender'       => 'nullable|in:male,female,transgender,All',
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 

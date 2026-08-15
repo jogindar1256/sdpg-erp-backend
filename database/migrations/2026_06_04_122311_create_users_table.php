@@ -19,8 +19,12 @@ return new class extends Migration
             $table->string('password');
             $table->rememberToken();
 
-            // Portal: which login screen this user belongs to
-            $table->enum('portal', ['college', 'student', 'university', 'super_admin'])->default('college');
+            // Portal: which login screen this user belongs to.
+            // Was ['college','student','university','super_admin'] — narrowed
+            // to just college/student (see the now-removed
+            // alter_users_portal_enum migrations): 'university' was a legacy
+            // pre-rename value and 'super_admin' was folded into 'college'.
+            $table->enum('portal', ['college', 'student'])->default('college');
 
             // Staff details
             $table->string('employee_id')->nullable();

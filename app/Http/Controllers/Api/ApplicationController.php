@@ -7,11 +7,14 @@ use App\Http\Concerns\LocksStudentIdentity;
 use App\Jobs\GenerateFeeReceiptPdf;
 use App\Models\FeeReceipt;
 use App\Services\AdmissionNumberService;
+use App\Support\TextNormalizer;
 use Barryvdh\DomPDF\Facade\Pdf;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 
@@ -535,7 +538,7 @@ class ApplicationController extends Controller
         $prog[$key] = true;
 
         DB::table('student_applications')->where('id', $id)->update([
-            $col => json_encode($req->all()),
+            $col => json_encode(TextNormalizer::upper($req->all())),
             'form_progress' => json_encode($prog),
             'updated_at' => now(),
         ]);
@@ -1637,6 +1640,9 @@ class ApplicationController extends Controller
         $prog[$key] = true;
 
         $clean = $this->stripLockedIdentity($req->all(), $req->user()->id);
+        // Backstop: uppercase free text server-side too, not just in the
+        // browser, so the saved data is normalized regardless of client.
+        $clean = TextNormalizer::upper($clean);
 
         DB::table('student_applications')->where('id', $id)->update([
             $col => json_encode($clean),
@@ -1648,6 +1654,150 @@ class ApplicationController extends Controller
             'message' => "Part {$partNo} saved.",
             'form_progress' => $prog,
         ]);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CONTACT (MOBILE / EMAIL) CHANGE — OTP-gated
+    // ══════════════════════════════════════════════════════════════
+    /**
+     * mobile/email stay in $lockedIdentityFields (see LocksStudentIdentity)
+     * so updatePart() above always strips them out of a raw part-save — this
+     * is the only path a student can actually change either one from the
+     * application form. Same real OTP mechanism StudentRegistrationController
+     * already uses for registration (Cache-backed, SmsService/Mail::raw), not
+     * the AmendmentController stub that never actually checks the code.
+     * Writes straight to `students.mobile`/`students.email` on verify, not
+     * into part_2 JSON, so there's one source of truth for contact info.
+     */
+    private function studentForContactChange(Request $req, $id): ?object
+    {
+        $student = DB::table('students')->where('user_id', $req->user()->id)->first();
+        if (!$student) return null;
+
+        $app = DB::table('student_applications')
+            ->where('id', $id)
+            ->where('student_id', $student->id)
+            ->whereNull('deleted_at')
+            ->first();
+        if (!$app) return null;
+
+        return $student;
+    }
+
+    public function sendContactMobileOtp(Request $req, $id)
+    {
+        $student = $this->studentForContactChange($req, $id);
+        if (!$student)
+            return response()->json(['message' => 'Application not found.'], 404);
+
+        $v = Validator::make($req->all(), ['new_mobile' => 'required|digits:10']);
+        if ($v->fails())
+            return response()->json(['errors' => $v->errors()], 422);
+
+        if ($req->new_mobile === $student->mobile) {
+            return response()->json(['message' => 'That is already your registered mobile number.'], 422);
+        }
+
+        $otp = rand(100000, 999999);
+        Cache::put("app_mobile_otp_{$student->id}", $otp, now()->addMinutes(10));
+        Cache::put("app_mobile_otp_value_{$student->id}", $req->new_mobile, now()->addMinutes(10));
+
+        $sent = app(\App\Services\SmsService::class)->sendOtp($req->new_mobile, $otp, null);
+        if (!$sent) {
+            Log::info("APPLICATION MOBILE OTP for student {$student->id}: {$otp}");
+        }
+
+        $masked   = substr($req->new_mobile, 0, 2) . 'XXXXXX' . substr($req->new_mobile, -2);
+        $response = ['message' => "OTP sent to {$masked}."];
+        if (config('app.debug')) $response['debug_otp'] = $otp; // only in local/dev
+
+        return response()->json($response);
+    }
+
+    public function verifyContactMobileOtp(Request $req, $id)
+    {
+        $student = $this->studentForContactChange($req, $id);
+        if (!$student)
+            return response()->json(['message' => 'Application not found.'], 404);
+
+        $v = Validator::make($req->all(), ['otp' => 'required|digits:6']);
+        if ($v->fails())
+            return response()->json(['errors' => $v->errors()], 422);
+
+        $cached  = Cache::get("app_mobile_otp_{$student->id}");
+        $pending = Cache::get("app_mobile_otp_value_{$student->id}");
+
+        if (!$cached || !$pending || (string) $cached !== (string) $req->otp) {
+            return response()->json(['message' => 'Invalid or expired OTP.'], 422);
+        }
+
+        DB::table('students')->where('id', $student->id)
+            ->update(['mobile' => $pending, 'updated_at' => now()]);
+
+        Cache::forget("app_mobile_otp_{$student->id}");
+        Cache::forget("app_mobile_otp_value_{$student->id}");
+
+        return response()->json(['message' => 'Mobile number updated.', 'mobile' => $pending]);
+    }
+
+    public function sendContactEmailOtp(Request $req, $id)
+    {
+        $student = $this->studentForContactChange($req, $id);
+        if (!$student)
+            return response()->json(['message' => 'Application not found.'], 404);
+
+        $v = Validator::make($req->all(), ['new_email' => 'required|email']);
+        if ($v->fails())
+            return response()->json(['errors' => $v->errors()], 422);
+
+        if (strcasecmp($req->new_email, (string) $student->email) === 0) {
+            return response()->json(['message' => 'That is already your registered email.'], 422);
+        }
+
+        $otp = rand(100000, 999999);
+        Cache::put("app_email_otp_{$student->id}", $otp, now()->addMinutes(10));
+        Cache::put("app_email_otp_value_{$student->id}", $req->new_email, now()->addMinutes(10));
+
+        try {
+            Mail::raw(
+                "Your SDPG College email verification OTP is: {$otp}\n\nValid for 10 minutes. Do not share it with anyone.",
+                fn ($m) => $m->to($req->new_email)->subject('SDPG College — Email Verification OTP')
+            );
+        } catch (\Throwable $e) {
+            Log::error('Application email OTP send failed: ' . $e->getMessage());
+            Log::info("APPLICATION EMAIL OTP for student {$student->id}: {$otp}");
+        }
+
+        $response = ['message' => 'OTP sent to your new email.'];
+        if (config('app.debug')) $response['debug_otp'] = $otp;
+
+        return response()->json($response);
+    }
+
+    public function verifyContactEmailOtp(Request $req, $id)
+    {
+        $student = $this->studentForContactChange($req, $id);
+        if (!$student)
+            return response()->json(['message' => 'Application not found.'], 404);
+
+        $v = Validator::make($req->all(), ['otp' => 'required|digits:6']);
+        if ($v->fails())
+            return response()->json(['errors' => $v->errors()], 422);
+
+        $cached  = Cache::get("app_email_otp_{$student->id}");
+        $pending = Cache::get("app_email_otp_value_{$student->id}");
+
+        if (!$cached || !$pending || (string) $cached !== (string) $req->otp) {
+            return response()->json(['message' => 'Invalid or expired OTP.'], 422);
+        }
+
+        DB::table('students')->where('id', $student->id)
+            ->update(['email' => $pending, 'updated_at' => now()]);
+
+        Cache::forget("app_email_otp_{$student->id}");
+        Cache::forget("app_email_otp_value_{$student->id}");
+
+        return response()->json(['message' => 'Email updated.', 'email' => $pending]);
     }
 
     /**

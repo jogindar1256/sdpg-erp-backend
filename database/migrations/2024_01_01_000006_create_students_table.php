@@ -26,12 +26,17 @@ return new class extends Migration
             $table->string('nationality')->default('Indian');
             $table->string('aadhar_no', 20)->nullable();
             $table->string('abc_id')->nullable();             // Academic Bank of Credits
+            $table->string('ddurn', 50)->nullable();          // DDU Roll Number (queried by AmendmentController / upgradeSelf)
+            $table->string('family_id', 50)->nullable();
+            $table->string('student_code', 20)->nullable()->index(); // 13-digit Student ID (YY+centre+course+cat+serial)
 
             // Contact
             $table->string('mobile', 15);
             $table->string('alternate_mobile', 15)->nullable();
             $table->string('email')->nullable();
             $table->string('whatsapp_no', 15)->nullable();
+            $table->boolean('phone_verified')->default(false);
+            $table->boolean('email_verified')->default(false);
 
             // Address
             $table->text('permanent_address');
@@ -75,7 +80,22 @@ return new class extends Migration
             // Status
             $table->enum('status', ['active', 'inactive', 'blocked', 'cancelled', 'passed_out'])->default('active');
             $table->boolean('is_blocked')->default(false);
+            $table->boolean('is_restricted')->default(false);
             $table->string('block_reason')->nullable();
+
+            // A row here exists once registration happens, but that alone
+            // doesn't mean "real, admitted student" — is_confirmed is that
+            // gate (set true by ApplicationController::updateStatus on
+            // approval, alongside creating the admissions row).
+            // NOTE: confirmed_application_id intentionally has no DB-level FK
+            // constraint here — student_applications is created by a later
+            // migration, and this table must keep its original creation
+            // timestamp/order, so the constraint can't be declared at create
+            // time. Referential integrity for it is enforced at the
+            // application level only.
+            $table->boolean('is_confirmed')->default(false);
+            $table->timestamp('confirmed_at')->nullable();
+            $table->unsignedBigInteger('confirmed_application_id')->nullable();
 
             $table->timestamps();
             $table->softDeletes();

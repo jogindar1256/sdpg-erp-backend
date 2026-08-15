@@ -39,6 +39,28 @@ return new class extends Migration
             $table->date('cancel_date')->nullable();
             $table->foreignId('cancelled_by')->nullable()->constrained('users')->nullOnDelete();
 
+            // Approval workflow (distinct from the is_verified/verified_by
+            // document-verification pair above)
+            $table->boolean('documents_verified')->default(false);
+            $table->unsignedBigInteger('approved_by')->nullable();
+            $table->timestamp('approved_at')->nullable();
+
+            // Fee / payment tracking
+            // Final default is 'pending' — an earlier migration set it to
+            // 'paid' for college-created admissions, then a follow-up
+            // migration corrected the default (and backfilled any rows that
+            // were wrongly marked paid with no actual payment) to 'pending'.
+            $table->string('payment_status', 10)->default('pending');
+            $table->string('fee_status', 20)->default('Pending');
+            $table->string('razorpay_order_id', 100)->nullable();
+            $table->string('razorpay_payment_id', 100)->nullable();
+            $table->timestamp('paid_at')->nullable();
+            $table->string('temp_password_plain', 30)->nullable(); // cleared after welcome email is sent
+
+            // Admission-numbering scheme (AdmissionNumberService)
+            $table->string('file_no', 20)->nullable()->index();      // "2425/00001"
+            $table->unsignedInteger('record_no')->nullable()->index(); // global ever-incrementing record number
+
             $table->timestamps();
             $table->softDeletes();
 

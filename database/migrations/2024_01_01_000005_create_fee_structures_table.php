@@ -17,6 +17,11 @@ return new class extends Migration
             $table->string('academic_year', 10);          // 2024-25
             $table->enum('admission_type', ['regular', 'back_paper', 'upgrade', 'lateral']);
             $table->decimal('amount', 10, 2);
+            // Per-gender/category grid the Fee Structure UI actually uses
+            // (Male/Female/Trans × Gen/OBC/SC/ST); `amount` above is kept in
+            // sync (array_sum of amounts) for backward compatibility.
+            $table->json('amounts')->nullable();
+            $table->string('term', 30)->default('Admission'); // Admission | Semester Registration
             $table->decimal('late_fine_per_day', 8, 2)->default(0);
             $table->date('due_date')->nullable();
             $table->boolean('is_active')->default(true);

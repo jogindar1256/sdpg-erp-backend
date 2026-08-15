@@ -22,74 +22,66 @@ class DashboardController extends Controller
         $semName      = strtolower($request->query('semester_name', ''));  // odd|even|''
         $semNo        = $request->query('semester_no', '');                // 1-8|''
 
-        // ── Helper: base query for registrations ──────────────────────────────
-        $regBase = function () use ($session) {
-            $q = DB::table('registrations')
-                ->whereNull('deleted_at');
-            if ($session) $q->where('session_year', $session);
-            return $q;
-        };
-
-        // ── Helper: base query for admissions ────────────────────────────────
+        // ── Helper: base query for admissions (joined to programs) ────────────
         $admBase = function () use ($session) {
-            $q = DB::table('admissions')
-                ->whereNull('deleted_at');
-            if ($session) $q->where('session_year', $session);
+            $q = DB::table('admissions as a')
+                ->join('programs as p', 'p.id', '=', 'a.program_id')
+                ->whereNull('a.deleted_at');
+            if ($session) $q->where('a.academic_year', $session);
             return $q;
         };
 
-        // ── Semester filter helpers ───────────────────────────────────────────
+        // ── Semester filter helpers (admissions only — real column is semester_no) ──
         $applyOddEven = function ($q, string $name) {
-            if ($name === 'odd')  return $q->whereIn('semester', [1, 3, 5, 7]);
-            if ($name === 'even') return $q->whereIn('semester', [2, 4, 6, 8]);
+            if ($name === 'odd')  return $q->whereIn('a.semester_no', [1, 3, 5, 7]);
+            if ($name === 'even') return $q->whereIn('a.semester_no', [2, 4, 6, 8]);
             return $q;
         };
 
         $applySemNo = function ($q, $no) {
-            if ($no !== '' && $no !== null) return $q->where('semester', (int)$no);
+            if ($no !== '' && $no !== null) return $q->where('a.semester_no', (int)$no);
             return $q;
         };
 
-        // UG programs: BA, BSC (semester 1 = new; 3,5 = upgraded)
-        $ugPrograms = ['BA', 'B.A', 'B.A.', 'BSC', 'B.Sc', 'B.Sc.', 'B.SC', 'UG'];
-        // PG programs: MA, MSC, BED (semester 1 = new; 3 = upgraded)
-        $pgPrograms = ['MA', 'M.A', 'M.A.', 'MSC', 'M.Sc', 'M.Sc.', 'BED', 'B.Ed', 'B.Ed.', 'B.ED', 'PG'];
+        $ugLevels = ['UG'];
+        // PG group includes BEd per the original dashboard's own comment/labeling.
+        $pgLevels = ['PG', 'BEd'];
 
         $filterLevel = function ($q, array $levels) {
-            return $q->where(function ($inner) use ($levels) {
-                foreach ($levels as $i => $lvl) {
-                    $method = $i === 0 ? 'where' : 'orWhere';
-                    $inner->{$method}('program_code', 'ILIKE', $lvl . '%');
-                }
-            });
+            return $q->whereIn('p.level', $levels);
         };
 
         // ─────────────────────────────────────────────────────────────────────
-        // 1. NEW REGISTERED — UG (1st sem)
+        // 1-2. NEW REGISTERED — UG / PG, from direct_registrations.
+        // A registration has no semester field — it only exists at all as a
+        // "semester 1" event, so an explicit non-1 semester filter zeroes it.
         // ─────────────────────────────────────────────────────────────────────
-        $ugRegisteredNew = $filterLevel(
-            $applySemNo($applyOddEven($regBase()->where('semester', 1), $semName), $semNo === '' ? '' : $semNo),
-            $ugPrograms
-        )->count();
+        $regCount = function (array $regTypes) use ($session, $semName, $semNo) {
+            if ($semName === 'even') return 0;
+            if ($semNo !== '' && $semNo !== null && (int) $semNo !== 1) return 0;
 
-        // 2. NEW REGISTERED — PG (1st sem)
-        $pgRegisteredNew = $filterLevel(
-            $applySemNo($applyOddEven($regBase()->where('semester', 1), $semName), $semNo === '' ? '' : $semNo),
-            $pgPrograms
-        )->count();
+            $q = DB::table('direct_registrations')
+                ->whereNull('deleted_at')
+                ->whereIn('reg_type', $regTypes);
+            if ($session) $q->where('session_year', $session);
+            return $q->count();
+        };
+
+        $ugRegisteredNew = $regCount(['UG']);
+        $pgRegisteredNew = $regCount(['PG', 'BED']);
 
         // ─────────────────────────────────────────────────────────────────────
         // 3. NEW ADMISSION — UG (1st sem)
         // ─────────────────────────────────────────────────────────────────────
         $ugAdmissionNew = $filterLevel(
-            $applySemNo($applyOddEven($admBase()->where('semester', 1), $semName), $semNo === '' ? '' : $semNo),
-            $ugPrograms
+            $applySemNo($applyOddEven($admBase()->where('a.semester_no', 1), $semName), $semNo === '' ? '' : $semNo),
+            $ugLevels
         )->count();
 
         // 4. NEW ADMISSION — PG (1st sem)
         $pgAdmissionNew = $filterLevel(
-            $applySemNo($applyOddEven($admBase()->where('semester', 1), $semName), $semNo === '' ? '' : $semNo),
-            $pgPrograms
+            $applySemNo($applyOddEven($admBase()->where('a.semester_no', 1), $semName), $semNo === '' ? '' : $semNo),
+            $pgLevels
         )->count();
 
         // ─────────────────────────────────────────────────────────────────────
@@ -97,33 +89,35 @@ class DashboardController extends Controller
         // ─────────────────────────────────────────────────────────────────────
         $ugAdmissionUpgrade = $filterLevel(
             $applySemNo(
-                $applyOddEven($admBase()->whereIn('semester', [3, 5]), $semName),
+                $applyOddEven($admBase()->whereIn('a.semester_no', [3, 5]), $semName),
                 $semNo === '' ? '' : $semNo
             ),
-            $ugPrograms
+            $ugLevels
         )->count();
 
         // 6. UPGRADED ADMISSION — PG (3rd sem)
         $pgAdmissionUpgrade = $filterLevel(
             $applySemNo(
-                $applyOddEven($admBase()->where('semester', 3), $semName),
+                $applyOddEven($admBase()->where('a.semester_no', 3), $semName),
                 $semNo === '' ? '' : $semNo
             ),
-            $pgPrograms
+            $pgLevels
         )->count();
 
         // ─────────────────────────────────────────────────────────────────────
         // 7-9. Gender breakdown — New / Upgraded / Total Admission
         //      Joins with students table to get gender
         // ─────────────────────────────────────────────────────────────────────
-        $genderCount = function (string $type) use ($admBase, $applyOddEven, $applySemNo, $semName, $semNo) {
+        $genderCount = function (string $type) use ($applyOddEven, $applySemNo, $semName, $semNo, $session) {
             $q = DB::table('admissions as a')
                 ->join('students as s', 's.id', '=', 'a.student_id')
                 ->whereNull('a.deleted_at');
 
+            if ($session) $q->where('a.academic_year', $session);
+
             // type filter
-            if ($type === 'new')      $q->where('a.semester', 1);
-            if ($type === 'upgraded') $q->whereNotIn('a.semester', [1]);
+            if ($type === 'new')      $q->where('a.semester_no', 1);
+            if ($type === 'upgraded') $q->whereNotIn('a.semester_no', [1]);
 
             // semester filters
             $q = $applyOddEven($q, $semName);
@@ -152,10 +146,10 @@ class DashboardController extends Controller
 
         // ── Sessions list for filter dropdown ─────────────────────────────────
         $sessions = DB::table('admissions')
-            ->whereNotNull('session_year')
+            ->whereNotNull('academic_year')
             ->distinct()
-            ->orderByDesc('session_year')
-            ->pluck('session_year');
+            ->orderByDesc('academic_year')
+            ->pluck('academic_year');
 
         return response()->json([
             'filters' => [

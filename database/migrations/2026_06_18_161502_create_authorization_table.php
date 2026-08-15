@@ -31,44 +31,16 @@ return new class extends Migration {
             $t->index('admission_id');
         });
 
-        // ── Add documents_verified flag to admissions (if not present) ────────
-        if (Schema::hasTable('admissions')) {
-            Schema::table('admissions', function (Blueprint $t) {
-                if (!Schema::hasColumn('admissions', 'documents_verified'))
-                    $t->boolean('documents_verified')->default(false)->after('status');
-                if (!Schema::hasColumn('admissions', 'approved_by'))
-                    $t->unsignedBigInteger('approved_by')->nullable()->after('documents_verified');
-                if (!Schema::hasColumn('admissions', 'approved_at'))
-                    $t->timestamp('approved_at')->nullable()->after('approved_by');
-            });
-        }
-
-        // ── Add verified_by / verified_at to fee_receipts (if not present) ────
-        if (Schema::hasTable('fee_receipts')) {
-            Schema::table('fee_receipts', function (Blueprint $t) {
-                if (!Schema::hasColumn('fee_receipts', 'verified_by'))
-                    $t->unsignedBigInteger('verified_by')->nullable()->after('status');
-                if (!Schema::hasColumn('fee_receipts', 'verified_at'))
-                    $t->timestamp('verified_at')->nullable()->after('verified_by');
-            });
-        }
+        // (documents_verified/approved_by/approved_at on `admissions`, and
+        // verified_by/verified_at on `fee_receipts` — the latter pair
+        // already existed on fee_receipts before this file, so that part was
+        // always a no-op — now live directly in create_admissions_table.php
+        // and create_fee_receipts_table.php respectively, folded in as part
+        // of the migration cleanup.)
     }
 
     public function down(): void
     {
         Schema::dropIfExists('authorization_logs');
-        if (Schema::hasTable('admissions')) {
-            Schema::table('admissions', function (Blueprint $t) {
-                $t->dropColumnIfExists('documents_verified');
-                $t->dropColumnIfExists('approved_by');
-                $t->dropColumnIfExists('approved_at');
-            });
-        }
-        if (Schema::hasTable('fee_receipts')) {
-            Schema::table('fee_receipts', function (Blueprint $t) {
-                $t->dropColumnIfExists('verified_by');
-                $t->dropColumnIfExists('verified_at');
-            });
-        }
     }
 };

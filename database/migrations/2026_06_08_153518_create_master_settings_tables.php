@@ -54,7 +54,13 @@ Schema::create('enclosure_masters', function (Blueprint $table) {
     $table->string('admission_mode');
     $table->string('document_name');
     $table->boolean('is_required')->default(true);
+    // Grid columns (Enclosure Master screen)
+    $table->string('condition', 20)->nullable();
+    $table->boolean('enclose')->default(false);
+    $table->boolean('scan_copy')->default(false);
+    $table->string('photo_count', 5)->nullable();
     $table->timestamps();
+    $table->unique(['program_id', 'semester_no', 'admission_mode', 'document_name'], 'enclosure_masters_unique');
 });
 
 // back_paper_schedules
@@ -108,11 +114,17 @@ Schema::create('subject_papers', function (Blueprint $table) {
     $table->id();
     $table->foreignId('program_id')->constrained('programs')->cascadeOnDelete();
     $table->foreignId('subject_id')->constrained('subjects')->cascadeOnDelete();
+    $table->string('paper_code', 50)->nullable();
     $table->string('session_year');
     $table->string('semester_no');
     $table->string('paper_type');
     $table->string('paper_name');
-    $table->integer('group_no');
+    // Group is a real concept only for BSc electives (named combinations
+    // like "Maths Group"/"Bio Group" spanning several subjects) — group_no
+    // is legacy (kept for backward compat with already-saved rows, no
+    // longer written to); group_label is the live field.
+    $table->integer('group_no')->nullable();
+    $table->string('group_label', 50)->nullable();
     $table->integer('max_marks');
     $table->integer('min_marks');
     $table->timestamps();
@@ -140,10 +152,17 @@ Schema::create('subject_selections', function (Blueprint $table) {
     $table->foreignId('program_id')->constrained('programs')->cascadeOnDelete();
     $table->string('semester_no');
     $table->foreignId('subject_id')->constrained('subjects')->cascadeOnDelete();
-    $table->integer('group_no');
+    $table->integer('group_no'); // legacy numeric group — group_label below is the live A/B/C system
+    $table->string('group_label', 2)->nullable();
+    $table->string('group_name')->nullable();
     $table->boolean('is_compulsory')->default(false);
-    $table->integer('max_marks');
-    $table->integer('min_marks');
+    // Nullable — the group builder saves groups without per-subject marks;
+    // max_select/min_select (how many a student may/must pick) are the
+    // fields actually used now.
+    $table->integer('max_marks')->nullable();
+    $table->integer('min_marks')->nullable();
+    $table->integer('max_select')->default(1);
+    $table->integer('min_select')->default(1);
     $table->integer('sort_order')->default(0);
     $table->timestamps();
 });
@@ -156,6 +175,9 @@ Schema::create('vocational_papers', function (Blueprint $table) {
     $table->string('semester_no');
     $table->integer('group_no');
     $table->string('group_name');
+    // How many of this group's minor papers a student may/must pick.
+    $table->integer('max_select')->default(1);
+    $table->integer('min_select')->default(1);
     $table->string('paper_code');
     $table->string('paper_name');
     $table->integer('max_marks');

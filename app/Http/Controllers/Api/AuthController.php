@@ -27,14 +27,48 @@ class AuthController extends Controller
             'session'  => 'nullable|string',
         ]);
 
-        // Accept college, super_admin, AND legacy 'university' portal values.
-        // All employee accounts belong to 'college' conceptually — 'university' was
-        // the old value before the rename. We auto-migrate them below.
-        $user = User::where('email', $request->email)
-                    ->whereIn('portal', ['college', 'super_admin', 'university'])
-                    ->first();
+        // Match the email case/whitespace-insensitively — mobile keyboards
+        // and browser autofill can normalize input differently than manual
+        // typing (e.g. autocapitalize on the first letter), and email is
+        // conventionally case-insensitive anyway. Password is intentionally
+        // NOT trimmed/altered here — Hash::check must compare the exact
+        // bytes the account's password was hashed from.
+        $normalizedEmail = trim(strtolower($request->email));
+
+        // portal enum is college|student only ('university' and 'super_admin'
+        // were retired by migration — 'university' because this is a college
+        // system not a university system, 'super_admin' because it's a ROLE
+        // now, not a portal value).
+        //
+        // NOTE: Postgres' default unique index on `email` is case-sensitive,
+        // so "User@x.com" and "user@x.com" can both exist as "unique" rows.
+        // Matching case-insensitively (above) means if such a duplicate ever
+        // exists, which row comes back is otherwise undefined without an
+        // explicit order — that would look exactly like "sometimes invalid
+        // even when typed correctly", because the query could hand back a
+        // sibling account with a different password hash. orderBy('id')
+        // makes the pick deterministic; the count check below tells us via
+        // the log if a duplicate is the actual cause, without guessing.
+        $matches = User::whereRaw('LOWER(TRIM(email)) = ?', [$normalizedEmail])
+                    ->where('portal', 'college')
+                    ->orderBy('id')
+                    ->get();
+
+        if ($matches->count() > 1) {
+            \Illuminate\Support\Facades\Log::warning('Login: multiple user rows matched the same email case-insensitively', [
+                'email_normalized' => $normalizedEmail,
+                'user_ids' => $matches->pluck('id')->all(),
+            ]);
+        }
+
+        $user = $matches->first();
 
         if (!$user || !Hash::check($request->password, $user->password)) {
+            \Illuminate\Support\Facades\Log::info('Login failed', [
+                'email_normalized' => $normalizedEmail,
+                'user_found' => (bool) $user,
+                'ip' => $request->ip(),
+            ]);
             throw ValidationException::withMessages([
                 'email' => ['Invalid credentials. Please check your email and password.'],
             ]);
@@ -46,13 +80,7 @@ class AuthController extends Controller
             ], 403);
         }
 
-        // Auto-migrate legacy portal values to 'college' on successful login
-        if (in_array($user->portal, ['university', 'super_admin'])) {
-            $user->portal = 'college';
-        }
-
         $user->update([
-            'portal'        => $user->portal,
             'last_login_at' => now(),
             'last_login_ip' => $request->ip(),
         ]);
@@ -202,8 +230,8 @@ class AuthController extends Controller
     {
         $request->validate(['email' => 'required|email']);
 
-        $user = User::where('email', $request->email)
-                    ->whereIn('portal', ['college', 'super_admin', 'university'])
+        $user = User::whereRaw('LOWER(TRIM(email)) = ?', [trim(strtolower($request->email))])
+                    ->where('portal', 'college')
                     ->first();
 
         if (!$user) {
@@ -259,7 +287,7 @@ class AuthController extends Controller
         }
 
         $user = User::where('email', $request->email)
-                    ->whereIn('portal', ['college', 'super_admin', 'university'])
+                    ->where('portal', 'college')
                     ->firstOrFail();
 
         $user->update(['password' => Hash::make($request->password)]);

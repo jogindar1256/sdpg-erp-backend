@@ -66,23 +66,10 @@ return new class extends Migration {
             $t->index(['admission_id', 'status']);
         });
 
-        // ── Ensure fee_receipts has needed columns ────────────────────────────
-        if (Schema::hasTable('fee_receipts')) {
-            Schema::table('fee_receipts', function (Blueprint $t) {
-                if (!Schema::hasColumn('fee_receipts', 'bank_ref_no'))
-                    $t->string('bank_ref_no', 100)->nullable()->after('utr_no');
-                if (!Schema::hasColumn('fee_receipts', 'fee_status'))
-                    $t->string('fee_status', 20)->default('Pending')->after('status');
-            });
-        }
-
-        // ── Ensure admissions has fee_status column ───────────────────────────
-        if (Schema::hasTable('admissions')) {
-            Schema::table('admissions', function (Blueprint $t) {
-                if (!Schema::hasColumn('admissions', 'fee_status'))
-                    $t->string('fee_status', 20)->default('Pending')->after('status');
-            });
-        }
+        // (bank_ref_no/fee_status on fee_receipts, and fee_status on
+        // admissions — now live directly in create_fee_receipts_table.php
+        // and create_admissions_table.php respectively, folded in as part
+        // of the migration cleanup.)
     }
 
     public function down(): void

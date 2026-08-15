@@ -159,7 +159,7 @@ class StudentController extends Controller
             'first_name'         => 'required|string|max:100',
             'middle_name'        => 'nullable|string|max:100',
             'last_name'          => 'required|string|max:100',
-            'gender'             => 'required|in:male,female,other',
+            'gender'             => 'required|in:male,female,transgender',
             'date_of_birth'      => 'required|date|before:today',
             'category'           => 'required|in:general,obc,sc,st,ews',
             'mobile'             => 'required|string|size:10|unique:students,mobile',

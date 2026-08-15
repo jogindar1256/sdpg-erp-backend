@@ -53,9 +53,4 @@ class User extends Authenticatable
     {
         return $this->portal === 'college';
     }
-
-    public function isUniversityPortal(): bool
-    {
-        return $this->portal === 'university';
-    }
 }
