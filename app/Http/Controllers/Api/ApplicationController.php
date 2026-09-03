@@ -1705,6 +1705,13 @@ class ApplicationController extends Controller
         $sent = app(\App\Services\SmsService::class)->sendOtp($req->new_mobile, $otp, null);
         if (!$sent) {
             Log::info("APPLICATION MOBILE OTP for student {$student->id}: {$otp}");
+            // Same fix as StudentRegistrationController's OTP endpoints: don't
+            // claim success when the gateway call actually failed.
+            if (!config('app.debug')) {
+                return response()->json([
+                    'message' => 'Could not send the OTP to that mobile number right now. Please try again in a moment.',
+                ], 502);
+            }
         }
 
         $masked   = substr($req->new_mobile, 0, 2) . 'XXXXXX' . substr($req->new_mobile, -2);

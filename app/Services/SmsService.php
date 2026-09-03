@@ -28,6 +28,11 @@ class SmsService
      */
     public function sendOtp(string $mobile, string|int $otp, ?object $reg = null): bool
     {
+        Log::info('[SMS OTP] otp sending started', [
+            'mobile'          => $this->mask($mobile),
+            'organization_id' => $reg->organization_id ?? null,
+        ]);
+
         [$text, $templateId] = $this->otpTemplate((string) $otp, $reg);
 
         return $this->send($mobile, $text, $templateId, [
@@ -39,13 +44,20 @@ class SmsService
 
     /**
      * Generic DLT SMS send via Infibrix http-api.php. Returns true on success.
+     *
+     * Debug trail (all under the "[SMS]" log prefix so `grep '\[SMS' storage/logs/laravel.log`
+     * shows the full lifecycle of one send): config check → request built →
+     * calling api → api response → interpreted result. Added because failures
+     * here were previously invisible — the caller only saw a generic
+     * true/false with nothing about *why* a send failed (bad credentials,
+     * wrong route, gateway timeout, DLT template rejection, etc.).
      */
     public function send(string $mobile, string $message, ?string $templateId = null, array $meta = []): bool
     {
         $cfg = config('services.sms');
 
         if (empty($cfg['base_url']) || empty($cfg['auth_key'])) {
-            Log::warning('SMS not sent — Infibrix token missing (SMS_BASE_URL / SMS_AUTH_KEY).');
+            Log::warning('[SMS] not sent — Infibrix token missing (SMS_BASE_URL / SMS_AUTH_KEY not configured).');
             return false;
         }
 
@@ -62,25 +74,62 @@ class SmsService
             'unicode'       => $meta['unicode'] ?? null,   // set 2 for non-ASCII (Hindi) templates
         ], fn ($v) => $v !== null && $v !== '');
 
+        // Same params, but with the auth key redacted — safe to log (the raw
+        // $params array must NEVER be logged as-is; the key is a live credential).
+        $loggableParams = $params;
+        if (isset($loggableParams['authentic-key'])) {
+            $loggableParams['authentic-key'] = '***' . substr((string) $loggableParams['authentic-key'], -4);
+        }
+
+        Log::info('[SMS] calling api', [
+            'url'    => rtrim($cfg['base_url'], '/'),
+            'number' => $number,
+            'params' => $loggableParams,
+        ]);
+
         $status       = 'failed';
         $providerId   = null;
         $providerResp = null;
 
         try {
             $resp = Http::timeout(15)->get(rtrim($cfg['base_url'], '/'), $params);
+
+            Log::info('[SMS] api response', [
+                'number'      => $number,
+                'http_status' => $resp->status(),
+                'successful'  => $resp->successful(),
+                'body'        => trim($resp->body()),
+            ]);
+
             $providerResp = trim($resp->body());
             [$status, $providerId] = $this->interpret($resp->successful(), $providerResp, $resp->json());
+
+            Log::info('[SMS] interpreted result', [
+                'number'      => $number,
+                'status'      => $status,
+                'provider_id' => $providerId,
+            ]);
+
             if ($status !== 'sent') {
-                Log::warning("SMS send failed for {$number}: {$providerResp}");
+                Log::warning("[SMS] send failed for {$number}: {$providerResp}");
             }
         } catch (\Throwable $e) {
             $providerResp = $e->getMessage();
-            Log::error("SMS send exception for {$number}: {$providerResp}");
+            Log::error("[SMS] send exception for {$number}: {$providerResp}", [
+                'exception_class' => get_class($e),
+            ]);
         }
 
         $this->log($number, $message, $status, $providerId, $providerResp, $meta);
 
         return $status === 'sent';
+    }
+
+    /** Mask a mobile number for logs — keep first 2 + last 2 digits. */
+    private function mask(string $mobile): string
+    {
+        $d = preg_replace('/\D+/', '', $mobile);
+        return strlen($d) >= 4 ? substr($d, 0, 2) . str_repeat('X', strlen($d) - 4) . substr($d, -2) : $d;
     }
 
     /**

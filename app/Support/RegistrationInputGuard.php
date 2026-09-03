@@ -142,11 +142,16 @@ class RegistrationInputGuard
         return null;
     }
 
-    /** Family ID (UP "Ek Parivar Ek Pehchan" — familyid.up.gov.in): 12-digit numeric. */
+    /**
+     * Family ID (UP "Ek Parivar Ek Pehchan" — familyid.up.gov.in): 12-digit
+     * numeric. Not every applicant has one issued yet, so — unlike ABC ID —
+     * this field is optional; only validate the format when something was
+     * actually entered.
+     */
     public static function familyIdError(?string $id): ?string
     {
         $v = trim((string) $id);
-        if ($v === '') return 'Family ID is required.';
+        if ($v === '') return null;
         if (!preg_match('/^\d{12}$/', $v)) return 'Family ID must be exactly 12 digits (from familyid.up.gov.in).';
         if (preg_match('/^(\d)\1{11}$/', $v)) return 'That looks like a placeholder Family ID — enter your real one.';
         return null;

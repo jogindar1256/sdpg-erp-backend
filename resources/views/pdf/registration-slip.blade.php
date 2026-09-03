@@ -159,16 +159,22 @@
     <div class="sec">Personal Details</div>
     <table class="kv">
         <tr>
-            <td class="k">Name</td>
+            <td class="k">Name (English)</td>
             <td>{{ $val($reg->name) }}</td>
             <td class="k">Name (Hindi)</td>
             <td>{{ $val($reg->name_hindi) }}</td>
         </tr>
         <tr>
-            <td class="k">Father's Name</td>
+            <td class="k">Father's Name (English)</td>
             <td>{{ $val($reg->father_name) }}</td>
-            <td class="k">Mother's Name</td>
+            <td class="k">Father's Name (Hindi)</td>
+            <td>{{ $val($reg->father_name_hindi) }}</td>
+        </tr>
+        <tr>
+            <td class="k">Mother's Name (English)</td>
             <td>{{ $val($reg->mother_name) }}</td>
+            <td class="k">Mother's Name (Hindi)</td>
+            <td>{{ $val($reg->mother_name_hindi) }}</td>
         </tr>
         <tr>
             <td class="k">Date of Birth</td>

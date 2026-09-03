@@ -47,7 +47,7 @@ class StudentRegistrationController extends Controller
             'session'     => 'required|string|max:12',  // e.g. 2025-2026
             'ddurn_no'    => 'required|string|max:50',
             'abc_id'      => 'required|string|max:50',
-            'family_id'   => 'required|string|max:50',
+            'family_id'   => 'nullable|string|max:50', // optional — not every applicant has one issued yet
         ]);
 
         if ($v->fails()) {
@@ -90,7 +90,19 @@ class StudentRegistrationController extends Controller
         // Backstop: uppercase free text server-side too (frontend already
         // does this live as the student types) — email/mobile/session etc.
         // are left alone automatically by TextNormalizer's key exclusions.
-        $req->merge(TextNormalizer::upper($req->all()));
+        // gender/category/religion/nationality/domestic_state/etc. come from
+        // a fixed <select> on the form, not free text — uppercasing those
+        // corrupts them ('Male' -> 'MALE', which then fails
+        // direct_registrations_gender_check outright; 'General' -> 'GENERAL'
+        // etc. silently break every <select> that later tries to redisplay
+        // the saved value, since none of its <option>s match anymore). Keep
+        // this list in sync with $selectDrivenFields in applyDraftUpdate()
+        // below, which has the same exclusion for the office-edit path.
+        $req->merge(TextNormalizer::upper($req->all(), [
+            'gender', 'category', 'admission_category', 'religion', 'nationality',
+            'domestic_state', 'caste_cert_state', 'is_divyang', 'id_proof_type',
+            'course_group', 'stream',
+        ]));
 
         // ── Require mobile + email OTP verification BEFORE anything is created.
         // Nothing is drafted, no registration number is generated, and no email
@@ -145,7 +157,7 @@ class StudentRegistrationController extends Controller
 
                 'ddurn_no'            => $req->ddurn_no,
                 'abc_id'              => $req->abc_id,
-                'family_id'           => $req->family_id,
+                'family_id'           => $req->family_id ?: null,
 
                 'major_subject_1'     => $req->major_subject_1 ?: null,
                 'major_subject_2'     => $req->major_subject_2 ?: null,
@@ -249,6 +261,17 @@ class StudentRegistrationController extends Controller
         $sent = app(\App\Services\SmsService::class)->sendOtp($req->mobile, $otp, null);
         if (!$sent) {
             Log::info("PRE PHONE OTP for {$req->mobile}: {$otp}");
+            // Previously this fell through to a 200 "OTP sent" response even
+            // when the SMS gateway call failed — the applicant would wait for
+            // a code that never arrives, with the request logged as a
+            // success. Outside local/debug, a failed send must fail loudly so
+            // the frontend can tell the applicant to retry instead of lying
+            // to them. In debug, keep going so the OTP is still returned below.
+            if (!config('app.debug')) {
+                return response()->json([
+                    'message' => 'Could not send the OTP to your mobile right now. Please try again in a moment.',
+                ], 502);
+            }
         }
 
         $resp = ['message' => 'OTP sent to your mobile.'];
@@ -349,16 +372,51 @@ class StudentRegistrationController extends Controller
             'ug_university', 'ug_institute', 'ug_session', 'ug_roll_no',
             'stream', 'entrance_session', 'entrance_roll_no', 'state_rank', 'category_rank', 'cut_off',
         ];
+        // These columns are all populated from a fixed-vocabulary <select> on
+        // every registration form (UG/PG/BED), not free text — their stored
+        // value must exactly match the option list the forms render
+        // (Title Case: 'Male', 'General', 'Sikh', 'Uttar Pradesh', 'Indian',
+        // 'Aadhar Card', ...). initiate() writes them verbatim from the
+        // select's value and never uppercases them. Blanket-uppercasing them
+        // here (as this loop used to do for every field) silently corrupts
+        // them to 'MALE' / 'GENERAL' / 'SIKH' / etc: gender then fails the
+        // direct_registrations_gender_check DB constraint outright, and the
+        // rest just go uppercase and stop matching any <option> on reload —
+        // so the edit form renders them blank ("-- Select --") and any
+        // logic that string-compares against the option list (e.g. the
+        // caste-certificate-required check, or nationality's "Other" custom
+        // -text branch) misfires. They're excluded from the normalization
+        // pass below and written through exactly as submitted.
+        $selectDrivenFields = [
+            'gender', 'category', 'admission_category', 'religion', 'nationality',
+            'domestic_state', 'caste_cert_state', 'is_divyang', 'id_proof_type',
+            'course_group', 'stream',
+        ];
         $update = [];
         foreach ($fields as $f) {
-            // Backstop: same uppercase normalization as initiate() — none of
-            // these whitelisted fields are email/password, so it's safe to
-            // apply unconditionally here.
-            if ($req->has($f)) $update[$f] = TextNormalizer::upperValue($req->input($f)) ?: null;
+            if (!$req->has($f)) continue;
+            $update[$f] = in_array($f, $selectDrivenFields, true)
+                ? ($req->input($f) ?: null)
+                : (TextNormalizer::upperValue($req->input($f)) ?: null);
         }
         $update['updated_at'] = now();
 
         DB::table('direct_registrations')->where('id', $id)->update($update);
+
+        // receipt() serves a cached PDF from `pdf_path` instead of rendering
+        // fresh every time (see receipt()/generateReceiptPdf() below) — once
+        // a receipt has been generated, editing name/father_name/etc. here
+        // silently has no visible effect because the old file is still what
+        // gets served. Clear the cache so the next receipt view regenerates
+        // it with the corrected details. (registrationSlip() is unaffected —
+        // it already renders live from the DB on every request.)
+        $reg = DB::table('direct_registrations')->where('id', $id)->first();
+        if ($reg && $reg->pdf_path) {
+            if (Storage::exists($reg->pdf_path)) {
+                Storage::delete($reg->pdf_path);
+            }
+            DB::table('direct_registrations')->where('id', $id)->update(['pdf_path' => null]);
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -378,6 +436,14 @@ class StudentRegistrationController extends Controller
         $sent = app(\App\Services\SmsService::class)->sendOtp($reg->mobile, $otp, $reg);
         if (!$sent) {
             Log::info("PHONE OTP for registration {$reg->id}: {$otp}");
+            // Same bug as preSendPhoneOtp(): don't report success when the
+            // gateway call actually failed — surface it outside debug so the
+            // applicant isn't left waiting on an OTP that was never sent.
+            if (!config('app.debug')) {
+                return response()->json([
+                    'message' => 'Could not send the OTP to your mobile right now. Please try again in a moment.',
+                ], 502);
+            }
         }
 
         $masked   = substr($reg->mobile, 0, 2) . 'XXXXXX' . substr($reg->mobile, -2);
@@ -1166,20 +1232,30 @@ class StudentRegistrationController extends Controller
         $program = $reg->program_id ? DB::table('programs')->find($reg->program_id) : null;
         $org     = $reg->organization_id ? DB::table('organizations')->find($reg->organization_id) : null;
 
-        // Major subjects come from the subjects master.
+        // Major AND Minor subjects both come from the subjects master — Minor
+        // Subject used to be picked from the vocational/co-curricular paper
+        // master, but per DDU University rules that was wrong; a minor must
+        // be any subject offered by the same course, same as the majors.
         $subjIds = array_filter([
             $reg->major_subject_1 ?? null, $reg->major_subject_2 ?? null,
-            $reg->major_subject_3 ?? null, $reg->subject_id ?? null,
+            $reg->major_subject_3 ?? null, $reg->minor_subject_1 ?? null,
+            $reg->subject_id ?? null,
         ]);
         $names = $subjIds ? DB::table('subjects')->whereIn('id', $subjIds)->pluck('name', 'id')->all() : [];
 
-        // Minor subject is picked from the vocational / co-curricular paper master.
+        // Minor subject: look it up in subjects first (current rows). Rows
+        // saved before this fix stored a vocational_papers id instead — fall
+        // back to that table only if the subjects lookup comes up empty, so
+        // old registrations still print correctly.
         $minor = null;
         if (!empty($reg->minor_subject_1)) {
-            $vp = DB::table('vocational_papers')->find($reg->minor_subject_1);
-            $minor = $vp
-                ? trim($vp->paper_name . ($vp->paper_code ? " ({$vp->paper_code})" : ''))
-                : ($names[$reg->minor_subject_1] ?? null);   // fallback for older rows
+            $minor = $names[$reg->minor_subject_1] ?? null;
+            if (!$minor) {
+                $vp = DB::table('vocational_papers')->find($reg->minor_subject_1);
+                if ($vp) {
+                    $minor = trim($vp->paper_name . ($vp->paper_code ? " ({$vp->paper_code})" : ''));
+                }
+            }
         }
 
         $subjects = array_filter([

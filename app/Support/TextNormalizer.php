@@ -42,18 +42,32 @@ class TextNormalizer
      * strings and non-Latin scripts (e.g. Hindi fields) are safe to include
      * since uppercasing them is a no-op — there's no need to special-case
      * them out.
+     *
+     * $extraExcludedKeys is for callers whose payload includes fields
+     * populated from a fixed <select> rather than free text (e.g. gender,
+     * category, state) — those must keep the exact case their option list
+     * uses, so pass the exact key names (case-insensitive, exact match, not
+     * a substring pattern like EXCLUDED_KEY_PATTERNS) to leave them
+     * untouched. See StudentRegistrationController::initiate() for why this
+     * matters: uppercasing gender there used to break the DB check
+     * constraint on every submission.
      */
-    public static function upper(array $data): array
+    public static function upper(array $data, array $extraExcludedKeys = []): array
     {
+        $extraExcludedKeys = array_map('strtolower', $extraExcludedKeys);
         $out = [];
 
         foreach ($data as $key => $value) {
             if (is_array($value)) {
-                $out[$key] = self::upper($value);
+                $out[$key] = self::upper($value, $extraExcludedKeys);
                 continue;
             }
 
-            if (!is_string($value) || self::isExcludedKey((string) $key)) {
+            if (
+                !is_string($value)
+                || self::isExcludedKey((string) $key)
+                || in_array(strtolower((string) $key), $extraExcludedKeys, true)
+            ) {
                 $out[$key] = $value;
                 continue;
             }

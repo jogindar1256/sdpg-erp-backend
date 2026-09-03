@@ -180,7 +180,7 @@ return new class extends Migration
         }
 
         // ── fee_structures (from fix_master_settings_schema_gaps) ────────
-        if (Schema::hasTable('fee_structures')) {3639
+        if (Schema::hasTable('fee_structures')) {
             Schema::table('fee_structures', function (Blueprint $t) {
                 if (!Schema::hasColumn('fee_structures', 'amounts')) {
                     $t->json('amounts')->nullable();
