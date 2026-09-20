@@ -28,17 +28,40 @@ class SmsService
      */
     public function sendOtp(string $mobile, string|int $otp, ?object $reg = null): bool
     {
+        // organization_id drives which sms_templates row we're required to
+        // use — $reg is null at the pre-registration stage (no
+        // direct_registrations row exists yet), so fall back to the single
+        // active organization, same resolution initiate() itself uses.
+        $organizationId = $reg->organization_id ?? null;
+        if (empty($organizationId)) {
+            $org = DB::table('organizations')->where('is_active', true)->first();
+            $organizationId = $org->id ?? null;
+        }
+
         Log::info('[SMS OTP] otp sending started', [
             'mobile'          => $this->mask($mobile),
-            'organization_id' => $reg->organization_id ?? null,
+            'organization_id' => $organizationId,
         ]);
 
-        [$text, $templateId] = $this->otpTemplate((string) $otp, $reg);
+        $template = $this->otpTemplate((string) $otp, $organizationId);
+        if (!$template) {
+            // No hardcoded fallback — an OTP send with unregistered text/id
+            // just gets silently dropped by the carrier's DLT scrubbing
+            // (gateway still returns 200), which is worse than failing loud
+            // here. Always source from sms_templates, never from .env/config,
+            // even for a "just testing" send.
+            Log::error('[SMS OTP] not sent — no active sms_templates row for event_trigger=otp', [
+                'organization_id' => $organizationId,
+            ]);
+            return false;
+        }
+        [$text, $templateId, $senderId] = $template;
 
         return $this->send($mobile, $text, $templateId, [
-            'organization_id' => $reg->organization_id ?? null,
+            'organization_id' => $organizationId,
             'event_trigger'   => 'otp',
             'route'           => config('services.sms.otp_route', 10),
+            'sender_id'       => $senderId,
         ]);
     }
 
@@ -61,16 +84,33 @@ class SmsService
             return false;
         }
 
+        // No template id (or, for a DLT route, no text at all) is a hard stop
+        // — never send without one and hope the gateway/carrier sorts it out.
+        // This is what previously produced "200 OK, msg-id returned, nothing
+        // ever arrives": a send going out with a template id that either
+        // wasn't registered or didn't match the text, silently dropped by
+        // the carrier's DLT scrubbing after Infibrix's own gateway already
+        // accepted it. Always require an explicit, table-sourced id.
+        if (empty($templateId)) {
+            Log::error('[SMS] not sent — no DLT template id resolved (must come from sms_templates, no .env fallback).');
+            $this->log($this->normalize($mobile), $message, 'failed', null, 'no template id resolved', $meta);
+            return false;
+        }
+
         $number = $this->normalize($mobile);
 
         // Exact Infibrix token-API parameter names (note the hyphen in authentic-key).
+        // senderid prefers the sms_templates row's own sender_id (passed via
+        // $meta) over the generic .env-configured one — a template registered
+        // under one sender ID sent from a different one is itself a DLT
+        // mismatch, same class of bug as the template id itself.
         $params = array_filter([
             'authentic-key' => $cfg['auth_key'],
-            'senderid'      => $cfg['sender_id'] ?? null,
+            'senderid'      => $meta['sender_id'] ?? ($cfg['sender_id'] ?? null),
             'route'         => $meta['route'] ?? ($cfg['route'] ?? 2),
             'number'        => $number,
             'message'       => $message,
-            'templateid'    => $templateId ?: ($cfg['otp_template_id'] ?? null),
+            'templateid'    => $templateId,
             'unicode'       => $meta['unicode'] ?? null,   // set 2 for non-ASCII (Hindi) templates
         ], fn ($v) => $v !== null && $v !== '');
 
@@ -176,29 +216,35 @@ class SmsService
     }
 
     /**
-     * Resolve the OTP message + DLT template id. Prefers a DLT-registered row
-     * in sms_templates (event_trigger = 'otp') so the text matches TRAI exactly.
+     * Resolve the OTP message + DLT template id + sender id — ALWAYS from
+     * sms_templates (event_trigger = 'otp', is_active = true) for the given
+     * organization. No hardcoded/.env fallback: a template ID or message
+     * text that doesn't exactly match what's registered with the telecom
+     * carrier's DLT system gets silently dropped after the gateway itself
+     * already returned success, which is exactly the failure mode this was
+     * built to rule out. Returns null if no such row exists — the caller
+     * must fail the send rather than guess.
+     *
+     * @return array{0:string,1:?string,2:?string}|null [text, dlt_template_id, sender_id]
      */
-    private function otpTemplate(string $otp, ?object $reg): array
+    private function otpTemplate(string $otp, ?int $organizationId): ?array
     {
-        if ($reg && !empty($reg->organization_id)) {
-            $row = DB::table('sms_templates')
-                ->where('organization_id', $reg->organization_id)
-                ->where('event_trigger', 'otp')
-                ->where('is_active', true)
-                ->first();
-
-            if ($row) {
-                $text = str_replace(['{otp}', '{OTP}', '{#var#}'], $otp, $row->template);
-                return [$text, $row->dlt_template_id];
-            }
+        if (empty($organizationId)) {
+            return null;
         }
 
-        // Fallback matches the registered DLT template "Otp SMS Swami Devanand Post G":
-        //   "Dear Student, Your OTP is {#var#}. Please do not share this OTP.
-        //    Regards, Swami Devanand Post Graduate College"
-        $text = "Dear Student, Your OTP is {$otp}. Please do not share this OTP. Regards, Swami Devanand Post Graduate College";
-        return [$text, config('services.sms.otp_template_id')];
+        $row = DB::table('sms_templates')
+            ->where('organization_id', $organizationId)
+            ->where('event_trigger', 'otp')
+            ->where('is_active', true)
+            ->first();
+
+        if (!$row) {
+            return null;
+        }
+
+        $text = str_replace(['{otp}', '{OTP}', '{#var#}'], $otp, $row->template);
+        return [$text, $row->dlt_template_id, $row->sender_id];
     }
 
     /** Normalise an Indian mobile to 91XXXXXXXXXX. */

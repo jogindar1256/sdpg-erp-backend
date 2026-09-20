@@ -14,6 +14,7 @@ return new class extends Migration
             $table->string('name');                        // Tuition Fee, Library Fee, Exam Fee
             $table->string('code', 30)->unique();
             $table->enum('category', ['tuition', 'exam', 'library', 'hostel', 'transport', 'miscellaneous']);
+            $table->string('in_favor_of', 20)->nullable();
             $table->boolean('is_refundable')->default(false);
             $table->boolean('is_mandatory')->default(true);
             $table->text('description')->nullable();

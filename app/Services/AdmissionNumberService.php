@@ -31,6 +31,12 @@ class AdmissionNumberService
     /** Fee-receipt mode codes. */
     private const MODE = ['regular' => '101', 'self_finance' => '201', 'back_paper' => '301', 'other' => '401'];
 
+    /** Fee Ref. ID category codes (Gen/OBC/SC/ST/EWS — the labels the Fee Structure UI already shows, not the numeric Student-ID codes above). */
+    private const FEE_REF_CATEGORY = ['general' => 'GEN', 'gen' => 'GEN', 'obc' => 'OBC', 'sc' => 'SC', 'st' => 'ST', 'ews' => 'EWS'];
+
+    /** Fee Ref. ID gender codes. Unused for fee_structures now (see feeRefId() header) — kept for student_applications, which still encodes one real student's gender. */
+    private const FEE_REF_GENDER = ['male' => 'M', 'female' => 'F', 'other' => 'T', 'transgender' => 'T'];
+
     // ── 1. Student ID ──────────────────────────────────────────────────────
     public function studentId(string $session, object $program, ?string $category): string
     {
@@ -60,6 +66,49 @@ class AdmissionNumberService
             return $isSelfFinance ? 'self_finance' : 'regular';
         }
         return 'other';
+    }
+
+    /**
+     * Fee Ref. ID — course [+ category] [+ gender] + serial(3), e.g.
+     * BA001, BAGEN001, or BAGENM001, depending which of $category/$gender
+     * the caller has one real value for. Serial increments within
+     * whichever prefix results (same MAX+1-within-prefix approach as the
+     * other identifiers here).
+     *
+     * fee_structures calls pass $category (its real row identity — one row
+     * per course+category, see the amount_json migration header) and leave
+     * $gender null: a fee_structures row spans every gender within its
+     * category at once, so encoding one gender into a row-level ref would
+     * misrepresent it as covering only one. Gender lives inside
+     * amount_json instead, resolved from the student's own record when
+     * reading it.
+     *
+     * student_applications' own fee_ref_id is a separate case: that row
+     * DOES belong to one specific student, so ApplicationController passes
+     * both that student's real category AND gender and gets the full
+     * BAGENM001-style code.
+     */
+    public function feeRefId(string $table, string $column, object $program, ?string $category = null, ?string $gender = null): string
+    {
+        $course = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) ($program->short_name ?? 'FS'))) ?: 'FS';
+        $cat = $category ? (self::FEE_REF_CATEGORY[strtolower($category)] ?? strtoupper(substr($category, 0, 3))) : '';
+        $gen = $gender ? (self::FEE_REF_GENDER[strtolower($gender)] ?? strtoupper(substr($gender, 0, 1))) : '';
+        $prefix = $course . $cat . $gen;
+
+        return $prefix . $this->nextSerial($table, $column, $prefix, 3);
+    }
+
+    /**
+     * Ref no for a rejected_applications row — organization's own short
+     * code (organizations.code, e.g. "SDPG") + a 6-digit serial that only
+     * ever increments, e.g. "SDPG000001". One shared sequence across both
+     * hold and reject decisions (not split by decision type or program).
+     */
+    public function rejectedApplicationRefNo(object $organization): string
+    {
+        $prefix = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) ($organization->code ?? 'ORG'))) ?: 'ORG';
+
+        return $prefix . $this->nextSerial('rejected_applications', 'ref_no', $prefix, 6);
     }
 
     // ── 3. File No ─────────────────────────────────────────────────────────

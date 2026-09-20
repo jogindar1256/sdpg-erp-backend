@@ -60,6 +60,25 @@ return [
             'report' => false,
         ],
 
+        // Supabase Storage, accessed via its S3-compatible API — replaces
+        // local disk for student_application_documents uploads so files
+        // don't depend on the app server's own filesystem / storage:link
+        // symlink (see ApplicationController::uploadStudentDocument() and
+        // friends). Path-style addressing is required by Supabase's S3
+        // gateway (bucket name goes in the URL path, not as a subdomain).
+        'supabase' => [
+            'driver' => 's3',
+            'key' => env('SUPABASE_S3_ACCESS_KEY_ID'),
+            'secret' => env('SUPABASE_S3_SECRET_ACCESS_KEY'),
+            'region' => env('SUPABASE_S3_REGION', 'ap-northeast-2'),
+            'bucket' => env('SUPABASE_S3_BUCKET'),
+            'url' => env('SUPABASE_S3_URL'),
+            'endpoint' => env('SUPABASE_S3_ENDPOINT'),
+            'use_path_style_endpoint' => true,
+            'throw' => false,
+            'report' => false,
+        ],
+
     ],
 
     /*

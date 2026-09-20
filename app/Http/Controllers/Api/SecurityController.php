@@ -1,11 +1,14 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Api;
 
+use App\Http\Controllers\Controller;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 use Spatie\Permission\Models\Permission;
 
@@ -107,6 +110,117 @@ class SecurityController extends Controller
         $user->tokens()->delete(); // force re-login
 
         return response()->json(['message' => 'Password reset.', 'temp_password' => $temp]);
+    }
+
+    // ── Reset Password (any portal) ─────────────────────────────────────────
+
+    /**
+     * GET /security/reset-password/users
+     * Search users across EVERY portal (college staff, students, etc.) — the
+     * plain /security/users list above is deliberately scoped to portal=college
+     * only, so this is a separate, portal-agnostic lookup just for the
+     * "reset password of any user" tool.
+     */
+    public function searchAllUsers(Request $request)
+    {
+        $query = User::query()->orderBy('name');
+
+        if ($search = $request->query('search')) {
+            $query->where(function ($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('email', 'like', "%{$search}%")
+                  ->orWhere('mobile', 'like', "%{$search}%")
+                  ->orWhere('employee_id', 'like', "%{$search}%");
+            });
+        }
+
+        $users = $query->paginate(20)->through(function (User $u) {
+            return [
+                'id'        => $u->id,
+                'name'      => $u->name,
+                'email'     => $u->email,
+                'mobile'    => $u->mobile,
+                'portal'    => $u->portal,
+                'role'      => $u->getRoleNames()->first(),
+                'is_active' => $u->is_active ?? true,
+            ];
+        });
+
+        return response()->json($users);
+    }
+
+    /**
+     * POST /security/reset-password
+     * Admin-driven password reset for ANY user, any portal (college staff or
+     * student) — two modes:
+     *   - mode=email:    admin sets the new password themselves, it's emailed
+     *                     to the account's email on file, and never echoed
+     *                     back in the response.
+     *   - mode=generate: server generates a random password, saves it, and
+     *                     returns it in the response so the admin can copy it
+     *                     and hand it over directly (no email sent).
+     */
+    public function resetAnyPassword(Request $request)
+    {
+        $data = $request->validate([
+            'user_id'      => 'required|integer|exists:users,id',
+            'mode'         => 'required|in:email,generate',
+            'new_password' => 'required_if:mode,email|nullable|string|min:8',
+        ]);
+
+        $user = User::findOrFail($data['user_id']);
+
+        if ($data['mode'] === 'email') {
+            if (!$user->email) {
+                return response()->json([
+                    'message' => 'This account has no email on file — use "Generate & Copy" instead.',
+                ], 422);
+            }
+
+            $plain = $data['new_password'];
+            // Assigning the plain value is enough — User::$casts hashes it
+            // automatically (see 'password' => 'hashed'), same convention
+            // used by StudentRegistrationController::provisionAccount().
+            $user->update(['password' => $plain]);
+            $user->tokens()->delete(); // force re-login everywhere
+
+            $portalLabel = $user->portal === 'student' ? 'Student' : 'College';
+            $loginPath   = $user->portal === 'student' ? '/student/login' : '/login';
+            $loginId     = $user->portal === 'student' ? ($user->mobile ?? $user->email) : $user->email;
+
+            $body = "Dear {$user->name},\n\n"
+                . "Your password for the SDPG College {$portalLabel} Portal has been reset by an administrator.\n\n"
+                . "==============================\n"
+                . "NEW LOGIN CREDENTIALS\n"
+                . "==============================\n"
+                . "Portal   : {$loginPath}\n"
+                . "Login ID : {$loginId}\n"
+                . "Password : {$plain}\n\n"
+                . "Please log in and change this password as soon as possible.\n\n"
+                . "Regards,\nSDPG College ERP\n"
+                . "(Do not share your password with anyone. If you did not request this, contact the office immediately.)";
+
+            try {
+                Mail::raw($body, fn ($m) => $m->to($user->email)->subject('Your SDPG College ERP password has been reset'));
+            } catch (\Throwable $e) {
+                Log::error("Password reset email failed for user {$user->id}: " . $e->getMessage());
+                return response()->json([
+                    'message' => 'Password was reset, but the email failed to send. Please share it with the user manually or try "Generate & Copy" instead.',
+                ], 502);
+            }
+
+            return response()->json(['message' => "Password reset and emailed to {$user->email}."]);
+        }
+
+        // mode=generate
+        $plain = strtoupper(Str::random(3)) . random_int(100, 999) . Str::lower(Str::random(2));
+        $user->update(['password' => $plain]);
+        $user->tokens()->delete();
+
+        return response()->json([
+            'message'       => 'Password reset. Copy it now — it will not be shown again.',
+            'temp_password' => $plain,
+        ]);
     }
 
     // ── Permissions ──────────────────────────────────────────────────────────

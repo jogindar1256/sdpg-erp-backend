@@ -14,7 +14,6 @@ use App\Http\Controllers\Api\OrganizationController;
 use App\Http\Controllers\Api\ProgramController;
 use App\Http\Controllers\Api\StudentRegistrationController;
 use App\Http\Controllers\Api\SubjectController;
-use App\Http\Controllers\Api\FeeStructureController;
 use App\Http\Controllers\Api\AdmissionController;
 use App\Http\Controllers\Api\ExaminationController;
 use App\Http\Controllers\Api\AmendmentController;
@@ -50,14 +49,8 @@ Route::prefix('student/register')->group(function () {
     Route::get('meta', [StudentRegistrationController::class, 'registrationMeta']);
     // Groupwise (A/B/C) subjects for the public registration form dropdowns
     Route::get('subject-groups', [MasterSettingsController::class, 'publicSubjectGroups']);
-    // Vocational / co-curricular papers — populates the Minor Subject dropdown
     Route::get('vocational-papers', [MasterSettingsController::class, 'publicVocationalPapers']);
 
-    // Admission-condition-driven record lookups (see MasterSettingsController's
-    // admission_conditions feature). "Open Admission" checks for a returning
-    // DDU student in `students`; "Through Counselling" checks `counselling_reports`.
-    // fetchOldRecord() already existed but was never routed — the PG/BEd "Fetch
-    // Record" button has been calling this exact path and silently 404ing.
     Route::get('fetch-record', [StudentRegistrationController::class, 'fetchOldRecord']);
     Route::get('counselling-lookup', [StudentRegistrationController::class, 'counsellingLookup']);
 
@@ -70,17 +63,9 @@ Route::prefix('student/register')->group(function () {
     // Create the draft (only succeeds once both OTPs are verified).
     Route::post('init', [StudentRegistrationController::class, 'initiate']);
 
-    // Edit an unpaid draft (college "Modify" + student editing while payment pending).
-    Route::get('draft/{id}', [StudentRegistrationController::class, 'showDraft']);
-    Route::put('draft/{id}', [StudentRegistrationController::class, 'updateDraft']);
-
     Route::post('payment/initiate', [StudentRegistrationController::class, 'initiatePayment']);
     Route::post('payment/verify', [StudentRegistrationController::class, 'verifyPayment']);
     Route::post('payment/failed', [StudentRegistrationController::class, 'paymentFailed']);
-
-    Route::get('receipt/{id}', [StudentRegistrationController::class, 'receipt']);
-    // Registration slip — full details + payment status (available once paid).
-    Route::get('slip/{id}', [StudentRegistrationController::class, 'registrationSlip']);
 });
 
 
@@ -103,8 +88,6 @@ Route::get('bank/search', function (Request $request) {
                 ->orWhereRaw('UPPER(bank_name)   LIKE ?', [$like]);
         })
         ->select('id', 'ifsc_code', 'bank_name', 'branch_name', 'city', 'district', 'state', 'micr_code', 'address')
-        // Exact IFSC first; branch_name tiebreak so shared-IFSC rows don't
-        // come back in arbitrary order (2000 rows all matched rank 0 before).
         ->orderByRaw('CASE WHEN UPPER(ifsc_code) = ? THEN 0 ELSE 1 END', [$upper])
         ->orderBy('bank_name')
         ->orderBy('branch_name')
@@ -169,6 +152,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('logout', [AuthController::class, 'logout']);
         Route::get('me', [AuthController::class, 'me']);
         Route::post('change-password', [AuthController::class, 'changePassword']);
+        Route::post('verify-password', [AuthController::class, 'verifyPassword']);
     });
 
     // ── COLLEGE PORTAL ────────────────────────────────────────────────────
@@ -194,8 +178,6 @@ Route::middleware('auth:sanctum')->group(function () {
 
         // Fee Settings
         Route::apiResource('fee-heads', FeeHeadController::class);
-        Route::apiResource('fee-structures', FeeStructureController::class);
-        Route::post('fee-structures/copy-from-year', [FeeStructureController::class, 'copyFromYear']);
 
         // SMS Templates
         Route::apiResource('sms-templates', SmsTemplateController::class);
@@ -218,13 +200,23 @@ Route::middleware('auth:sanctum')->group(function () {
             // POST /applications   (office creates back-paper / upgrade app on behalf of student)
             Route::post('/', [ApplicationController::class, 'storeOffice']);
 
-            // GET  /applications/office-lookup?q=
             Route::get('/office-lookup', [ApplicationController::class, 'officeLookup']);
+            Route::get('/upgrade-lookup', [ApplicationController::class, 'upgradeLookup']);
 
-            // GET  /applications/hold
-            // POST /applications/hold
-            Route::get('/hold', [ApplicationController::class, 'holdIndex']);
-            Route::post('/hold', [ApplicationController::class, 'holdStore']);
+            // POST /applications/{id}/documents  (office equivalent of the student
+            // -portal upload — no student-ownership check, mirrors updatePartOffice)
+            Route::post('/{id}/documents', [ApplicationController::class, 'uploadStudentDocumentOffice']);
+
+            // DELETE /applications/{id}/documents/{document_type}  (office)
+            Route::delete('/{id}/documents/{document_type}', [ApplicationController::class, 'deleteStudentDocumentOffice']);
+
+            // GET /applications/{id}/documents/required  (office) — Enclosure
+            // Master-driven upload list, see buildRequiredDocuments().
+            Route::get('/{id}/documents/required', [ApplicationController::class, 'requiredDocumentsOffice']);
+
+            // GET /applications/hold-reject-applications — search backing
+            // /college/applications/hold-reject-applications/view
+            Route::get('/hold-reject-applications', [ApplicationController::class, 'holdRejectSearch']);
 
             // GET  /applications/back-paper/papers?admission_id=&semester_no=
             Route::get('/back-paper/papers', [ApplicationController::class, 'backPaperPapers']);
@@ -233,12 +225,11 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('/registration-form-status', [ApplicationController::class, 'registrationFormStatus']);
 
             // Office (read-only) equivalents of the student-portal subjects /
-            // subject-papers lookups used by Part 6 "Subject & Paper Selection"
-            // — same controller methods, reachable from a portal:college token
-            // instead of portal:student, since that form is shared between both
-            // scopes and the student-only routes 403 for office staff.
             Route::get('/programs/{programId}/subjects', [ProgramController::class, 'subjects']);
             Route::get('/programs/{programId}/subject-papers', [ProgramController::class, 'subjectPapers']);
+
+            // GET  /applications/by-number/{application_no}  (read-only "View" page)
+            Route::get('/by-number/{application_no}', [ApplicationController::class, 'showByNumber']);
 
             // ── Wildcard — MUST be last inside this prefix group ─────────────────────
 
@@ -263,11 +254,19 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::post('/{id}/back-paper/pay/failed', [ApplicationController::class, 'backPaperPayFailed']);
             Route::get('/{id}/back-paper/print', [ApplicationController::class, 'printBackPaperForm']);
 
-            // PATCH /applications/{id}/status   (approve / reject / reopen)
-            Route::patch('/{id}/status', [ApplicationController::class, 'updateStatus']);
+            // POST /applications/{id}/approve — approval only, student_applications-only.
+            Route::post('/{id}/approve', [ApplicationController::class, 'approve']);
 
-            // PATCH /applications/{id}/release-hold
-            Route::patch('/{id}/release-hold', [ApplicationController::class, 'holdRelease']);
+            // POST /applications/{id}/reject-or-hold — shared Reject/Hold entry,
+            // writes the decision to rejected_applications.
+            Route::post('/{id}/reject-or-hold', [ApplicationController::class, 'rejectOrHold']);
+
+            // POST /applications/{id}/release-hold
+            Route::post('/{id}/release-hold', [ApplicationController::class, 'releaseHold']);
+
+            // GET /applications/{id}/hold-reject-slip — PDF, only once a
+            // hold/reject decision exists.
+            Route::get('/{id}/hold-reject-slip', [ApplicationController::class, 'holdRejectSlip']);
         });
 
         // Admissions
@@ -289,12 +288,16 @@ Route::middleware('auth:sanctum')->group(function () {
 
         // Fee Receipts
         Route::get('fee-receipts', [FeeReceiptController::class, 'index']);
+        // Literal-segment routes MUST be registered before the
+        // {feeReceipt} wildcard below — Laravel matches routes in
+        // registration order, so a wildcard placed first swallows
+        // "summary" as if it were an id and 404s (model not found)
+        // before the real summary route is ever reached.
+        Route::get('fee-receipts/summary', [FeeReceiptController::class, 'financialSummary']);
         Route::get('fee-receipts/{feeReceipt}', [FeeReceiptController::class, 'show']);
-        Route::post('fee-receipts/generate', [FeeReceiptController::class, 'generate']);
         Route::get('fee-receipts/{feeReceipt}/download', [FeeReceiptController::class, 'download']);
         Route::post('fee-receipts/{feeReceipt}/verify', [FeeReceiptController::class, 'verify']);
         Route::post('fee-receipts/{feeReceipt}/cancel', [FeeReceiptController::class, 'cancel']);
-        Route::get('fee-receipts/summary', [FeeReceiptController::class, 'financialSummary']);
 
 
         // Registration
@@ -323,6 +326,11 @@ Route::middleware('auth:sanctum')->group(function () {
             // Stats
             Route::get('stats', [RegistrationController::class, 'stats']);
             Route::get('self-registered', [StudentRegistrationController::class, 'adminIndex']);
+
+            // Office copies — any registration in the college (staff-gated
+            // by portal:college, not per-record ownership).
+            Route::get('{id}/slip', [StudentRegistrationController::class, 'registrationSlip']);
+            Route::get('{id}/receipt', [StudentRegistrationController::class, 'receipt']);
 
         });
 
@@ -539,6 +547,8 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::post('users', [SecurityController::class, 'createUser']);
             Route::patch('users/{id}/deactivate', [SecurityController::class, 'deactivateUser']);
             Route::post('users/{id}/reset-password', [SecurityController::class, 'resetPassword']);
+            Route::get('reset-password/users', [SecurityController::class, 'searchAllUsers']);
+            Route::post('reset-password', [SecurityController::class, 'resetAnyPassword']);
             Route::get('permissions', [SecurityController::class, 'permissions']);
             Route::get('users/{id}/permissions', [SecurityController::class, 'getUserPermissions']);
             Route::put('users/{id}/permissions', [SecurityController::class, 'updateUserPermissions']);
@@ -568,6 +578,12 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::post('enclosure', [MasterSettingsController::class, 'enclosureMasterStore']);
             Route::delete('enclosure/{id}', [MasterSettingsController::class, 'enclosureMasterDestroy']);
             Route::post('enclosure/bulk', [MasterSettingsController::class, 'enclosureMasterBulkStore']);
+
+            // GET /settings/admission/enclosure-types — fixed org-wide
+            // document-name list (see EnclosureTypeSeeder). Drives the
+            // Enclosure Master grid rows + the read-only Enclosure
+            // Constants panel below it.
+            Route::get('enclosure-types', [MasterSettingsController::class, 'enclosureTypesIndex']);
 
             // Fee Head
             Route::get('fee-heads', [MasterSettingsController::class, 'feeHeadIndex']);
@@ -711,10 +727,10 @@ Route::middleware('auth:sanctum')->group(function () {
             // POST /student/applications/{id}/submit
             Route::post('/{id}/submit', [ApplicationController::class, 'submit']);
 
+            // GET  /student/applications/{id}/print   (own copy — available once submitted, no fee-paid gate)
+            Route::get('/{id}/print', [ApplicationController::class, 'studentPrintApplicationForm'])->whereNumber('id');
+
             // Contact (mobile/email) change — OTP-gated; mobile/email are
-            // locked out of the generic /part/{part} save (LocksStudentIdentity),
-            // this is the only way a student can change either from the
-            // application form.
             Route::post('/{id}/contact/mobile/send-otp', [ApplicationController::class, 'sendContactMobileOtp']);
             Route::post('/{id}/contact/mobile/verify', [ApplicationController::class, 'verifyContactMobileOtp']);
             Route::post('/{id}/contact/email/send-otp', [ApplicationController::class, 'sendContactEmailOtp']);
@@ -722,6 +738,17 @@ Route::middleware('auth:sanctum')->group(function () {
 
             // POST /student/applications/{id}/documents
             Route::post('/{id}/documents', [ApplicationController::class, 'uploadStudentDocument']);
+
+            // DELETE /student/applications/{id}/documents/{document_type}
+            Route::delete('/{id}/documents/{document_type}', [ApplicationController::class, 'deleteStudentDocument']);
+
+            // GET /student/applications/{id}/documents/required — Enclosure
+            // Master-driven upload list, see buildRequiredDocuments().
+            Route::get('/{id}/documents/required', [ApplicationController::class, 'studentRequiredDocuments']);
+
+            // GET /student/applications/{id}/receipt — education-fee receipt
+            // PDF download, once paid.
+            Route::get('/{id}/receipt', [ApplicationController::class, 'studentReceiptDownload']);
 
             // Back paper — student self-service save / pay / print (ownership-checked)
             // Education fee (fresh / semester_upgrade / lateral) — student
@@ -752,11 +779,16 @@ Route::middleware('auth:sanctum')->group(function () {
 
         Route::get('registration/pending', [StudentRegistrationController::class, 'studentPending']);
         Route::post('registration/pay', [StudentRegistrationController::class, 'payPending']);
-    });
 
-    // (University portal removed — this is a college system, not a
-    // university system; 'university' was dropped from the users.portal
-    // enum by migration. This whole group was unreachable — its middleware
-    // could never match, and one of its two routes pointed at a
-    // StudentController::universityView() method that didn't exist.)
+        // The student's own copies — ownership-checked (same mobile/user_id
+        // rule as payPending() above), replacing the old fully-public
+        // student/register/slip|receipt/{id} routes.
+        Route::get('registration/slip/{id}', [StudentRegistrationController::class, 'studentRegistrationSlip']);
+        Route::get('registration/receipt/{id}', [StudentRegistrationController::class, 'studentReceipt']);
+
+        // Self-edit an unpaid registration draft — ownership-checked, same
+        // rule as the two routes above. Replaces the old public draft/{id}.
+        Route::get('registration/draft/{id}', [StudentRegistrationController::class, 'studentShowDraft']);
+        Route::put('registration/draft/{id}', [StudentRegistrationController::class, 'studentUpdateDraft']);
+    });
 });

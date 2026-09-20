@@ -57,13 +57,27 @@ class FinancialController extends Controller
 
         // Required fee — computed on the fly from fee_structures (admissions
         // has nowhere to store a per-admission required/fine amount).
-        $row->required_fee = (float) DB::table('fee_structures')
-            ->where('program_id', $row->program_id)
-            ->where('academic_year', $row->session)
-            ->whereIn('semester_no', array_unique([0, (int) $row->semester_no]))
-            ->where('admission_type', $row->admission_type)
-            ->where('is_active', true)
-            ->sum('amount');
+        // fee_structures is one row per CONFIGURATION (program, semester,
+        // year, admission type, ...) with amount_json holding every fee
+        // particular's full gender x category breakdown — so this must
+        // read amount_json filtered to the student's own gender+category,
+        // not a row-level column. Same 'other'->'transgender',
+        // 'general'->'gen' mapping used throughout
+        // (FeesController::feeGenderCategory(),
+        // ApplicationController::feeGenderCategory()).
+        $feeGender = strtolower((string) ($row->gender ?? 'male'));
+        $feeGender = $feeGender === 'other' ? 'transgender' : $feeGender;
+        $feeCategory = strtolower((string) ($row->category ?? 'general'));
+        $feeCategory = $feeCategory === 'general' ? 'gen' : $feeCategory;
+
+        $row->required_fee = \App\Models\FeeStructure::requiredFeeFor(
+            $row->program_id,
+            $row->session,
+            array_unique([0, (int) $row->semester_no]),
+            $row->admission_type,
+            $feeGender,
+            $feeCategory
+        );
 
         return $row;
     }

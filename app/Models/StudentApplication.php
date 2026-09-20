@@ -15,20 +15,15 @@ class StudentApplication extends Model
     protected $fillable = [
         'organization_id', 'student_id', 'program_id', 'academic_year',
         'application_no', 'application_type', 'semester_no',
-        'selected_subjects', 'selected_optional_subjects',
         'declaration_accepted', 'declaration_at',
-        'status', 'rejection_reason', 'remarks',
-        'reviewed_by', 'reviewed_at', 'approved_by', 'approved_at',
+        'status', 'approved_by', 'approved_at',
         'form_progress',
     ];
 
     protected $casts = [
-        'selected_subjects' => 'array',
-        'selected_optional_subjects' => 'array',
         'form_progress' => 'array',
         'declaration_accepted' => 'boolean',
         'declaration_at' => 'datetime',
-        'reviewed_at' => 'datetime',
         'approved_at' => 'datetime',
     ];
 
@@ -47,9 +42,9 @@ class StudentApplication extends Model
         return $this->belongsTo(Program::class);
     }
 
-    public function reviewedBy(): BelongsTo
+    public function rejectedApplications(): HasMany
     {
-        return $this->belongsTo(User::class, 'reviewed_by');
+        return $this->hasMany(RejectedApplication::class, 'student_application_id');
     }
 
     public function approvedBy(): BelongsTo

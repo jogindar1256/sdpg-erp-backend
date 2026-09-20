@@ -27,6 +27,24 @@ class FeesController extends Controller
         return $isVerified ? 'Verified' : 'Pending';
     }
 
+    /**
+     * Map a student's own gender/category onto fee_structures.amount_json's
+     * key spelling. Same intentional mismatches handled in
+     * ApplicationController::feeGenderCategory() — students.gender's
+     * 'other' -> 'transgender'; students.category's default 'general' ->
+     * 'gen'.
+     */
+    private function feeGenderCategory(?string $gender, ?string $category): array
+    {
+        $gender = strtolower((string) ($gender ?? 'male'));
+        $gender = $gender === 'other' ? 'transgender' : $gender;
+
+        $category = strtolower((string) ($category ?? 'general'));
+        $category = $category === 'general' ? 'gen' : $category;
+
+        return [$gender, $category];
+    }
+
     // ─── Shared: base receipt query ──────────────────────────────────────────────
     protected function baseReceiptQuery(Request $request)
     {
@@ -212,13 +230,16 @@ class FeesController extends Controller
 
         if (!$admission) return response()->json(['student' => null]);
 
-        $totalRequired = DB::table('fee_structures')
-            ->where('program_id', $admission->program_id)
-            ->where('academic_year', $admission->session)
-            ->whereIn('semester_no', array_unique([0, (int) $admission->semester_no]))
-            ->where('admission_type', $admission->admission_type)
-            ->where('is_active', true)
-            ->sum('amount');
+        [$feeGender, $feeCategory] = $this->feeGenderCategory($admission->gender, $admission->category);
+
+        $totalRequired = \App\Models\FeeStructure::requiredFeeFor(
+            $admission->program_id,
+            $admission->session,
+            array_unique([0, (int) $admission->semester_no]),
+            $admission->admission_type,
+            $feeGender,
+            $feeCategory
+        );
 
         $receipts = DB::table('fee_receipts as fr')
             ->where('fr.student_id', $admission->student_id)
@@ -264,16 +285,32 @@ class FeesController extends Controller
             ->where('adm.academic_year', $session)
             ->when($progId, fn ($q) => $q->where('adm.program_id', $progId));
 
-        $totalRequired = DB::table('admissions as adm')
-            ->join('fee_structures as fs', function ($j) {
-                $j->on('fs.program_id', '=', 'adm.program_id')
-                  ->on('fs.semester_no', '=', 'adm.semester_no')
-                  ->where('fs.is_active', true);
-            })
+        // fee_structures no longer has row-level gender/category to filter
+        // in SQL — every particular's full breakdown lives inside one
+        // configuration row's amount_json. So: pull every admission's own
+        // program/semester/admission-type/gender/category, bulk-fetch the
+        // matching amount_json blobs once (requiredFeeBlobMap), and sum each
+        // admission's own required fee in PHP.
+        $admissionsForFee = DB::table('admissions as adm')
+            ->join('students as s', 's.id', '=', 'adm.student_id')
             ->where('adm.academic_year', $session)
-            ->whereColumn('fs.academic_year', 'adm.academic_year')
             ->when($progId, fn ($q) => $q->where('adm.program_id', $progId))
-            ->sum('fs.amount');
+            ->select('adm.id', 'adm.program_id', 'adm.semester_no', 'adm.admission_type', 's.gender', 's.category')
+            ->get();
+
+        $feeBlobMap = \App\Models\FeeStructure::requiredFeeBlobMap($session, $progId ?: null);
+
+        $requiredFeeByAdmission = $admissionsForFee->mapWithKeys(function ($a) use ($feeBlobMap) {
+            [$g, $c] = $this->feeGenderCategory($a->gender, $a->category);
+            // Category is part of the blob-map key now (fee_structures is
+            // one row per course+category — see the amount_json migration
+            // header), gender picks the key inside each matched blob.
+            $key = $a->program_id . '|' . $a->semester_no . '|' . $a->admission_type . '|' . $c;
+            $blobs = $feeBlobMap[$key] ?? [];
+            return [$a->id => \App\Models\FeeStructure::sumFromGenderBlobs($blobs, $g)];
+        });
+
+        $totalRequired = $requiredFeeByAdmission->sum();
 
         $totalCollected = DB::table('fee_receipts as fr')
             ->join('admissions as adm', 'adm.id', '=', 'fr.admission_id')
@@ -315,53 +352,67 @@ class FeesController extends Controller
             ->orderByDesc('collected')
             ->get();
 
-        $byClass = DB::table('admissions as adm')
-            ->join('programs as p', 'p.id', '=', 'adm.program_id')
-            ->leftJoin('fee_structures as fs', function ($j) {
-                $j->on('fs.program_id', '=', 'adm.program_id')
-                  ->on('fs.semester_no', '=', 'adm.semester_no')
-                  ->whereColumn('fs.academic_year', 'adm.academic_year')
-                  ->where('fs.is_active', true);
-            })
-            ->leftJoin('fee_receipts as fr', function ($j) {
-                $j->on('fr.admission_id', '=', 'adm.id')->where('fr.is_verified', true);
-            })
+        // Same reasoning as $totalRequired above: no row-level gender/
+        // category to join on any more, so class/semester breakdowns are
+        // built from $admissionsForFee's already-computed per-admission
+        // required fee (PHP-side), joined with SQL-computed collected sums
+        // (fee_receipts isn't affected by the fee_structures redesign, so
+        // that half stays a plain SQL aggregate).
+        $collectedByProgram = DB::table('fee_receipts as fr')
+            ->join('admissions as adm', 'adm.id', '=', 'fr.admission_id')
             ->where('adm.academic_year', $session)
             ->when($progId, fn ($q) => $q->where('adm.program_id', $progId))
-            ->selectRaw("
-                p.short_name as class_name,
-                COALESCE(SUM(DISTINCT fs.amount),0) as required,
-                COALESCE(SUM(fr.net_amount),0) as collected
-            ")
-            ->groupBy('adm.program_id', 'p.short_name')
-            ->orderBy('p.short_name')
-            ->get()
-            ->map(function ($r) {
-                $r->outstanding = max(0, (float) $r->required - (float) $r->collected);
-                return $r;
-            });
+            ->where('fr.is_verified', true)
+            ->selectRaw('adm.program_id, SUM(fr.net_amount) as collected')
+            ->groupBy('adm.program_id')
+            ->pluck('collected', 'program_id');
 
-        $bySemester = DB::table('admissions as adm')
-            ->leftJoin('fee_structures as fs', function ($j) {
-                $j->on('fs.program_id', '=', 'adm.program_id')
-                  ->on('fs.semester_no', '=', 'adm.semester_no')
-                  ->whereColumn('fs.academic_year', 'adm.academic_year')
-                  ->where('fs.is_active', true);
-            })
-            ->leftJoin('fee_receipts as fr', function ($j) {
-                $j->on('fr.admission_id', '=', 'adm.id')->where('fr.is_verified', true);
-            })
+        $collectedBySemester = DB::table('fee_receipts as fr')
+            ->join('admissions as adm', 'adm.id', '=', 'fr.admission_id')
             ->where('adm.academic_year', $session)
             ->when($progId, fn ($q) => $q->where('adm.program_id', $progId))
-            ->selectRaw("
-                adm.semester_no,
-                COUNT(DISTINCT adm.id) as students,
-                COALESCE(SUM(DISTINCT fs.amount),0) as required,
-                COALESCE(SUM(fr.net_amount),0) as collected
-            ")
+            ->where('fr.is_verified', true)
+            ->selectRaw('adm.semester_no, SUM(fr.net_amount) as collected')
             ->groupBy('adm.semester_no')
-            ->orderBy('adm.semester_no')
-            ->get();
+            ->pluck('collected', 'semester_no');
+
+        $programNames = DB::table('programs')->pluck('short_name', 'id');
+
+        $requiredByProgram = [];
+        $requiredBySemester = [];
+        $studentsBySemester = [];
+        foreach ($admissionsForFee as $a) {
+            $fee = $requiredFeeByAdmission[$a->id] ?? 0;
+            $requiredByProgram[$a->program_id] = ($requiredByProgram[$a->program_id] ?? 0) + $fee;
+            $requiredBySemester[$a->semester_no] = ($requiredBySemester[$a->semester_no] ?? 0) + $fee;
+            $studentsBySemester[$a->semester_no] = ($studentsBySemester[$a->semester_no] ?? 0) + 1;
+        }
+
+        $byClass = collect($requiredByProgram)
+            ->map(function ($required, $programId) use ($programNames, $collectedByProgram) {
+                $collected = (float) ($collectedByProgram[$programId] ?? 0);
+                return (object) [
+                    'class_name'  => $programNames[$programId] ?? "Program #{$programId}",
+                    'required'    => (float) $required,
+                    'collected'   => $collected,
+                    'outstanding' => max(0, (float) $required - $collected),
+                ];
+            })
+            ->sortBy('class_name')
+            ->values();
+
+        $bySemester = collect($requiredBySemester)
+            ->map(function ($required, $semNo) use ($collectedBySemester, $studentsBySemester) {
+                $collected = (float) ($collectedBySemester[$semNo] ?? 0);
+                return (object) [
+                    'semester_no' => (int) $semNo,
+                    'students'    => $studentsBySemester[$semNo] ?? 0,
+                    'required'    => (float) $required,
+                    'collected'   => $collected,
+                ];
+            })
+            ->sortBy('semester_no')
+            ->values();
 
         $latestReg = $this->latestRegistrationSub();
         $recentReceipts = DB::table('fee_receipts as fr')

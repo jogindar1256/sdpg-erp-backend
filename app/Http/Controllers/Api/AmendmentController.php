@@ -69,8 +69,13 @@ class AmendmentController extends Controller
                 'a.admission_date',
                 'a.status as admission_status',
                 's.id as student_id',
-                's.first_name', 's.middle_name', 's.last_name',
-                'dr.name', 'dr.father_name', 'dr.mother_name', 'dr.dob',
+                's.first_name',
+                's.middle_name',
+                's.last_name',
+                'dr.name',
+                'dr.father_name',
+                'dr.mother_name',
+                'dr.dob',
                 's.mobile',
                 's.gender',
                 's.category',
@@ -148,8 +153,12 @@ class AmendmentController extends Controller
                 'a.semester_no',
                 'a.status as admission_status',
                 's.id as student_id',
-                's.first_name', 's.middle_name', 's.last_name',
-                'dr.name', 'dr.father_name', 'dr.mother_name',
+                's.first_name',
+                's.middle_name',
+                's.last_name',
+                'dr.name',
+                'dr.father_name',
+                'dr.mother_name',
                 's.mobile',
                 's.gender',
                 's.category',
@@ -173,8 +182,12 @@ class AmendmentController extends Controller
                 'a.semester_no',
                 'a.status',
                 's.id',
-                's.first_name', 's.middle_name', 's.last_name',
-                'dr.name', 'dr.father_name', 'dr.mother_name',
+                's.first_name',
+                's.middle_name',
+                's.last_name',
+                'dr.name',
+                'dr.father_name',
+                'dr.mother_name',
                 's.mobile',
                 's.gender',
                 's.category',
@@ -224,7 +237,7 @@ class AmendmentController extends Controller
         // Return full student profile + the registration snapshot (name/
         // father_name/mother_name/dob/caste_cert_* live there, not on students).
         $full = DB::table('students')->find($student->student_id);
-        $reg  = $full ? DB::table('direct_registrations')
+        $reg = $full ? DB::table('direct_registrations')
             ->where('user_id', $full->user_id)
             ->whereNull('deleted_at')
             ->orderByDesc('id')
@@ -236,17 +249,6 @@ class AmendmentController extends Controller
         ]));
     }
 
-    /**
-     * `students` and `direct_registrations` split the identity data across
-     * two tables (see findStudent()'s doc comment). The previous $allowed
-     * list here targeted a single flat set of columns that never matched
-     * either table — name/father_name/mother_name/dob/caste_cert_* belong
-     * on direct_registrations, several others (district/state/address) were
-     * just the wrong column names for students' real permanent_* columns,
-     * and a few (name_hindi, marital_status, spouse_name*, police_station,
-     * post, sub_district, blood_group) have no destination column anywhere
-     * in the current schema and are dropped rather than silently failing.
-     */
     public function modifyUpdate(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -257,26 +259,26 @@ class AmendmentController extends Controller
 
         // → students columns
         $studentFieldMap = [
-            'religion'            => 'religion',
-            'nationality'         => 'nationality',
-            'bank_name'           => 'bank_name',
-            'abc_id'              => 'abc_id',
-            'enrollment_no'       => 'enrollment_no',
-            'university_roll_no'  => 'university_roll_no',
-            'aadhar_no'           => 'aadhar_no',
-            'ddurn'               => 'ddurn',
-            'family_id'           => 'family_id',
-            'district'            => 'permanent_district',
-            'state'               => 'permanent_state',
-            'address'             => 'permanent_address',
+            'religion' => 'religion',
+            'nationality' => 'nationality',
+            'bank_name' => 'bank_name',
+            'abc_id' => 'abc_id',
+            'enrollment_no' => 'enrollment_no',
+            'university_roll_no' => 'university_roll_no',
+            'aadhar_no' => 'aadhar_no',
+            'ddurn' => 'ddurn',
+            'family_id' => 'family_id',
+            'district' => 'permanent_district',
+            'state' => 'permanent_state',
+            'address' => 'permanent_address',
         ];
         // → direct_registrations columns
         $regFieldMap = [
-            'name'            => 'name',
-            'father_name'     => 'father_name',
-            'mother_name'     => 'mother_name',
-            'dob'             => 'dob',
-            'caste_cert_no'   => 'caste_cert_no',
+            'name' => 'name',
+            'father_name' => 'father_name',
+            'mother_name' => 'mother_name',
+            'dob' => 'dob',
+            'caste_cert_no' => 'caste_cert_no',
             'caste_cert_date' => 'caste_cert_date',
         ];
 
@@ -286,11 +288,13 @@ class AmendmentController extends Controller
         $in = TextNormalizer::upper($req->all());
         $studentData = [];
         foreach ($studentFieldMap as $in_key => $col) {
-            if (array_key_exists($in_key, $in) && $in[$in_key] !== null) $studentData[$col] = $in[$in_key];
+            if (array_key_exists($in_key, $in) && $in[$in_key] !== null)
+                $studentData[$col] = $in[$in_key];
         }
         $regData = [];
         foreach ($regFieldMap as $in_key => $col) {
-            if (array_key_exists($in_key, $in) && $in[$in_key] !== null) $regData[$col] = $in[$in_key];
+            if (array_key_exists($in_key, $in) && $in[$in_key] !== null)
+                $regData[$col] = $in[$in_key];
         }
 
         if (empty($studentData) && empty($regData)) {
@@ -367,9 +371,13 @@ class AmendmentController extends Controller
             ->orderByDesc('id')
             ->first();
 
+        // Subject selection lives on part_6 only (decode/encode everywhere) —
+        // the old top-level selected_subjects column was always null for
+        // real student-submitted applications.
         $subjectIds = [];
-        if ($app && $app->selected_subjects) {
-            $raw = json_decode($app->selected_subjects, true) ?? [];
+        if ($app && $app->part_6) {
+            $part6 = is_string($app->part_6) ? (json_decode($app->part_6, true) ?? []) : $app->part_6;
+            $raw = $part6['selected_subjects'] ?? [];
             foreach ($raw as $item) {
                 $subjectIds[] = is_array($item) ? ($item['subject_id'] ?? $item['id'] ?? null) : $item;
             }
@@ -383,7 +391,7 @@ class AmendmentController extends Controller
         // Frontend reads subject_type/subject_name/paper_code/semester_no —
         // direct rename off the real `subjects` columns (type/name/code/
         // semester_no), no invented fields.
-        $shape = fn ($s) => [
+        $shape = fn($s) => [
             'subject_type' => $s->type,
             'subject_name' => $s->name,
             'paper_code' => $s->code,
@@ -412,10 +420,6 @@ class AmendmentController extends Controller
         return response()->json([
             'current_subjects' => $currentSubjects,
             'available_subjects' => $availableSubjects,
-            // No fee-diff logic exists anywhere in this codebase to derive
-            // this from (which fee columns apply on a subject swap, whether
-            // it's prorated, etc.) — that's a product decision, not a
-            // mismatch. Returning 0 rather than guessing.
             'fee_difference' => 0,
         ]);
     }
@@ -456,9 +460,6 @@ class AmendmentController extends Controller
             ->select('a.academic_year', 'p.short_name as class_name')
             ->first() : null;
 
-        // "Previous subject" per type comes from the same
-        // student_applications.selected_subjects source subjectChangeGet's
-        // form mode reads — the subjects on file before this request.
         $app = DB::table('student_applications')
             ->where('student_id', $log->student_id)
             ->whereNull('deleted_at')
@@ -466,8 +467,9 @@ class AmendmentController extends Controller
             ->first();
 
         $oldIds = [];
-        if ($app && $app->selected_subjects) {
-            $raw = json_decode($app->selected_subjects, true) ?? [];
+        if ($app && $app->part_6) {
+            $part6 = is_string($app->part_6) ? (json_decode($app->part_6, true) ?? []) : $app->part_6;
+            $raw = $part6['selected_subjects'] ?? [];
             foreach ($raw as $item) {
                 $oldIds[] = is_array($item) ? ($item['subject_id'] ?? $item['id'] ?? null) : $item;
             }
@@ -716,9 +718,14 @@ class AmendmentController extends Controller
             ->where('a.program_id', $req->program_id)
             ->where('a.semester_no', $req->semester_no)
             ->select(
-                'a.id as admission_id', 'a.roll_no', 'a.enrollment_no',
-                's.first_name', 's.middle_name', 's.last_name',
-                'dr.name', 'dr.father_name'
+                'a.id as admission_id',
+                'a.roll_no',
+                'a.enrollment_no',
+                's.first_name',
+                's.middle_name',
+                's.last_name',
+                'dr.name',
+                'dr.father_name'
             )
             ->orderBy('a.roll_no')
             ->get();
@@ -787,7 +794,9 @@ class AmendmentController extends Controller
                 'a.roll_no',
                 'a.account_no',
                 'a.semester_no',
-                's.first_name', 's.middle_name', 's.last_name',
+                's.first_name',
+                's.middle_name',
+                's.last_name',
                 'dr.name',
                 's.mobile',
                 'sa.application_no'
@@ -819,12 +828,6 @@ class AmendmentController extends Controller
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
-
-        // Build dynamic query based on selected fields. `students` has no
-        // name/father_name/mother_name/dob columns — those live on
-        // direct_registrations (dr); `applications` (ap.application_no) was
-        // dropped (never populated by anything) — student_applications (sa)
-        // is the real, live application table.
         $fieldMap = [
             'Registration No' => 'a.roll_no',
             'Application No' => 'sa.application_no',
@@ -873,17 +876,7 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function feeValueChangeGet(Request $req)
     {
-        // fee-value-change/page.tsx sends `student_id` (+ `value_type`), not
-        // `search`.
-        // NOTE: even after this param fix, the response below is still just
-        // a placeholder — it does not return `current_value`, `fee_impact`,
-        // or `available_values`, which is what the frontend actually reads
-        // (see VALUE_OPTIONS: Category / Scholarship Status / Income Group /
-        // Sub-Category / Fee Waiver in the page). None of those map to real
-        // columns anywhere in the schema I can see, and there's no fee-diff
-        // calculation logic in this codebase to draw on, so I'm not going to
-        // invent one — that's a product decision, not a mismatch fix. Flagged
-        // to Jogindar rather than guessed at.
+
         $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -951,7 +944,7 @@ class AmendmentController extends Controller
             ->where('admission_id', $student->admission_id)
             ->orderByDesc('id')
             ->get()
-            ->map(fn ($f) => [
+            ->map(fn($f) => [
                 'id' => $f->id,
                 'fee_type' => ucwords(str_replace('_', ' ', $f->receipt_type)),
                 'amount' => (float) $f->total_amount,
@@ -995,11 +988,6 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function blockUnblockGet(Request $req)
     {
-        // block-unblock/page.tsx doesn't actually call this GET at all right
-        // now — it reads student.is_blocked off the default /amendments/search
-        // response instead. Fixing the param (search -> student_id) and
-        // response shape anyway so this endpoint is correct if/when it's
-        // ever wired up, rather than leaving a second broken copy sitting here.
         $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -1015,11 +1003,6 @@ class AmendmentController extends Controller
 
     public function blockUnblockStore(Request $req)
     {
-        // block-unblock/page.tsx posts action as lowercase 'block'/'unblock'
-        // (block.mutate('block') / block.mutate('unblock')) — the validator
-        // required capitalized 'Block'/'Unblock', so every real submission
-        // from this page was rejected with a 422. This was a live bug, not
-        // just the GET's dead-code param mismatch.
         $v = Validator::make($req->all(), [
             'student_id' => 'required|exists:students,id',
             'action' => 'required|in:block,unblock',
@@ -1061,9 +1044,13 @@ class AmendmentController extends Controller
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->select(
                 'sr.*',
-                's.first_name', 's.middle_name', 's.last_name',
-                'dr.name', 'dr.father_name',
-                's.mobile', 'p.short_name as class'
+                's.first_name',
+                's.middle_name',
+                's.last_name',
+                'dr.name',
+                'dr.father_name',
+                's.mobile',
+                'p.short_name as class'
             )
             ->orderByDesc('sr.created_at')
             ->get();
@@ -1125,12 +1112,7 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function admissionCancelGet(Request $req)
     {
-        // print/admission-cancel/page.tsx always sends a `ref_no` key
-        // (possibly empty, alongside `student_id`) when looking up an
-        // *already cancelled* admission for the printable notice. The
-        // pre-cancel form (admission-cancel/page.tsx) only ever sends
-        // `student_id`. That key's presence is what distinguishes the two
-        // response shapes each caller actually expects.
+
         if ($req->has('ref_no')) {
             $printData = $this->admissionCancelPrintData($req);
             if (!$printData)
@@ -1259,13 +1241,6 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     // 14. HOLD OR CANCEL — BY COLLEGE
     // ══════════════════════════════════════════════════════════════
-    /**
-     * Rewired to student_applications — the `applications` table this used
-     * to query (as its FROM table, no less) has been dropped; it was never
-     * populated by anything so this always returned an empty page anyway.
-     * Status values match student_applications' real enum, same as
-     * holdCancelStore() below.
-     */
     public function holdCancelIndex(Request $req)
     {
         $latestReg = $this->regJoinSub();
@@ -1282,9 +1257,13 @@ class AmendmentController extends Controller
             }))
             ->select(
                 'ap.*',
-                's.first_name', 's.middle_name', 's.last_name',
-                'dr.name', 'dr.father_name',
-                's.mobile', 'p.short_name as class'
+                's.first_name',
+                's.middle_name',
+                's.last_name',
+                'dr.name',
+                'dr.father_name',
+                's.mobile',
+                'p.short_name as class'
             )
             ->orderByDesc('ap.updated_at');
 
@@ -1308,11 +1287,18 @@ class AmendmentController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
+        $app = DB::table('student_applications')->where('id', $req->application_id)->whereNull('deleted_at')->first();
+        if (!$app) return response()->json(['message' => 'Application not found.'], 404);
+
+        $newStatus = $req->action === 'Cancel' ? 'cancelled' : 'on_hold';
+
         DB::table('student_applications')->where('id', $req->application_id)
             ->update([
-                'status' => $req->action === 'Cancel' ? 'cancelled' : 'on_hold',
+                'status' => $newStatus,
                 'updated_at' => now(),
             ]);
+
+        app(ApplicationController::class)->blockRelatedRecords($app, $newStatus, null, $req->user()?->id);
 
         return response()->json(['message' => "Application {$req->action}ed."]);
     }
@@ -1331,8 +1317,11 @@ class AmendmentController extends Controller
             ->when($req->status, fn($q) => $q->where('al.status', $req->status))
             ->select(
                 'al.*',
-                's.first_name', 's.middle_name', 's.last_name',
-                'dr.name', 'dr.father_name',
+                's.first_name',
+                's.middle_name',
+                's.last_name',
+                'dr.name',
+                'dr.father_name',
                 's.mobile'
             )
             ->orderByDesc('al.created_at')

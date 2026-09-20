@@ -51,6 +51,13 @@ class SmsTemplateSeeder extends Seeder
             'application_rejected' => ['Application Form Rejected', '1207165768458090315',
                 'Your Application No {#var#} has been rejected due to {#var#} . Swami Devanand Post Graduate College'],
 
+            // No DLT template id — not registered on DLT yet, so this is
+            // email-only by design (NotificationService skips SMS whenever
+            // dlt_template_id is empty). Update this row via the sms
+            // templates admin once a DLT id exists, don't hardcode one here.
+            'application_hold' => ['Application On Hold', null,
+                'Your Application No {#var#} has been placed on hold due to {#var#}. Please contact the college office for more details. Swami Devanand Post Graduate College'],
+
             'admission_fee_pending' => ['Admission Fee Not Paid', '1207165907641012952',
                 'You have Final Submit Your admission application Form No {#var#} has been Approved for pay education fee by the college Admission Committee but you not pay fee till date. Your admission still pending. Swami Devanand Post Graduate College'],
 

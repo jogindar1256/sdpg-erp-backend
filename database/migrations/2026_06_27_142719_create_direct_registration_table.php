@@ -67,6 +67,7 @@ return new class extends Migration
             // Contact
             $table->string('email', 100);
             $table->string('mobile', 15);
+            $table->string('unique_code', 64)->nullable()->unique();
 
             // PG — Previous Education
             $table->string('ug_university', 150)->nullable();

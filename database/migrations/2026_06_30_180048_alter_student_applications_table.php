@@ -10,9 +10,6 @@ return new class extends Migration {
         // Stores uploaded document files linked to a student_application.
         // Used by uploadStudentDocument() via POST /student/applications/{id}/documents
         // (part_1..part_8 on student_applications itself now live directly
-        // in create_student_applications_table.php — this file used to also
-        // re-add those columns here, folded in as part of the migration
-        // cleanup since they were already added by an earlier migration.)
         Schema::create('student_application_documents', function (Blueprint $t) {
             $t->id();
             $t->unsignedBigInteger('application_id');

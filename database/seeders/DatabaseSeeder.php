@@ -24,6 +24,12 @@ class DatabaseSeeder extends Seeder
             'manage-exams', 'generate-certificates', 'manage-settings',
             'view-reports', 'manage-users', 'block-students',
             'verify-fee-receipts', 'cancel-admissions',
+            // Gates the "Highly Respected Objection" hold-release action on
+            // /college/applications/hold-reject-applications — Principal/
+            // Proctor only, never the staff who placed the hold. The
+            // "General Instruction Objection" release path reuses the
+            // existing verify-admissions permission instead of a new one.
+            'release-highly-respected-objection',
         ];
 
         foreach ($permissions as $perm) {
@@ -37,6 +43,10 @@ class DatabaseSeeder extends Seeder
             'accounts_staff'   => ['manage-fees', 'generate-receipts', 'verify-fee-receipts', 'view-reports'],
             'exam_staff'       => ['manage-exams', 'generate-certificates', 'view-reports'],
             'university_admin' => ['view-reports'],
+            // Neither existed before — added specifically for the Highly
+            // Respected Objection hold-release rule.
+            'principal'        => ['release-highly-respected-objection'],
+            'proctor'          => ['release-highly-respected-objection'],
             'student'          => [],
         ];
 
@@ -91,6 +101,24 @@ class DatabaseSeeder extends Seeder
             ]
         );
         $collegeAdmin->assignRole('college_admin');
+        // This is the same person whose designation is already 'Principal'
+        // above — give them the new principal role too rather than
+        // creating a second login for the same person.
+        $collegeAdmin->assignRole('principal');
+
+        $proctor = User::firstOrCreate(
+            ['email' => 'proctor@sdpgcollege.ac.in'],
+            [
+                'organization_id' => $org->id,
+                'name'            => 'College Proctor',
+                'mobile'          => '9977553311',
+                'password'        => Hash::make('Proctor@1234'),
+                'portal'          => 'college',
+                'designation'     => 'Proctor',
+                'is_active'       => true,
+            ]
+        );
+        $proctor->assignRole('proctor');
 
         $accountsStaff = User::firstOrCreate(
             ['email' => 'accounts@sdpgcollege.ac.in'],
@@ -163,6 +191,7 @@ class DatabaseSeeder extends Seeder
         $this->call([
             UniversitySeeder::class,
             PincodeSeeder::class,
+            EnclosureTypeSeeder::class,
         ]);
 
         $this->command->info('✅ Database seeded successfully!');

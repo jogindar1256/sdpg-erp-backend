@@ -5,8 +5,6 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Jobs\GenerateFeeReceiptPdf;
 use App\Models\FeeReceipt;
-use App\Models\FeeStructure;
-use App\Models\Student;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -40,99 +38,6 @@ class FeeReceiptController extends Controller
     {
         $feeReceipt->load(['student', 'admission.program', 'generatedBy', 'verifiedBy', 'organization']);
         return response()->json($feeReceipt);
-    }
-
-    /**
-     * Generate a fee receipt for a student
-     */
-    public function generate(Request $request): JsonResponse
-    {
-        $request->validate([
-            'student_id' => 'required|exists:students,id',
-            'admission_id' => 'required|exists:admissions,id',
-            'receipt_type' => 'required|in:regular_admission,back_paper,semester_upgrade,miscellaneous',
-            'academic_year' => 'required|string',
-            'semester_no' => 'required|integer',
-            'payment_mode' => 'required|in:cash,dd,online,neft,upi,cheque',
-            'transaction_id' => 'nullable|string',
-            'bank_name' => 'nullable|string',
-            'dd_no' => 'required_if:payment_mode,dd|string',
-            'dd_date' => 'required_if:payment_mode,dd|date',
-            'concession' => 'nullable|numeric|min:0',
-            'fee_head_ids' => 'required|array|min:1',
-            'fee_head_ids.*' => 'exists:fee_heads,id',
-        ]);
-
-        // Fetch fee structure for selected heads
-        $structures = FeeStructure::where('program_id', function ($q) use ($request) {
-            $q->select('program_id')->from('admissions')->where('id', $request->admission_id);
-        })
-            ->where('academic_year', $request->academic_year)
-            ->where('semester_no', $request->semester_no)
-            ->whereIn('fee_head_id', $request->fee_head_ids)
-            ->with('feeHead')
-            ->get();
-
-        // Calculate late fine (overdue check)
-        $lateFine = $structures->sum(function ($s) {
-            if ($s->due_date && now()->gt($s->due_date) && $s->late_fine_per_day > 0) {
-                $days = now()->diffInDays($s->due_date);
-                return $days * $s->late_fine_per_day;
-            }
-            return 0;
-        });
-
-        $totalAmount = $structures->sum('amount');
-        $concession = $request->concession ?? 0;
-        $netAmount = $totalAmount + $lateFine - $concession;
-
-        $feeBreakdown = $structures->map(fn($s) => [
-            'fee_head_id' => $s->fee_head_id,
-            'fee_head_name' => $s->feeHead->name,
-            'amount' => $s->amount,
-        ])->toArray();
-
-        // Self-finance flag comes from the admission's program (drives mode 201 vs 101).
-        $isSelfFinance = (bool) DB::table('admissions as a')
-            ->join('programs as p', 'p.id', '=', 'a.program_id')
-            ->where('a.id', $request->admission_id)
-            ->value('p.is_self_finance');
-
-        $receipt = DB::transaction(fn() => FeeReceipt::create([
-            'organization_id' => $request->user()->organization_id,
-            'student_id' => $request->student_id,
-            'admission_id' => $request->admission_id,
-            'academic_year' => $request->academic_year,
-            'semester_no' => $request->semester_no,
-            'receipt_type' => $request->receipt_type,
-            'receipt_no' => FeeReceipt::feeReceiptNo(
-                $request->academic_year,
-                $request->receipt_type,
-                $isSelfFinance
-            ),
-            'receipt_date' => now()->toDateString(),
-            'total_amount' => $totalAmount,
-            'late_fine' => $lateFine,
-            'concession' => $concession,
-            'net_amount' => $netAmount,
-            'payment_mode' => $request->payment_mode,
-            'transaction_id' => $request->transaction_id,
-            'bank_name' => $request->bank_name,
-            'dd_no' => $request->dd_no,
-            'dd_date' => $request->dd_date,
-            'fee_breakdown' => $feeBreakdown,
-            'generated_by' => $request->user()->id,
-            'status' => 'active',
-        ]));
-
-        // Generate PDF in background
-        GenerateFeeReceiptPdf::dispatch($receipt->id);
-
-        return response()->json([
-            'message' => 'Fee receipt generated successfully.',
-            'receipt' => $receipt->load(['student', 'organization']),
-            'receipt_no' => $receipt->receipt_no,
-        ], 201);
     }
 
     /**

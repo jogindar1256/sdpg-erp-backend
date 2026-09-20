@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\FeeHead;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class FeeHeadController extends Controller
 {
@@ -51,7 +52,27 @@ class FeeHeadController extends Controller
 
     public function destroy(FeeHead $feeHead): JsonResponse
     {
-        if ($feeHead->feeStructures()->count() > 0) {
+        // fee_head_id is no longer a fee_structures column — every fee
+        // particular now lives TWO levels deep inside a row's amount_json
+        // ({ "male": { "<fee_head_id>": amount, ... }, "female": {...} }),
+        // keyed by this fee head's id inside each gender's object. A plain
+        // top-level jsonb "?" key-exists check won't reach that depth, so
+        // this unnests every gender's sub-object via jsonb_each() and
+        // checks each one. json::jsonb cast is inline/on-the-fly (the
+        // column itself stays plain json) just so jsonb operators/functions
+        // are usable here.
+        // NOTE: the jsonb "?" (key-exists) operator must be escaped as "??"
+        // here — Laravel's query builder otherwise treats every bare "?" as
+        // a positional parameter placeholder, including the operator's own.
+        $inUse = DB::table('fee_structures')
+            ->where('organization_id', $feeHead->organization_id)
+            ->whereRaw(
+                'EXISTS (SELECT 1 FROM jsonb_each(amount_json::jsonb) AS g(gender, heads) WHERE g.heads ?? ?)',
+                [(string) $feeHead->id]
+            )
+            ->exists();
+
+        if ($inUse) {
             return response()->json(['message' => 'Cannot delete — fee head is used in fee structures.'], 422);
         }
         $feeHead->delete();

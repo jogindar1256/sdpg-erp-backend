@@ -182,6 +182,22 @@ class MasterSettingsController extends Controller
 
     // 3. Enclosure Master ─────────────────────────────────────────────
 
+    // GET /settings/admission/enclosure-types — the fixed, org-wide
+    // enclosure/document name list (seeded by EnclosureTypeSeeder). Drives
+    // both the Enclosure Master grid's rows and the read-only "Enclosure
+    // Constants" panel shown below it — same list, two views. UI-only for
+    // now (no add/edit/delete route exposed yet); that lands once specific
+    // management requirements are defined.
+    public function enclosureTypesIndex()
+    {
+        return response()->json(
+            DB::table('enclosure_types')
+                ->where('is_active', true)
+                ->orderBy('sort_order')
+                ->get(['id', 'name', 'key', 'sort_order'])
+        );
+    }
+
     public function enclosureMasterIndex(Request $req)
     {
         return response()->json(
@@ -200,30 +216,34 @@ class MasterSettingsController extends Controller
             'program_id' => 'required|exists:programs,id',
             'semester_no' => 'required|string',
             'admission_mode' => 'required|string',
-            'document_name' => 'required|string|max:255',
+            'enclosure_type_id' => 'required|exists:enclosure_types,id',
             'is_required' => 'required|boolean',
         ]);
         if ($v->fails()) {
             return response()->json(['errors' => $v->errors()], 422);
         }
 
+        $typeName = DB::table('enclosure_types')->where('id', $req->enclosure_type_id)->value('name');
+
         $keys = [
             'program_id' => $req->program_id,
             'semester_no' => $req->semester_no,
             'admission_mode' => $req->admission_mode,
-            'document_name' => trim($req->document_name),
+            'enclosure_type_id' => $req->enclosure_type_id,
         ];
 
-        // Idempotent: same document for the same class+semester+mode updates the
-        // existing row instead of inserting a duplicate.
+        // Idempotent: same enclosure type for the same class+semester+mode
+        // updates the existing row instead of inserting a duplicate.
+        // document_name is kept in sync as a denormalized display copy —
+        // enclosure_type_id (not the text) is the real identity now.
         DB::table('enclosure_masters')->updateOrInsert(
             $keys,
-            ['is_required' => $req->boolean('is_required'), 'updated_at' => now()]
+            ['document_name' => $typeName, 'is_required' => $req->boolean('is_required'), 'updated_at' => now()]
         );
 
         return response()->json(['message' => 'Document saved.'], 201);
     }
-    
+
     public function enclosureMasterDestroy($id)
     {
         DB::table('enclosure_masters')->where('id', $id)->delete();
@@ -237,7 +257,15 @@ class MasterSettingsController extends Controller
             'semester_no' => 'required|string',
             'admission_mode' => 'required|string',
             'rows' => 'required|array',
-            'rows.*.document_name' => 'required|string|max:255',
+            // Every real document row must carry an enclosure_type_id.
+            // "Attach Color Photographs" is the one exception — it's a
+            // fixed synthetic row (see enclosure/page.tsx's PHOTO_ROW_ID)
+            // that never went into enclosure_types, since Photo is handled
+            // as its own always-mandatory upload outside Master Settings.
+            // It's identified purely by document_name and always saved
+            // with enclosure_type_id = null.
+            'rows.*.enclosure_type_id' => 'nullable|exists:enclosure_types,id',
+            'rows.*.document_name' => 'nullable|string|max:255',
             'rows.*.condition' => 'nullable|string|max:20',
             'rows.*.enclose' => 'nullable|boolean',
             'rows.*.scan_copy' => 'nullable|boolean',
@@ -247,15 +275,35 @@ class MasterSettingsController extends Controller
             return response()->json(['errors' => $v->errors()], 422);
         }
 
+        $typeNames = DB::table('enclosure_types')->pluck('name', 'id');
+
         foreach ($req->rows as $row) {
+            $typeId = $row['enclosure_type_id'] ?? null;
+
+            if (!$typeId && ($row['document_name'] ?? null) !== 'Attach Color Photographs') {
+                // Not the photo row and no real type id — nothing to save
+                // against; skip rather than writing an orphaned row.
+                continue;
+            }
+
             DB::table('enclosure_masters')->updateOrInsert(
+                $typeId
+                    ? [
+                        'program_id' => $req->program_id,
+                        'semester_no' => $req->semester_no,
+                        'admission_mode' => $req->admission_mode,
+                        'enclosure_type_id' => $typeId,
+                    ]
+                    : [
+                        'program_id' => $req->program_id,
+                        'semester_no' => $req->semester_no,
+                        'admission_mode' => $req->admission_mode,
+                        'enclosure_type_id' => null,
+                        'document_name' => 'Attach Color Photographs',
+                    ],
                 [
-                    'program_id' => $req->program_id,
-                    'semester_no' => $req->semester_no,
-                    'admission_mode' => $req->admission_mode,
-                    'document_name' => trim($row['document_name']),
-                ],
-                [
+                    // Denormalized display copy — see enclosureMasterStore().
+                    'document_name' => $typeId ? ($typeNames[$typeId] ?? null) : 'Attach Color Photographs',
                     'condition' => $row['condition'] ?? null,
                     'enclose' => !empty($row['enclose']),
                     'scan_copy' => !empty($row['scan_copy']),
@@ -322,33 +370,84 @@ class MasterSettingsController extends Controller
         'Lateral' => 'lateral',
     ];
 
+    /** Categories a fee_structures row can exist under — one row per category, per configuration. */
+    private const FEE_CATEGORIES = ['gen', 'obc', 'sc', 'st', 'ews'];
+
+    /**
+     * One fee_structures row = one (program, semester, year, admission
+     * type, CATEGORY, sdpgc/ddu flags) — up to 5 rows per configuration
+     * (gen/obc/sc/st/ews). `amount_json` on each row holds every fee
+     * particular's amount for every GENDER within that category:
+     *   { "male": { "<fee_head_id>": 1850, ... }, "female": {...}, ... }
+     * The frontend still wants one "row" per fee particular for the grid
+     * (same wire shape as before), so this fetches all category-rows for
+     * the configuration and flattens them back into one entry per
+     * fee_head, with amounts keyed "{gender}_{category}" — plus a
+     * `category_refs` map, since fee_ref_id is now one per category (not
+     * one shared value for the whole configuration).
+     */
     public function feeStructureIndex(Request $req)
     {
         $admissionType = self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? $req->exam_mode;
 
-        return response()->json(
-            DB::table('fee_structures as fs')
-                ->join('programs as p', 'p.id', 'fs.program_id')
-                ->join('fee_heads as fh', 'fh.id', 'fs.fee_head_id')
-                ->select(
-                    'fs.id', 'fs.organization_id', 'fs.program_id', 'fs.fee_head_id', 'fs.semester_no',
-                    'fs.academic_year', 'fs.admission_type', 'fs.amount', 'fs.amounts', 'fs.term',
-                    'fs.sdpgc_student', 'fs.ddu_affiliated', 'fs.late_fine_per_day', 'fs.due_date',
-                    'fs.is_active', 'fs.created_at', 'fs.updated_at',
-                    'p.short_name as class',
-                    'fh.name as fee_head',
-                    'fh.in_favor_of as fee_head_default_favor',
-                    DB::raw('COALESCE(fs.in_favor_of, fh.in_favor_of) as in_favor_of')
-                )
-                ->when($req->program_id, fn($q) => $q->where('fs.program_id', $req->program_id))
-                ->when($req->session_year, fn($q) => $q->where('fs.academic_year', $req->session_year))
-                ->when($req->semester_no, fn($q) => $q->where('fs.semester_no', $req->semester_no))
-                ->when($admissionType, fn($q) => $q->where('fs.admission_type', $admissionType))
-                ->when($req->has('sdpgc_student'), fn($q) => $q->where('fs.sdpgc_student', $req->boolean('sdpgc_student')))
-                ->when($req->has('ddu_affiliated'), fn($q) => $q->where('fs.ddu_affiliated', $req->boolean('ddu_affiliated')))
-                ->orderBy('fh.name')
-                ->get()
-        );
+        $programClass = DB::table('programs')->where('id', $req->program_id)->value('short_name');
+
+        $rows = DB::table('fee_structures as fs')
+            ->select(
+                'fs.id', 'fs.fee_ref_id', 'fs.organization_id', 'fs.program_id', 'fs.semester_no',
+                'fs.academic_year', 'fs.admission_type', 'fs.category', 'fs.amount_json', 'fs.term',
+                'fs.sdpgc_student', 'fs.ddu_affiliated', 'fs.in_favor_of', 'fs.late_fine_per_day', 'fs.due_date',
+                'fs.is_active'
+            )
+            ->where('fs.program_id', $req->program_id)
+            ->where('fs.academic_year', $req->session_year)
+            ->where('fs.semester_no', $req->semester_no)
+            ->where('fs.admission_type', $admissionType)
+            ->when($req->has('sdpgc_student'), fn($q) => $q->where('fs.sdpgc_student', $req->boolean('sdpgc_student')))
+            ->when($req->has('ddu_affiliated'), fn($q) => $q->where('fs.ddu_affiliated', $req->boolean('ddu_affiliated')))
+            ->get();
+
+        if ($rows->isEmpty()) {
+            return response()->json(['rows' => [], 'category_refs' => (object) []]);
+        }
+
+        $feeHeadNames = DB::table('fee_heads')->pluck('name', 'id');
+        $first = $rows->first();
+
+        // fee_head_id -> "gender_category" -> amount, built by combining
+        // every category-row's gender-nested amount_json.
+        $flat = [];
+        $categoryRefs = [];
+        foreach ($rows as $row) {
+            $categoryRefs[$row->category] = $row->fee_ref_id;
+            $amountJson = $row->amount_json ? json_decode($row->amount_json, true) : [];
+            foreach ((array) $amountJson as $gender => $heads) {
+                foreach ((array) $heads as $feeHeadId => $amount) {
+                    $flat[$feeHeadId]["{$gender}_{$row->category}"] = (float) $amount;
+                }
+            }
+        }
+
+        $out = [];
+        foreach ($flat as $feeHeadId => $amounts) {
+            $out[] = [
+                'fee_head_id'    => (int) $feeHeadId,
+                'fee_head'       => $feeHeadNames[$feeHeadId] ?? "Fee Head #{$feeHeadId}",
+                'program_id'     => $first->program_id,
+                'class'          => $programClass,
+                'semester_no'    => $first->semester_no,
+                'academic_year'  => $first->academic_year,
+                'admission_type' => $first->admission_type,
+                'amounts'        => $amounts,
+                'term'           => $first->term,
+                'in_favor_of'    => $first->in_favor_of,
+                'sdpgc_student'  => $first->sdpgc_student,
+                'ddu_affiliated' => $first->ddu_affiliated,
+                'is_active'      => $first->is_active,
+            ];
+        }
+
+        return response()->json(['rows' => $out, 'category_refs' => $categoryRefs]);
     }
 
     public function feeStructureStore(Request $req)
@@ -373,66 +472,165 @@ class MasterSettingsController extends Controller
             return response()->json(['errors' => $v->errors()], 422);
 
         $orgId = DB::table('programs')->where('id', $req->program_id)->value('organization_id');
+        $program = DB::table('programs')->where('id', $req->program_id)->first();
 
-        DB::table('fee_structures')->updateOrInsert(
-            [
-                'program_id' => $req->program_id,
-                'fee_head_id' => $req->fee_head_id,
-                'academic_year' => $req->session_year,
-                'semester_no' => $req->semester_no,
-                'admission_type' => self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? 'regular',
-                'sdpgc_student' => $req->boolean('sdpgc_student'),
-                'ddu_affiliated' => $req->boolean('ddu_affiliated'),
-            ],
-            [
-                'organization_id' => $orgId,
-                'term' => $req->term,
-                'amounts' => json_encode($req->amounts),
-                'amount' => (float) array_sum($req->amounts), // legacy scalar column kept in sync, unused by this UI
-                'in_favor_of' => $req->in_favor_of,
-                'updated_at' => now(),
-            ]
-        );
-        return response()->json(['message' => 'Fee structure saved.']);
+        // Base identity shared by every category-row this request touches —
+        // category itself is added per-group below, since ONE row is per
+        // (program, session, semester, admission type, CATEGORY, sdpgc,
+        // ddu): a POST carrying several gender_category keys can touch
+        // several category-rows at once (one per distinct category present).
+        $baseKey = [
+            'program_id' => $req->program_id,
+            'academic_year' => $req->session_year,
+            'semester_no' => $req->semester_no,
+            'admission_type' => self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? 'regular',
+            'sdpgc_student' => $req->boolean('sdpgc_student'),
+            'ddu_affiliated' => $req->boolean('ddu_affiliated'),
+        ];
+
+        // Normalize the incoming amounts (e.g. "Male_Gen" -> gender=male,
+        // category=gen) and group by category — drop malformed keys rather
+        // than guessing.
+        $byCategory = [];
+        foreach ($req->amounts as $genderCatKey => $value) {
+            $parts = explode('_', (string) $genderCatKey, 2);
+            if (count($parts) !== 2) {
+                continue;
+            }
+            [$gender, $category] = $parts;
+            $gender = strtolower($gender);
+            $category = strtolower($category);
+            if (!in_array($category, self::FEE_CATEGORIES, true)) {
+                continue; // unknown category code — skip rather than create a stray row
+            }
+            $byCategory[$category][$gender] = (float) $value;
+        }
+
+        if (empty($byCategory)) {
+            return response()->json(['message' => 'No valid gender/category amounts were provided.'], 422);
+        }
+
+        $saved = 0;
+        foreach ($byCategory as $category => $genderValues) {
+            $rowKey = $baseKey + ['category' => $category];
+
+            $existing = DB::table('fee_structures')->where($rowKey)->first();
+            $amountJson = $existing && $existing->amount_json ? json_decode($existing->amount_json, true) : [];
+            $amountJson = is_array($amountJson) ? $amountJson : [];
+
+            // Merge this fee_head's amounts into the row's JSON — every
+            // OTHER fee head already saved for this category is left
+            // untouched, only this one particular's value per gender changes.
+            foreach ($genderValues as $gender => $value) {
+                $amountJson[$gender][(string) $req->fee_head_id] = $value;
+            }
+
+            DB::table('fee_structures')->updateOrInsert(
+                $rowKey,
+                [
+                    'organization_id' => $orgId,
+                    'term' => $req->term,
+                    'amount_json' => json_encode($amountJson),
+                    'in_favor_of' => $req->in_favor_of,
+                    'updated_at' => now(),
+                ]
+            );
+
+            // fee_ref_id: a real, DB-backed, unique fee reference — one per
+            // (course + category) row, generated once when the row first
+            // exists, left untouched on later edits. No gender component —
+            // see AdmissionNumberService::feeRefId() header for why.
+            $row = DB::table('fee_structures')->where($rowKey)->first();
+            if ($row && !$row->fee_ref_id) {
+                $feeRefId = app(\App\Services\AdmissionNumberService::class)
+                    ->feeRefId('fee_structures', 'fee_ref_id', $program, $category);
+                DB::table('fee_structures')->where('id', $row->id)->update(['fee_ref_id' => $feeRefId]);
+            }
+            $saved++;
+        }
+
+        return response()->json(['message' => "Fee structure saved ({$saved} category row" . ($saved === 1 ? '' : 's') . ")."]);
     }
 
+    // Copies exactly the configuration currently loaded on the fee-structure
+    // page (one program plus semester plus exam mode) from one academic
+    // year forward into a later one. Deliberately scoped tight, not "whole
+    // program, every semester and exam mode": the operator has one class,
+    // semester and exam-mode combo open on screen, and only that combo is
+    // meant to carry forward. All up-to-5 category rows (gen/obc/sc/st/ews)
+    // and any sdpgc/ddu variants under that one combo still come along
+    // together. Copy direction is enforced below: the target year must be
+    // later than the source, never the same year or an earlier one.
     public function feeStructureCopyYear(Request $req)
     {
         $v = Validator::make($req->all(), [
             'from_year' => 'required|string',
             'to_year' => 'required|string',
             'program_id' => 'required|exists:programs,id',
+            'semester_no' => 'required|integer',
+            'exam_mode' => 'required|in:Regular,Back Paper,Upgrade,Lateral',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
+        // Academic years are stored "YYYY-YYYY" — compare the leading year
+        // number so a copy can only move forward in time.
+        $fromStartYear = (int) substr($req->from_year, 0, 4);
+        $toStartYear = (int) substr($req->to_year, 0, 4);
+        if ($toStartYear <= $fromStartYear) {
+            return response()->json(['message' => 'Copy target must be a later academic year than the source year — pick the next year, not the same one or an earlier one.'], 422);
+        }
+
+        $admissionType = self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? $req->exam_mode;
+
         $rows = DB::table('fee_structures')
             ->where('academic_year', $req->from_year)
             ->where('program_id', $req->program_id)
+            ->where('semester_no', $req->semester_no)
+            ->where('admission_type', $admissionType)
             ->get();
 
+        if ($rows->isEmpty()) {
+            return response()->json(['message' => 'No fee structure found for that class, semester and exam mode in the source year.'], 422);
+        }
+
+        $program = DB::table('programs')->where('id', $req->program_id)->first();
+        $copied = 0;
+
         foreach ($rows as $r) {
+            $key = [
+                'program_id' => $r->program_id,
+                'academic_year' => $req->to_year,
+                'semester_no' => $r->semester_no,
+                'admission_type' => $r->admission_type,
+                'category' => $r->category,
+                'sdpgc_student' => $r->sdpgc_student,
+                'ddu_affiliated' => $r->ddu_affiliated,
+            ];
+
             DB::table('fee_structures')->updateOrInsert(
-                [
-                    'program_id' => $r->program_id,
-                    'fee_head_id' => $r->fee_head_id,
-                    'academic_year' => $req->to_year,
-                    'semester_no' => $r->semester_no,
-                    'admission_type' => $r->admission_type,
-                    'sdpgc_student' => $r->sdpgc_student,
-                    'ddu_affiliated' => $r->ddu_affiliated,
-                ],
+                $key,
                 [
                     'organization_id' => $r->organization_id,
                     'term' => $r->term,
-                    'amounts' => $r->amounts,
-                    'amount' => $r->amount,
+                    'amount_json' => $r->amount_json,
                     'in_favor_of' => $r->in_favor_of,
                     'updated_at' => now(),
                 ]
             );
+
+            // Fresh fee_ref_id for the new year's row — copying doesn't
+            // reuse last year's reference number.
+            $row = DB::table('fee_structures')->where($key)->first();
+            if ($row && !$row->fee_ref_id) {
+                $feeRefId = app(\App\Services\AdmissionNumberService::class)
+                    ->feeRefId('fee_structures', 'fee_ref_id', $program, $r->category);
+                DB::table('fee_structures')->where('id', $row->id)->update(['fee_ref_id' => $feeRefId]);
+            }
+            $copied++;
         }
-        return response()->json(['message' => "Copied {$req->from_year} → {$req->to_year}."]);
+
+        return response()->json(['message' => "Copied {$copied} fee structure(s), {$req->from_year} → {$req->to_year}."]);
     }
 
     public function registrationFeeCopyYear(Request $req)

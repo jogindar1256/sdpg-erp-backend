@@ -6,7 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Support\RegistrationInputGuard;
 use App\Support\TextNormalizer;
-use Barryvdh\DomPDF\Facade\Pdf;   // pure-PHP PDF (no wkhtmltopdf binary needed)
+use Barryvdh\DomPDF\Facade\Pdf;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -40,9 +40,6 @@ class StudentRegistrationController extends Controller
             'mobile'      => 'required|digits:10',
             'email'       => 'required|email|max:100',
             'aadhar_no'   => 'required|digits:12',
-            // Only the three gender categories the Government of India legally
-            // recognizes (NALSA v. Union of India, 2014; Transgender Persons
-            // (Protection of Rights) Act, 2019) — no free-text "Other" bypass.
             'gender'      => 'required|in:Male,Female,Transgender',
             'session'     => 'required|string|max:12',  // e.g. 2025-2026
             'ddurn_no'    => 'required|string|max:50',
@@ -54,14 +51,6 @@ class StudentRegistrationController extends Controller
             return response()->json(['errors' => $v->errors()], 422);
         }
 
-        // Server-side port of src/lib/registrationSecurity.tsx — the frontend
-        // already blocks junk names ("wordpress" instead of a real name),
-        // placeholder Aadhaar (checked against the Verhoeff checksum, not just
-        // digit count), placeholder mobile numbers, and junk ABC ID/Family
-        // ID/DDURN values, but that's only enforced in the browser. Anyone
-        // POSTing directly to this endpoint would skip all of it, so the same
-        // checks are re-run here as the authoritative gate before anything is
-        // written to direct_registrations.
         $guardErrors = [];
         foreach (['name', 'father_name', 'mother_name'] as $nameField) {
             if ($msg = RegistrationInputGuard::nameError((string) $req->input($nameField))) {
@@ -87,17 +76,6 @@ class StudentRegistrationController extends Controller
             return response()->json(['errors' => $guardErrors], 422);
         }
 
-        // Backstop: uppercase free text server-side too (frontend already
-        // does this live as the student types) — email/mobile/session etc.
-        // are left alone automatically by TextNormalizer's key exclusions.
-        // gender/category/religion/nationality/domestic_state/etc. come from
-        // a fixed <select> on the form, not free text — uppercasing those
-        // corrupts them ('Male' -> 'MALE', which then fails
-        // direct_registrations_gender_check outright; 'General' -> 'GENERAL'
-        // etc. silently break every <select> that later tries to redisplay
-        // the saved value, since none of its <option>s match anymore). Keep
-        // this list in sync with $selectDrivenFields in applyDraftUpdate()
-        // below, which has the same exclusion for the office-edit path.
         $req->merge(TextNormalizer::upper($req->all(), [
             'gender', 'category', 'admission_category', 'religion', 'nationality',
             'domestic_state', 'caste_cert_state', 'is_divyang', 'id_proof_type',
@@ -116,16 +94,20 @@ class StudentRegistrationController extends Controller
 
         $regType = strtoupper($req->reg_type);
 
-        // Same mobile / aadhar / abc_id CAN register for a different course
-        // (UG, PG, BEd are separate reg_type values — not a duplicate). But
-        // re-registering for the SAME session + course with any of those
-        // three identifiers is only allowed if the earlier registration was
-        // cancelled by the college — otherwise it's a duplicate entry.
+        // Deliberately NOT scoped with whereNull('deleted_at') — a row that's
+        // been deleted (soft or otherwise) outside the app must still count
+        // as an existing registration. Only an explicit status='cancelled'
+        // (via the college office's cancel action) may free up this
+        // mobile/aadhaar/abc_id slot for the same session_year + reg_type.
+        // This closes the exact loophole where deleting a row from the DB
+        // directly let the same mobile silently re-register.
+        // Note: DB::table() (unlike an Eloquent model) never auto-excludes
+        // soft-deleted rows — there's no global scope to bypass. Simply not
+        // filtering on deleted_at here is enough to include them.
         $dup = DB::table('direct_registrations')
             ->where('session_year', $req->session)
             ->where('reg_type', $regType)
             ->where('status', '!=', 'cancelled')
-            ->whereNull('deleted_at')
             ->where(function ($q) use ($req) {
                 $q->where('mobile', $req->mobile)
                   ->orWhere('aadhar_no', $req->aadhar_no)
@@ -143,14 +125,16 @@ class StudentRegistrationController extends Controller
         $org   = DB::table('organizations')->where('is_active', true)->first();
         $orgId = $org->id ?? null;
 
-        $regNo    = $this->generateRegNo($req->session, $req->program_id);
-        $password = strtoupper(Str::random(3)) . rand(100, 999) . Str::lower(Str::random(2));
+        $regNo      = $this->generateRegNo($req->session, $req->program_id);
+        $password   = strtoupper(Str::random(3)) . rand(100, 999) . Str::lower(Str::random(2));
+        $uniqueCode = $this->generateUniqueCode($regType, $req->program_id, $req->session);
 
         try {
             $id = DB::table('direct_registrations')->insertGetId([
                 'organization_id'     => $orgId,
                 'program_id'          => $req->program_id,
                 'registration_no'     => $regNo,
+                'unique_code'         => $uniqueCode,
                 'reg_type'            => $regType,
                 'session_year'        => $req->session,
                 'reg_date'            => now()->toDateString(),
@@ -247,10 +231,6 @@ class StudentRegistrationController extends Controller
     {
         $req->validate(['mobile' => 'required|digits:10']);
 
-        // Reject placeholder/junk numbers (0000000000, 1234567890, etc.)
-        // server-side too — the frontend's mobileError() already blocks these
-        // in the browser, but this endpoint is hit directly by fetch/axios
-        // and would otherwise burn real SMS credits on fake numbers.
         if ($msg = RegistrationInputGuard::mobileError((string) $req->mobile)) {
             return response()->json(['message' => $msg, 'errors' => ['mobile' => [$msg]]], 422);
         }
@@ -261,12 +241,6 @@ class StudentRegistrationController extends Controller
         $sent = app(\App\Services\SmsService::class)->sendOtp($req->mobile, $otp, null);
         if (!$sent) {
             Log::info("PRE PHONE OTP for {$req->mobile}: {$otp}");
-            // Previously this fell through to a 200 "OTP sent" response even
-            // when the SMS gateway call failed — the applicant would wait for
-            // a code that never arrives, with the request logged as a
-            // success. Outside local/debug, a failed send must fail loudly so
-            // the frontend can tell the applicant to retry instead of lying
-            // to them. In debug, keep going so the OTP is still returned below.
             if (!config('app.debug')) {
                 return response()->json([
                     'message' => 'Could not send the OTP to your mobile right now. Please try again in a moment.',
@@ -372,21 +346,6 @@ class StudentRegistrationController extends Controller
             'ug_university', 'ug_institute', 'ug_session', 'ug_roll_no',
             'stream', 'entrance_session', 'entrance_roll_no', 'state_rank', 'category_rank', 'cut_off',
         ];
-        // These columns are all populated from a fixed-vocabulary <select> on
-        // every registration form (UG/PG/BED), not free text — their stored
-        // value must exactly match the option list the forms render
-        // (Title Case: 'Male', 'General', 'Sikh', 'Uttar Pradesh', 'Indian',
-        // 'Aadhar Card', ...). initiate() writes them verbatim from the
-        // select's value and never uppercases them. Blanket-uppercasing them
-        // here (as this loop used to do for every field) silently corrupts
-        // them to 'MALE' / 'GENERAL' / 'SIKH' / etc: gender then fails the
-        // direct_registrations_gender_check DB constraint outright, and the
-        // rest just go uppercase and stop matching any <option> on reload —
-        // so the edit form renders them blank ("-- Select --") and any
-        // logic that string-compares against the option list (e.g. the
-        // caste-certificate-required check, or nationality's "Other" custom
-        // -text branch) misfires. They're excluded from the normalization
-        // pass below and written through exactly as submitted.
         $selectDrivenFields = [
             'gender', 'category', 'admission_category', 'religion', 'nationality',
             'domestic_state', 'caste_cert_state', 'is_divyang', 'id_proof_type',
@@ -403,13 +362,6 @@ class StudentRegistrationController extends Controller
 
         DB::table('direct_registrations')->where('id', $id)->update($update);
 
-        // receipt() serves a cached PDF from `pdf_path` instead of rendering
-        // fresh every time (see receipt()/generateReceiptPdf() below) — once
-        // a receipt has been generated, editing name/father_name/etc. here
-        // silently has no visible effect because the old file is still what
-        // gets served. Clear the cache so the next receipt view regenerates
-        // it with the corrected details. (registrationSlip() is unaffected —
-        // it already renders live from the DB on every request.)
         $reg = DB::table('direct_registrations')->where('id', $id)->first();
         if ($reg && $reg->pdf_path) {
             if (Storage::exists($reg->pdf_path)) {
@@ -750,6 +702,57 @@ class StudentRegistrationController extends Controller
         return $this->initiatePayment($req);
     }
 
+    /**
+     * The logged-in student's own registration receipt / slip. Same
+     * ownership rule as payPending() above (user_id match, or mobile match
+     * for a registration made before the account existed) — replaces the
+     * old student/register/receipt|slip/{id} routes, which had none.
+     */
+    public function studentReceipt(Request $req, int $id)
+    {
+        $reg = $this->findReg($id);
+        if (!$reg) return response()->json(['message' => 'Registration not found.'], 404);
+        $user = $req->user();
+        if ($reg->user_id && (int) $reg->user_id !== (int) $user->id && $reg->mobile !== $user->mobile) {
+            return response()->json(['message' => 'This registration does not belong to you.'], 403);
+        }
+        return $this->receipt($id);
+    }
+
+    public function studentRegistrationSlip(Request $req, int $id)
+    {
+        $reg = $this->findReg($id);
+        if (!$reg) return response()->json(['message' => 'Registration not found.'], 404);
+        $user = $req->user();
+        if ($reg->user_id && (int) $reg->user_id !== (int) $user->id && $reg->mobile !== $user->mobile) {
+            return response()->json(['message' => 'This registration does not belong to you.'], 403);
+        }
+        return $this->registrationSlip($id);
+    }
+
+    /** Same ownership rule — the student's own self-edit-while-unpaid draft. */
+    public function studentShowDraft(Request $req, int $id): JsonResponse
+    {
+        $reg = $this->findReg($id);
+        if (!$reg) return response()->json(['message' => 'Registration not found.'], 404);
+        $user = $req->user();
+        if ($reg->user_id && (int) $reg->user_id !== (int) $user->id && $reg->mobile !== $user->mobile) {
+            return response()->json(['message' => 'This registration does not belong to you.'], 403);
+        }
+        return $this->showDraft($req, $id);
+    }
+
+    public function studentUpdateDraft(Request $req, int $id): JsonResponse
+    {
+        $reg = $this->findReg($id);
+        if (!$reg) return response()->json(['message' => 'Registration not found.'], 404);
+        $user = $req->user();
+        if ($reg->user_id && (int) $reg->user_id !== (int) $user->id && $reg->mobile !== $user->mobile) {
+            return response()->json(['message' => 'This registration does not belong to you.'], 403);
+        }
+        return $this->updateDraft($req, $id);
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // 8a. LOGIN LOOKUP — resolve name + father name from a registration no.
     //     Public (pre-login). Returns a masked mobile hint, never the full no.
@@ -920,11 +923,7 @@ class StudentRegistrationController extends Controller
 
     // ──────────────────────────────────────────────────────────────────────
     // 8d. COUNSELLING LOOKUP — for programs whose admission_conditions row is
-    //     "Through Counselling". Unlike fetchOldRecord() above (which looks
-    //     for a RETURNING DDU student), this checks the entrance-counselling
-    //     import for a first-time applicant's allotment, scoped to the exact
-    //     program + session so a roll number from a different year/course
-    //     can't match. Public (pre-registration, no student row exists yet).
+    //     "Through Counselling". Unlike fetchOldRecord()
     //     GET /student/register/counselling-lookup?program_id=&session_year=&entrance_roll_no=
     // ──────────────────────────────────────────────────────────────────────
     public function counsellingLookup(Request $req): JsonResponse
@@ -948,10 +947,6 @@ class StudentRegistrationController extends Controller
             ]);
         }
 
-        // gender/social_category are already stored Title-Case ('Male',
-        // 'General', etc.) matching the registration form's own option
-        // values exactly — no remapping needed, unlike fetchOldRecord()'s
-        // students-table source which stores them lowercase.
         return response()->json([
             'found'  => true,
             'source' => 'counselling_reports',
@@ -996,9 +991,7 @@ class StudentRegistrationController extends Controller
     // ──────────────────────────────────────────────────────────────────────
     // 10. COLLEGE — cancel a registration.
     //     This is the ONLY way the same mobile/aadhar/abc_id can register
-    //     again for the same session + course — the duplicate check in
-    //     initiate() blocks re-registration unless the prior one is
-    //     cancelled here first.
+    //     again for the same session + course
     // ──────────────────────────────────────────────────────────────────────
     public function cancelRegistration(Request $req, int $id): JsonResponse
     {
@@ -1043,8 +1036,6 @@ class StudentRegistrationController extends Controller
                     'name'            => $reg->name,
                     'mobile'          => $reg->mobile,
                     'email'           => $reg->email,
-                    // User model casts 'password' => 'hashed', so pass PLAIN here
-                    // (passing a pre-hashed value would double-hash and break login).
                     'password'        => $plain,
                     'portal'          => 'student',
                     'is_active'       => true,
@@ -1052,18 +1043,6 @@ class StudentRegistrationController extends Controller
                 try { $user->assignRole('student'); } catch (\Throwable $e) { Log::warning('assignRole(student) failed: ' . $e->getMessage()); }
             }
 
-            // Best-effort student profile on successful payment (keeps the portal usable).
-            //
-            // One person can hold several direct_registrations rows (UG, PG,
-            // BEd are separate reg_type values — allowed by design) that all
-            // share this same $user (looked up by mobile above). Without a
-            // dedup check here, each registration's first paid pass would
-            // blindly insert its OWN new students row for the same physical
-            // person — fragmenting their identity across multiple `students`
-            // records (separate confirmation status, documents, fee history,
-            // etc. per program instead of one person with many applications).
-            // Reuse an existing students row for this user if one already
-            // exists from an earlier registration.
             $studentId = $reg->student_id;
             if ($paid && !$studentId) {
                 $existing = DB::table('students')
@@ -1232,10 +1211,6 @@ class StudentRegistrationController extends Controller
         $program = $reg->program_id ? DB::table('programs')->find($reg->program_id) : null;
         $org     = $reg->organization_id ? DB::table('organizations')->find($reg->organization_id) : null;
 
-        // Major AND Minor subjects both come from the subjects master — Minor
-        // Subject used to be picked from the vocational/co-curricular paper
-        // master, but per DDU University rules that was wrong; a minor must
-        // be any subject offered by the same course, same as the majors.
         $subjIds = array_filter([
             $reg->major_subject_1 ?? null, $reg->major_subject_2 ?? null,
             $reg->major_subject_3 ?? null, $reg->minor_subject_1 ?? null,
@@ -1243,10 +1218,6 @@ class StudentRegistrationController extends Controller
         ]);
         $names = $subjIds ? DB::table('subjects')->whereIn('id', $subjIds)->pluck('name', 'id')->all() : [];
 
-        // Minor subject: look it up in subjects first (current rows). Rows
-        // saved before this fix stored a vocational_papers id instead — fall
-        // back to that table only if the subjects lookup comes up empty, so
-        // old registrations still print correctly.
         $minor = null;
         if (!empty($reg->minor_subject_1)) {
             $minor = $names[$reg->minor_subject_1] ?? null;
@@ -1316,13 +1287,10 @@ class StudentRegistrationController extends Controller
     /**
      * Registration fee comes from Master Settings (`registration_fees`,
      * keyed by program_id + session_year + semester_no + registration_mode,
-     * with amounts stored as a JSON map keyed "{gender}_{category}", e.g.
-     * "male_gen" — must match the exact key format the settings UI writes:
-     * `${gender.toLowerCase()}_${category.toLowerCase()}`).
-     *
+     * with amounts stored as a JSON map keyed "{gender}_{category}",
+     * 
      * Falls back to the static self::FEES table by level (UG/PG/BED) when
-     * no Master Settings row exists for that program/session yet, so
-     * registration never hard-fails just because MS hasn't been configured.
+     * no Master Settings row exists registration never hard-fails just because MS hasn't been configured.
      */
     private function resolveRegistrationFee(?int $programId, string $session, ?string $gender, ?string $category, string $regType): int
     {
@@ -1355,21 +1323,11 @@ class StudentRegistrationController extends Controller
         return self::FEES[$regType] ?? 0;
     }
 
-    /**
-     * Public metadata for the registration landing page: current registration
-     * fee (Master-Settings-driven, falls back to static table), the session
-     * year to display (latest configured in MS for this program, else the
-     * current academic-year fallback), and the admission conditions/
-     * eligibility text for the chosen program, if configured.
-     */
     public function registrationMeta(Request $req): JsonResponse
     {
         $regType   = strtoupper((string) $req->reg_type);
         $programId = $req->program_id ? (int) $req->program_id : null;
 
-        // Session: prefer the most recent session_year configured in Master
-        // Settings for this program (registration_fees or admission_conditions);
-        // otherwise fall back to the current academic year (Apr–Mar cycle).
         $session = null;
         if ($programId) {
             $session = DB::table('registration_fees')
@@ -1413,7 +1371,54 @@ class StudentRegistrationController extends Controller
         return $ys . $ye . $progCode . str_pad((string) $seq, 4, '0', STR_PAD_LEFT);
     }
 
-    private function sessionYears(string $session): array
+    /**
+     * ~37-char code identifying one registration, "-"-delimited:
+     *   timestamp-classType-courseCode-sessionCode-mode-randomDigits
+     *   e.g. 20260909055159-UG-BA-2627-REGULAR-782555
+     * "-" rather than "&" on purpose — this travels as a URL query value
+     * (?code=...) and, later, potentially in printed slips/SMS/email too;
+     * "-" needs no escaping anywhere it ends up, "&" would need to survive
+     * being percent-encoded/decoded correctly at every single hop forever.
+     * Stored on direct_registrations.unique_code and required (as &code=) to
+     * open that registration's application form — see ApplicationController.
+     */
+    // public+static so the one-off backfill command (registrations:backfill-codes,
+    // for pre-existing rows created before this column existed) can reuse the
+    // exact same format instead of a second, driftable copy of this logic.
+    public static function generateUniqueCode(string $regType, $programId, string $session): string
+    {
+        $timestamp = now()->format('YmdHis'); // 14 digits, sortable and unique per second
+
+        $courseCode = 'GEN';
+        if ($programId) {
+            $program = DB::table('programs')->where('id', $programId)->first();
+            if ($program && !empty($program->code)) {
+                $courseCode = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', $program->code));
+            }
+        }
+
+        [$ys, $ye]   = self::sessionYears($session); // e.g. "25", "26"
+        $sessionCode = $ys . $ye;                       // "2526"
+
+        $mode   = 'REGULAR'; // only mode supported today — extend here if more modes are added later
+        $random = (string) random_int(100000, 999999); // 6-digit random tail
+
+        $segments = [$timestamp, strtoupper($regType), $courseCode, $sessionCode, $mode, $random];
+        $code     = implode('-', $segments);
+
+        // Astronomically unlikely to collide (timestamp + random already make
+        // it unique), but direct_registrations.unique_code has a DB unique
+        // constraint — guard against a same-second retry anyway.
+        while (DB::table('direct_registrations')->where('unique_code', $code)->exists()) {
+            $random     = (string) random_int(100000, 999999);
+            $segments[5] = $random;
+            $code        = implode('-', $segments);
+        }
+
+        return $code;
+    }
+
+    private static function sessionYears(string $session): array
     {
         $parts = explode('-', $session);
         return [

@@ -372,6 +372,29 @@ class AuthController extends Controller
     }
 
     /**
+     * POST /auth/verify-password
+     * Re-auth gate used by the "Modify" password-confirmation popup on
+     * /college/registration/status and /college/applications — confirms the
+     * CURRENTLY LOGGED-IN user's own password before letting them into an
+     * edit page. Not a login: no new token is issued, nothing is revoked,
+     * it only tells the frontend whether to unlock the modify page it's
+     * already about to navigate to. Works for any authenticated portal
+     * (college/student) since it only ever checks the caller's own hash.
+     */
+    public function verifyPassword(Request $request): JsonResponse
+    {
+        $request->validate(['password' => 'required|string']);
+
+        if (!Hash::check($request->password, $request->user()->password)) {
+            throw ValidationException::withMessages([
+                'password' => ['Incorrect password.'],
+            ]);
+        }
+
+        return response()->json(['verified' => true]);
+    }
+
+    /**
      * Logout — revoke current Sanctum token.
      */
     public function logout(Request $request): JsonResponse

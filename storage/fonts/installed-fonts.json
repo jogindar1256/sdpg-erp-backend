@@ -1,0 +1,8 @@
+{
+    "noto sans devanagari": {
+        "normal": "C:\\Users\\asus\\Documents\\Coding Playground\\sdpg-erp-backend\\storage\\fonts\/noto_sans_devanagari_normal_48b13220159370d5d6fc7fa6f5370b88",
+        "bold": "C:\\Users\\asus\\Documents\\Coding Playground\\sdpg-erp-backend\\storage\\fonts\/noto_sans_devanagari_bold_78d216857bebdaabb5ac84cac9f66178",
+        "italic": "C:\\Users\\asus\\Documents\\Coding Playground\\sdpg-erp-backend\\storage\\fonts\/noto_sans_devanagari_italic_48b13220159370d5d6fc7fa6f5370b88",
+        "bold_italic": "noto_sans_devanagari_bold_italic_78d216857bebdaabb5ac84cac9f66178"
+    }
+}

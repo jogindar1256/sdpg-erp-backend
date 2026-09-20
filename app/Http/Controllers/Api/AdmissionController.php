@@ -198,7 +198,7 @@ class AdmissionController extends Controller
     {
         $orgId = $request->user()->organization_id;
 
-        $query = \App\Models\FeeStructure::with(['program', 'feeHead'])
+        $query = \App\Models\FeeStructure::with('program')
             ->where('organization_id', $orgId);
 
         if ($request->filled('program_id'))    $query->where('program_id', $request->program_id);
@@ -207,18 +207,53 @@ class AdmissionController extends Controller
 
         $structures = $query->orderBy('program_id')->orderBy('semester_no')->get();
 
-        // Group by program → semester
-        $grouped = $structures->groupBy('program_id')->map(function ($items) {
+        // Each fee_structures row is one (course + category) — up to 5 rows
+        // per program/semester/session/admission-type (gen/obc/sc/st/ews) —
+        // with amount_json holding every fee particular's amount for every
+        // GENDER within that category. See the 2026_09_16 migration header.
+        // So each combo shown here is (this row's category, one gender key
+        // from its amount_json), never collapsed across categories or
+        // genders, since that would reintroduce exactly the ambiguity
+        // amount_json was written to remove.
+        $feeHeadNames = DB::table('fee_heads')->pluck('name', 'id');
+
+        $grouped = $structures->groupBy('program_id')->map(function ($items) use ($feeHeadNames) {
             return [
                 'program'   => $items->first()->program,
-                'semesters' => $items->groupBy('semester_no')->map(fn($s) => [
-                    'total'  => $s->sum('amount'),
-                    'heads'  => $s->map(fn($h) => [
-                        'fee_head' => $h->feeHead->name,
-                        'amount'   => $h->amount,
-                        'type'     => $h->admission_type,
-                    ]),
-                ]),
+                'semesters' => $items->groupBy('semester_no')->map(function ($configRows) use ($feeHeadNames) {
+                    // Multiple rows can share a semester_no — up to 5
+                    // (one per category) times however many distinct
+                    // admission_type/sdpgc_student/ddu_affiliated variants
+                    // exist — each contributes its own combos.
+                    $combos = [];
+                    foreach ($configRows as $row) {
+                        $amountJson = (array) ($row->amount_json ?? []);
+                        foreach ($amountJson as $gender => $heads) {
+                            $headsOut = [];
+                            $total = 0.0;
+                            foreach ((array) $heads as $feeHeadId => $amount) {
+                                if ((float) $amount <= 0) continue;
+                                $headsOut[] = [
+                                    'fee_head' => $feeHeadNames[$feeHeadId] ?? "Fee Head #{$feeHeadId}",
+                                    'amount'   => (float) $amount,
+                                    'type'     => $row->admission_type,
+                                ];
+                                $total += (float) $amount;
+                            }
+                            if (empty($headsOut)) {
+                                continue;
+                            }
+                            $combos[] = [
+                                'gender'     => $gender,
+                                'category'   => $row->category,
+                                'total'      => $total,
+                                'fee_ref_id' => $row->fee_ref_id,
+                                'heads'      => $headsOut,
+                            ];
+                        }
+                    }
+                    return $combos;
+                }),
             ];
         })->values();
 
@@ -294,14 +329,23 @@ class AdmissionController extends Controller
             ->when($year, fn($q) => $q->where('academic_year', $year))
             ->get();
 
-        // Count subjects selected across all applications
+        // Count subjects selected across all applications. Subject selection
+        // lives on part_6 only (decode/encode everywhere) — the old
+        // selected_subjects/selected_optional_subjects columns were always
+        // null for real student-submitted applications. part_6 is not an
+        // Eloquent array-cast attribute, so decode it manually here.
         $subjectCounts = [];
         foreach ($apps as $app) {
+            $part6 = $app->part_6 ?? null;
+            $part6 = is_string($part6) ? (json_decode($part6, true) ?? []) : ($part6 ?? []);
             $subjects = array_merge(
-                $app->selected_subjects ?? [],
-                $app->selected_optional_subjects ?? []
+                $part6['selected_subjects'] ?? [],
+                $part6['selected_optional_subjects'] ?? []
             );
             foreach ($subjects as $subId) {
+                if (!is_numeric($subId)) {
+                    continue;
+                }
                 $subjectCounts[$subId] = ($subjectCounts[$subId] ?? 0) + 1;
             }
         }
