@@ -122,7 +122,7 @@ class AdmissionController extends Controller
     public function upgrade(Request $request, Admission $admission): JsonResponse
     {
         $request->validate([
-            'new_semester_no'  => 'required|integer|min:1|max:12',
+            'new_semester_no'  => 'required|integer|exists:semester_masters,semester_num',
             'new_academic_year'=> 'required|string',
         ]);
 

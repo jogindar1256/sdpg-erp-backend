@@ -616,10 +616,10 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::put('classes/{id}', [MasterSettingsController::class, 'classMasterUpdate']);
             Route::delete('classes/{id}', [MasterSettingsController::class, 'classMasterDestroy']);
 
+            // Read-only: seeded reference data (semesters 1..10 + ODD/EVEN).
+            // Single source of truth for every semester dropdown in the app.
+            // Write routes removed — change SemesterSeeder and reseed instead.
             Route::get('semesters', [MasterSettingsController::class, 'semesterMasterIndex']);
-            Route::post('semesters', [MasterSettingsController::class, 'semesterMasterStore']);
-            Route::put('semesters/{id}', [MasterSettingsController::class, 'semesterMasterUpdate']);
-            Route::delete('semesters/{id}', [MasterSettingsController::class, 'semesterMasterDestroy']);
 
             Route::get('subjects', [MasterSettingsController::class, 'subjectMasterIndex']);
             Route::post('subjects', [MasterSettingsController::class, 'subjectMasterStore']);

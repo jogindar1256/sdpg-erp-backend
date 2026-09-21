@@ -192,6 +192,9 @@ class DatabaseSeeder extends Seeder
             UniversitySeeder::class,
             PincodeSeeder::class,
             EnclosureTypeSeeder::class,
+            // Semesters 1..10 + ODD/EVEN parity. Every semester dropdown in
+            // the app reads this table, so it must always be seeded.
+            SemesterSeeder::class,
         ]);
 
         $this->command->info('✅ Database seeded successfully!');

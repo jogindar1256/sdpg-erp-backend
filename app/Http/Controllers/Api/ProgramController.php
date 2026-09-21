@@ -30,7 +30,7 @@ class ProgramController extends Controller
             'code' => 'required|string|max:20|unique:programs,code',
             'level' => 'required|in:UG,PG,BEd,Diploma,Certificate',
             'duration_years' => 'required|integer|min:1|max:6',
-            'total_semesters' => 'required|integer|min:1|max:12',
+            'total_semesters' => 'required|integer|min:1|max:10', // matches SemesterSeeder::MAX_SEMESTER
             'semester_type' => 'required|in:semester,annual',
             'description' => 'nullable|string',
         ]);
@@ -54,7 +54,7 @@ class ProgramController extends Controller
             'short_name' => 'sometimes|string|max:20',
             'level' => 'sometimes|in:UG,PG,BEd,Diploma,Certificate',
             'duration_years' => 'sometimes|integer|min:1|max:6',
-            'total_semesters' => 'sometimes|integer|min:1|max:12',
+            'total_semesters' => 'sometimes|integer|min:1|max:10', // matches SemesterSeeder::MAX_SEMESTER
             'semester_type' => 'sometimes|in:semester,annual',
             'description' => 'nullable|string',
             'is_active' => 'sometimes|boolean',

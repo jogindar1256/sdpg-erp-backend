@@ -38,7 +38,7 @@ class SubjectController extends Controller
             'program_id'     => 'required|exists:programs,id',
             'name'           => 'required|string|max:200',
             'code'           => 'required|string|max:30|unique:subjects,code',
-            'semester_no'    => 'required|integer|min:1|max:12',
+            'semester_no'    => 'required|integer|exists:semester_masters,semester_num',
             'type'           => 'required|in:compulsory,optional,elective,practical,project',
             'paper_type'     => 'required|in:regular,back_paper',
             'max_marks'      => 'required|integer|min:0',
@@ -56,7 +56,7 @@ class SubjectController extends Controller
     {
         $validated = $request->validate([
             'name'           => 'sometimes|string|max:200',
-            'semester_no'    => 'sometimes|integer|min:1|max:12',
+            'semester_no'    => 'sometimes|integer|exists:semester_masters,semester_num',
             'type'           => 'sometimes|in:compulsory,optional,elective,practical,project',
             'max_marks'      => 'sometimes|integer|min:0',
             'min_marks'      => 'sometimes|integer|min:0',

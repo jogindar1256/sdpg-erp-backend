@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 class ApplicationSchedule extends Model
 {
     protected $fillable = [
-        'program_id', 'session_year', 'semester_name', 'semester_no',
+        'program_id', 'session_year', 'semester_no',
         'exam_mode', 'start_admission', 'close_admission',
         'late_fee_applicable', 'late_fee',
     ];

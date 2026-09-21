@@ -469,7 +469,7 @@ class ApplicationController extends Controller
             'program_id' => 'required|exists:programs,id',
             'academic_year' => 'required|string|max:10',
             'application_type' => 'required|in:back_paper,semester_upgrade,lateral',
-            'semester_no' => 'nullable|integer|min:1|max:12',
+            'semester_no' => 'nullable|integer|exists:semester_masters,semester_num',
             'paper_ids' => 'nullable|array',
             'selected_subjects' => 'nullable|array',
             'compulsory_paper_ids' => 'nullable|array',
@@ -2407,7 +2407,7 @@ class ApplicationController extends Controller
             'program_id' => 'required|exists:programs,id',
             'academic_year' => 'required|string|max:10',
             'application_type' => 'required|in:fresh,back_paper,semester_upgrade,lateral',
-            'semester_no' => 'nullable|integer|min:1|max:12',
+            'semester_no' => 'nullable|integer|exists:semester_masters,semester_num',
         ]);
 
         $student = DB::table('students')->where('user_id', $req->user()->id)->first();

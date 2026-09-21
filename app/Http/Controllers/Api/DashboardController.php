@@ -13,14 +13,16 @@ class DashboardController extends Controller
      *
      * Query params:
      *   session_year   e.g. "2025-2026"          (optional)
-     *   semester_name  "odd" | "even" | ""        (optional)
-     *   semester_no    1-8 | ""                   (optional)
+     *   semester_no    1..10 | ""                 (optional)
+     *
+     * semester_name was removed: a semester number already implies its
+     * ODD/EVEN parity, so the two filters were one filter. The valid range
+     * comes from semester_masters (seeded 1..10), not from a hardcoded list.
      */
     public function index(Request $request)
     {
         $session      = $request->query('session_year', '');
-        $semName      = strtolower($request->query('semester_name', ''));  // odd|even|''
-        $semNo        = $request->query('semester_no', '');                // 1-8|''
+        $semNo        = $request->query('semester_no', '');                // 1..10|''
 
         // ── Helper: base query for admissions (joined to programs) ────────────
         $admBase = function () use ($session) {
@@ -31,13 +33,7 @@ class DashboardController extends Controller
             return $q;
         };
 
-        // ── Semester filter helpers (admissions only — real column is semester_no) ──
-        $applyOddEven = function ($q, string $name) {
-            if ($name === 'odd')  return $q->whereIn('a.semester_no', [1, 3, 5, 7]);
-            if ($name === 'even') return $q->whereIn('a.semester_no', [2, 4, 6, 8]);
-            return $q;
-        };
-
+        // ── Semester filter helper (admissions only — real column is semester_no) ──
         $applySemNo = function ($q, $no) {
             if ($no !== '' && $no !== null) return $q->where('a.semester_no', (int)$no);
             return $q;
@@ -56,8 +52,7 @@ class DashboardController extends Controller
         // A registration has no semester field — it only exists at all as a
         // "semester 1" event, so an explicit non-1 semester filter zeroes it.
         // ─────────────────────────────────────────────────────────────────────
-        $regCount = function (array $regTypes) use ($session, $semName, $semNo) {
-            if ($semName === 'even') return 0;
+        $regCount = function (array $regTypes) use ($session, $semNo) {
             if ($semNo !== '' && $semNo !== null && (int) $semNo !== 1) return 0;
 
             $q = DB::table('direct_registrations')
@@ -74,13 +69,13 @@ class DashboardController extends Controller
         // 3. NEW ADMISSION — UG (1st sem)
         // ─────────────────────────────────────────────────────────────────────
         $ugAdmissionNew = $filterLevel(
-            $applySemNo($applyOddEven($admBase()->where('a.semester_no', 1), $semName), $semNo === '' ? '' : $semNo),
+            $applySemNo($admBase()->where('a.semester_no', 1), $semNo === '' ? '' : $semNo),
             $ugLevels
         )->count();
 
         // 4. NEW ADMISSION — PG (1st sem)
         $pgAdmissionNew = $filterLevel(
-            $applySemNo($applyOddEven($admBase()->where('a.semester_no', 1), $semName), $semNo === '' ? '' : $semNo),
+            $applySemNo($admBase()->where('a.semester_no', 1), $semNo === '' ? '' : $semNo),
             $pgLevels
         )->count();
 
@@ -89,7 +84,7 @@ class DashboardController extends Controller
         // ─────────────────────────────────────────────────────────────────────
         $ugAdmissionUpgrade = $filterLevel(
             $applySemNo(
-                $applyOddEven($admBase()->whereIn('a.semester_no', [3, 5]), $semName),
+                $admBase()->whereIn('a.semester_no', [3, 5]),
                 $semNo === '' ? '' : $semNo
             ),
             $ugLevels
@@ -98,7 +93,7 @@ class DashboardController extends Controller
         // 6. UPGRADED ADMISSION — PG (3rd sem)
         $pgAdmissionUpgrade = $filterLevel(
             $applySemNo(
-                $applyOddEven($admBase()->where('a.semester_no', 3), $semName),
+                $admBase()->where('a.semester_no', 3),
                 $semNo === '' ? '' : $semNo
             ),
             $pgLevels
@@ -108,7 +103,7 @@ class DashboardController extends Controller
         // 7-9. Gender breakdown — New / Upgraded / Total Admission
         //      Joins with students table to get gender
         // ─────────────────────────────────────────────────────────────────────
-        $genderCount = function (string $type) use ($applyOddEven, $applySemNo, $semName, $semNo, $session) {
+        $genderCount = function (string $type) use ($applySemNo, $semNo, $session) {
             $q = DB::table('admissions as a')
                 ->join('students as s', 's.id', '=', 'a.student_id')
                 ->whereNull('a.deleted_at');
@@ -119,8 +114,7 @@ class DashboardController extends Controller
             if ($type === 'new')      $q->where('a.semester_no', 1);
             if ($type === 'upgraded') $q->whereNotIn('a.semester_no', [1]);
 
-            // semester filters
-            $q = $applyOddEven($q, $semName);
+            // semester filter
             $q = $applySemNo($q, $semNo);
 
             $rows = $q->select(
@@ -154,7 +148,6 @@ class DashboardController extends Controller
         return response()->json([
             'filters' => [
                 'session_year'  => $session,
-                'semester_name' => $semName,
                 'semester_no'   => $semNo,
             ],
             'sessions' => $sessions,

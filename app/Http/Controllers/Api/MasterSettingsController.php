@@ -11,6 +11,7 @@ use App\Models\Program;
 use App\Models\Subject;
 use App\Models\FeeHead;
 use App\Models\FeeStructure;
+use App\Models\SemesterMaster;
 
 class MasterSettingsController extends Controller
 {
@@ -35,8 +36,8 @@ class MasterSettingsController extends Controller
         $v = Validator::make($req->all(), [
             'program_id' => 'required|exists:programs,id',
             'session_year' => 'required|string',
-            'semester_name' => 'required|string',
-            'semester_no' => 'required|string',
+            // semester_name dropped — parity is derived from semester_no.
+            'semester_no' => 'required|integer|min:1',
             'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
             // Widened from a bare date to a full timestamp so the office can
             // set an exact admission open/close TIME, not just a day.
@@ -51,7 +52,6 @@ class MasterSettingsController extends Controller
         $rec = DB::table('application_schedules')->insertGetId(array_merge($req->only([
             'program_id',
             'session_year',
-            'semester_name',
             'semester_no',
             'exam_mode',
             'start_admission',
@@ -71,8 +71,7 @@ class MasterSettingsController extends Controller
         $v = Validator::make($req->all(), [
             'program_id' => 'sometimes|required|exists:programs,id',
             'session_year' => 'sometimes|required|string',
-            'semester_name' => 'sometimes|required|string',
-            'semester_no' => 'sometimes|required|string',
+            'semester_no' => 'sometimes|required|integer|min:1',
             'exam_mode' => 'sometimes|required|in:Regular,Back Paper,Upgrade',
             'start_admission' => 'sometimes|required|date',
             'close_admission' => 'sometimes|required|date|after:start_admission',
@@ -86,7 +85,6 @@ class MasterSettingsController extends Controller
             $req->only([
                 'program_id',
                 'session_year',
-                'semester_name',
                 'semester_no',
                 'exam_mode',
                 'start_admission',
@@ -759,22 +757,6 @@ class MasterSettingsController extends Controller
     // COURSE SETTINGS
     // ══════════════════════════════════════════════════════════════════
 
-    // 8. Class Master ─────────────────────────────────────────────────
-    // programs real columns: organization_id, name, short_name, code (unique,
-    // NOT NULL), level (enum UG|PG|BEd|Diploma|Certificate — note: 'BEd', not
-    // 'B.Ed'), duration_years, total_semesters, semester_type, description,
-    // is_active, full_name, course_code, is_self_finance, plus approval_type/
-    // exam_mode added by 2026_07_21_100000_fix_master_settings_schema_gaps.php.
-    //
-    // The frontend sends 'B.Ed' (display label) not the DB enum 'BEd', and
-    // sends 'status' (Active/Inactive) which maps onto the real is_active
-    // boolean, and 'approval_type' Self Finance/Under Finance which also
-    // drives the real is_self_finance boolean. It never collects `code` or
-    // `organization_id` — both are required NOT NULL columns, so Class
-    // Master's create previously threw a DB error on every single save
-    // (Program::create() was also missing 'name' entirely, and $fillable
-    // didn't even include full_name/approval_type/exam_mode, so those were
-    // silently dropped by mass assignment even before hitting the DB).
     private const CLASS_LEVEL_TO_ENUM = ['B.Ed' => 'BEd'];
 
     public function classMasterIndex()
@@ -874,42 +856,27 @@ class MasterSettingsController extends Controller
         return response()->json(['message' => 'Deleted.']);
     }
 
-    // 9. Semester Master ──────────────────────────────────────────────
+    // 9. Semester Master (READ-ONLY) ──────────────────────────────────
+    //
+    // Seeded reference data (SemesterSeeder): semesters 1..10 with ODD/EVEN
+    // parity. This is the single source of truth every semester dropdown in
+    // the app reads — nothing hardcodes the list or the parity any more.
+    //
+    // Create/update/delete were removed deliberately: parity is arithmetic,
+    // not configuration, and a free-text edit here could silently break the
+    // ODD/EVEN mapping system-wide. To change the range, edit
+    // SemesterSeeder::MAX_SEMESTER and reseed.
     public function semesterMasterIndex()
     {
-        return response()->json(DB::table('semester_masters')->orderBy('semester_nos')->get());
-    }
-
-    public function semesterMasterStore(Request $req)
-    {
-        $v = Validator::make($req->all(), [
-            'name' => 'required|string|max:50',
-            'semester_nos' => 'required|string',
-            'status' => 'required|in:Active,Inactive',
-        ]);
-        if ($v->fails())
-            return response()->json(['errors' => $v->errors()], 422);
-
-        $id = DB::table('semester_masters')->insertGetId(array_merge($req->only(['name', 'semester_nos', 'status']), [
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]));
-        return response()->json(['id' => $id, 'message' => 'Semester saved.'], 201);
-    }
-
-    public function semesterMasterUpdate(Request $req, $id)
-    {
-        DB::table('semester_masters')->where('id', $id)->update(array_merge(
-            $req->only(['name', 'semester_nos', 'status']),
-            ['updated_at' => now()]
-        ));
-        return response()->json(['message' => 'Updated.']);
-    }
-
-    public function semesterMasterDestroy($id)
-    {
-        DB::table('semester_masters')->where('id', $id)->delete();
-        return response()->json(['message' => 'Deleted.']);
+        return response()->json(
+            SemesterMaster::active()->map(fn($s) => [
+                'id'            => $s->id,
+                'semester_num'  => $s->semester_num,
+                'semester_name' => $s->semester_name,
+                'label'         => $s->label,   // "Semester 1 (ODD)"
+                'status'        => $s->status,
+            ])->values()
+        );
     }
 
     // 10. Subject Master ──────────────────────────────────────────────
@@ -922,17 +889,6 @@ class MasterSettingsController extends Controller
         );
     }
 
-    // Subject Master.docx: this screen is subject-DETAIL info only — Subject
-    // Name, Is Practical, Practical Fees Applicable, Permission Type,
-    // Additional Fee Applicable, Fee Rs. It is NOT the place for exam-paper
-    // fields (semester, marks, credits) — that's Subject Paper Master
-    // (subjectPaperIndex/Store further down), which already has its own
-    // per-session/semester subject_papers table for exactly that. The
-    // `subjects` table still carries semester_no/type/max_marks/min_marks/
-    // internal_marks/credits/code columns because other code paths
-    // (Program::semesterSubjects(), exam controllers) depend on them, and
-    // `code` is unique+NOT NULL — none of these are collected by this
-    // simplified screen, so sane defaults/auto-generated values are used.
     public function subjectMasterStore(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -1100,17 +1056,6 @@ class MasterSettingsController extends Controller
         );
     }
 
-    /**
-     * Batch save — the Subject Paper Master screen lets the office fill
-     * several Paper Code / Paper Name rows for one Class + Semester +
-     * Paper Type + Subject in one go, then hit Save once.
-     *
-     * Group is only a real concept for BSc classes (elective combinations
-     * like "Maths Group" / "Bio Group" spanning several subjects), and it
-     * is a name the office chooses — never an auto-incrementing counter.
-     * For every other class, group_label stays null and no grouping is
-     * shown anywhere.
-     */
     public function subjectPaperStore(Request $req)
     {
         $v = Validator::make($req->all(), [
