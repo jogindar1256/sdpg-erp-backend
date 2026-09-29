@@ -346,21 +346,6 @@ class MasterSettingsController extends Controller
         return response()->json(['message' => 'Deleted.']);
     }
 
-    // 5. Fee Structure ────────────────────────────────────────────────
-    // fee_structures real columns (2024_01_01_000005_create_fee_structures_table.php,
-    // plus amounts/term added by 2026_07_21_100000_fix_master_settings_schema_gaps.php):
-    // organization_id, program_id, fee_head_id, semester_no, academic_year,
-    // admission_type (enum regular|back_paper|upgrade|lateral), amount (legacy,
-    // unused single scalar), late_fine_per_day, due_date, is_active, amounts
-    // (json — per-gender/category grid, same "{gender}_{category}" key
-    // convention as registration_fees), term. There was NO session_year,
-    // exam_mode, for_sdpg_passout, for_ddu_passout — the store/index/copy
-    // methods here were reading/writing columns that never existed, so this
-    // endpoint 500'd on every call.
-    //
-    // The frontend's "session_year"/"exam_mode" filters map onto
-    // academic_year/admission_type; "exam_mode" values ('Regular','Back
-    // Paper','Upgrade') map onto the lowercase admission_type enum.
     private const EXAM_MODE_TO_ADMISSION_TYPE = [
         'Regular' => 'regular',
         'Back Paper' => 'back_paper',
@@ -371,19 +356,6 @@ class MasterSettingsController extends Controller
     /** Categories a fee_structures row can exist under — one row per category, per configuration. */
     private const FEE_CATEGORIES = ['gen', 'obc', 'sc', 'st', 'ews'];
 
-    /**
-     * One fee_structures row = one (program, semester, year, admission
-     * type, CATEGORY, sdpgc/ddu flags) — up to 5 rows per configuration
-     * (gen/obc/sc/st/ews). `amount_json` on each row holds every fee
-     * particular's amount for every GENDER within that category:
-     *   { "male": { "<fee_head_id>": 1850, ... }, "female": {...}, ... }
-     * The frontend still wants one "row" per fee particular for the grid
-     * (same wire shape as before), so this fetches all category-rows for
-     * the configuration and flattens them back into one entry per
-     * fee_head, with amounts keyed "{gender}_{category}" — plus a
-     * `category_refs` map, since fee_ref_id is now one per category (not
-     * one shared value for the whole configuration).
-     */
     public function feeStructureIndex(Request $req)
     {
         $admissionType = self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? $req->exam_mode;
@@ -472,11 +444,6 @@ class MasterSettingsController extends Controller
         $orgId = DB::table('programs')->where('id', $req->program_id)->value('organization_id');
         $program = DB::table('programs')->where('id', $req->program_id)->first();
 
-        // Base identity shared by every category-row this request touches —
-        // category itself is added per-group below, since ONE row is per
-        // (program, session, semester, admission type, CATEGORY, sdpgc,
-        // ddu): a POST carrying several gender_category keys can touch
-        // several category-rows at once (one per distinct category present).
         $baseKey = [
             'program_id' => $req->program_id,
             'academic_year' => $req->session_year,
@@ -516,9 +483,6 @@ class MasterSettingsController extends Controller
             $amountJson = $existing && $existing->amount_json ? json_decode($existing->amount_json, true) : [];
             $amountJson = is_array($amountJson) ? $amountJson : [];
 
-            // Merge this fee_head's amounts into the row's JSON — every
-            // OTHER fee head already saved for this category is left
-            // untouched, only this one particular's value per gender changes.
             foreach ($genderValues as $gender => $value) {
                 $amountJson[$gender][(string) $req->fee_head_id] = $value;
             }
@@ -552,13 +516,7 @@ class MasterSettingsController extends Controller
 
     // Copies exactly the configuration currently loaded on the fee-structure
     // page (one program plus semester plus exam mode) from one academic
-    // year forward into a later one. Deliberately scoped tight, not "whole
-    // program, every semester and exam mode": the operator has one class,
-    // semester and exam-mode combo open on screen, and only that combo is
-    // meant to carry forward. All up-to-5 category rows (gen/obc/sc/st/ews)
-    // and any sdpgc/ddu variants under that one combo still come along
-    // together. Copy direction is enforced below: the target year must be
-    // later than the source, never the same year or an earlier one.
+    // year forward into a later one.
     public function feeStructureCopyYear(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -857,15 +815,6 @@ class MasterSettingsController extends Controller
     }
 
     // 9. Semester Master (READ-ONLY) ──────────────────────────────────
-    //
-    // Seeded reference data (SemesterSeeder): semesters 1..10 with ODD/EVEN
-    // parity. This is the single source of truth every semester dropdown in
-    // the app reads — nothing hardcodes the list or the parity any more.
-    //
-    // Create/update/delete were removed deliberately: parity is arithmetic,
-    // not configuration, and a free-text edit here could silently break the
-    // ODD/EVEN mapping system-wide. To change the range, edit
-    // SemesterSeeder::MAX_SEMESTER and reseed.
     public function semesterMasterIndex()
     {
         return response()->json(
@@ -1018,16 +967,7 @@ class MasterSettingsController extends Controller
     // 12. Subject Paper Master ────────────────────────────────────────
     // subject_papers real columns: program_id, subject_id, session_year,
     // semester_no, paper_type, paper_name, group_no, max_marks, min_marks,
-    // plus paper_code (added by 2026_07_22_090000_add_paper_code_to_subject_papers.php
-    // — the mockup's "Paper Code" column had no backing column before this).
-    /**
-     * BSc is the only class with an elective "Group" concept (Maths Group,
-     * Bio Group, etc. — several subjects bundled as one selectable combo).
-     * Detection matches the short_name normalization already used by the
-     * course_code backfill migration (strip non-letters, uppercase, look
-     * for "BSC") since `level` alone is shared by every UG program (BA,
-     * BCom, BSc all have level='UG').
-     */
+    // plus paper_code
     private function programIsBsc($program): bool
     {
         if (!$program) return false;
@@ -1279,6 +1219,37 @@ class MasterSettingsController extends Controller
 
         $label   = strtoupper($req->group_label);
         $groupNo = ord($label) - 64;   // A -> 1 (kept for reg/adm compatibility)
+
+        // A subject can only belong to ONE group per class + semester. Letting
+        // the same subject sit in two groups corrupts everything downstream
+        // that assumes a subject->group lookup is unambiguous (registration's
+        // group-based picker resolves a subject's group by searching the
+        // groups array and picks the first match — a duplicate silently
+        // mis-assigns picks to the wrong group and can make a legitimate 3rd
+        // pick look like it's hitting that group's max_select cap). Reject
+        // any submitted subject that's already saved under a DIFFERENT group
+        // for this program+semester (re-saving the SAME group is fine — that
+        // row gets replaced below, not treated as a conflict with itself).
+        // subjects also has its own program_id column, so every predicate
+        // below must be table-qualified once the join is in play — an
+        // unqualified 'program_id'/'semester_no' is ambiguous to Postgres
+        // and errors (SQLSTATE 42702) rather than picking either table.
+        $incomingIds = collect($req->subjects)->pluck('subject_id')->unique()->values();
+        $conflicts = DB::table('subject_selections')
+            ->join('subjects', 'subjects.id', '=', 'subject_selections.subject_id')
+            ->where('subject_selections.program_id', $req->program_id)
+            ->where('subject_selections.semester_no', $req->semester_no)
+            ->where('subject_selections.group_label', '!=', $label)
+            ->whereIn('subject_selections.subject_id', $incomingIds)
+            ->select('subjects.name', 'subject_selections.group_label')
+            ->get();
+        if ($conflicts->isNotEmpty()) {
+            $msgs = $conflicts->map(fn ($c) => "{$c->name} is already in Group {$c->group_label}")->unique()->values();
+            return response()->json([
+                'message' => 'Some subjects are already assigned to another group: ' . $msgs->implode('; '),
+                'errors'  => ['subjects' => $msgs->all()],
+            ], 422);
+        }
 
         DB::transaction(function () use ($req, $label, $groupNo) {
             // Replace the whole group.

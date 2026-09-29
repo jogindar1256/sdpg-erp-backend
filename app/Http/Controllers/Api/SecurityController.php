@@ -9,7 +9,6 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
-use Illuminate\Support\Str;
 use Spatie\Permission\Models\Permission;
 
 class SecurityController extends Controller
@@ -87,8 +86,14 @@ class SecurityController extends Controller
     /**
      * PATCH /security/users/{id}/deactivate
      */
-    public function deactivateUser(int $id)
+    public function deactivateUser(Request $request, int $id)
     {
+        if ($id === $request->user()->id) {
+            return response()->json([
+                'message' => 'You cannot deactivate your own account.',
+            ], 422);
+        }
+
         $user = User::where('portal', 'college')->findOrFail($id);
         $user->update(['is_active' => false]);
 
@@ -99,17 +104,14 @@ class SecurityController extends Controller
     }
 
     /**
-     * POST /security/users/{id}/reset-password
-     * Generate a temporary password and return it.
+     * PATCH /security/users/{id}/activate
      */
-    public function resetPassword(int $id)
+    public function activateUser(int $id)
     {
         $user = User::where('portal', 'college')->findOrFail($id);
-        $temp = Str::random(10);
-        $user->update(['password' => Hash::make($temp)]);
-        $user->tokens()->delete(); // force re-login
+        $user->update(['is_active' => true]);
 
-        return response()->json(['message' => 'Password reset.', 'temp_password' => $temp]);
+        return response()->json(['message' => 'User activated.']);
     }
 
     // ── Reset Password (any portal) ─────────────────────────────────────────
@@ -152,20 +154,22 @@ class SecurityController extends Controller
     /**
      * POST /security/reset-password
      * Admin-driven password reset for ANY user, any portal (college staff or
-     * student) — two modes:
-     *   - mode=email:    admin sets the new password themselves, it's emailed
-     *                     to the account's email on file, and never echoed
-     *                     back in the response.
-     *   - mode=generate: server generates a random password, saves it, and
-     *                     returns it in the response so the admin can copy it
-     *                     and hand it over directly (no email sent).
+     * student) — two modes, both admin-chosen (no more server-generated
+     * random passwords):
+     *   - mode=email: admin sets the new password themselves, it's emailed
+     *                 to the account's email on file, and never echoed back
+     *                 in the response.
+     *   - mode=set:   admin sets the new password themselves; nothing is
+     *                 emailed — the same password is echoed back in the
+     *                 response so the admin can read it on screen and hand
+     *                 it to the user directly.
      */
     public function resetAnyPassword(Request $request)
     {
         $data = $request->validate([
             'user_id'      => 'required|integer|exists:users,id',
-            'mode'         => 'required|in:email,generate',
-            'new_password' => 'required_if:mode,email|nullable|string|min:8',
+            'mode'         => 'required|in:email,set',
+            'new_password' => 'required|string|min:8',
         ]);
 
         $user = User::findOrFail($data['user_id']);
@@ -212,13 +216,14 @@ class SecurityController extends Controller
             return response()->json(['message' => "Password reset and emailed to {$user->email}."]);
         }
 
-        // mode=generate
-        $plain = strtoupper(Str::random(3)) . random_int(100, 999) . Str::lower(Str::random(2));
+        // mode=set — admin-chosen password, not emailed, echoed back for on-screen display
+        $plain = $data['new_password'];
+        // Assigning the plain value is enough — User::$casts hashes it automatically.
         $user->update(['password' => $plain]);
         $user->tokens()->delete();
 
         return response()->json([
-            'message'       => 'Password reset. Copy it now — it will not be shown again.',
+            'message'       => 'Password reset successfully.',
             'temp_password' => $plain,
         ]);
     }

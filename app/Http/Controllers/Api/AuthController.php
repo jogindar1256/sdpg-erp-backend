@@ -97,11 +97,29 @@ class AuthController extends Controller
     /**
      * Student login — mobile number + password.
      *
-     * Uses raw DB queries (not Eloquent relationships) because the Student model's
-     * user() relationship may not be defined. The canonical link is:
-     *   students.user_id  →  users.id
+     * The `users` table (mobile + portal='student') is the authoritative
+     * source for login. A `students` row is NOT required to exist — it is
+     * only optional enrichment for the response payload. This matters
+     * because a student can have a working `users` account before their
+     * `students` profile row is ever created (e.g. profile provisioning
+     * failed after a paid registration for an unrelated data reason) — they
+     * still need to log in to see their status, retry payment, fix a
+     * rejected application, etc. Gating login on the `students` row existing
+     * created a chicken-and-egg lockout: see AuthController git history /
+     * session notes around 2026-09-21.
      *
-     * If no user_id is set (legacy registration), falls back to students.password.
+     * Legacy fallback: some very old accounts only ever got a `students`
+     * row with a `password` column and no `users` row at all — that path is
+     * kept, and promotes them to a proper `users` row on successful login.
+     *
+     * Login is blocked ONLY by the explicit, intentional Block/Unblock admin
+     * action (students.is_blocked, set via StudentController/
+     * AuthorizationController/AmendmentController's dedicated block/unblock
+     * handlers) or by users.is_active === false. Application-lifecycle state
+     * — rejected, on hold, pending registration fee, pending education fee,
+     * anything else — must never block login; blockRelatedRecords() in
+     * ApplicationController no longer touches is_blocked for exactly this
+     * reason.
      */
     public function studentLogin(Request $request): JsonResponse
     {
@@ -110,48 +128,43 @@ class AuthController extends Controller
             'password' => 'required|string|min:1',
         ]);
 
-        // ── 1. Find the student row ───────────────────────────────────────────
+        // ── 1. Users table first — the authoritative login source ─────────────
+        $user = User::where('mobile', $request->mobile)
+            ->where('portal', 'student')
+            ->first();
+
+        // ── 2. Students row — optional enrichment only, never a precondition ──
         $student = DB::table('students')
             ->where('mobile', $request->mobile)
             ->whereNull('deleted_at')
             ->first();
 
-        if (!$student) {
-            throw ValidationException::withMessages([
-                'mobile' => ['No student found with this mobile number.'],
-            ]);
-        }
-
-        // ── 2. Resolve the users row ─────────────────────────────────────────
-        //      Priority: students.user_id → users table
-        $user = null;
-
-        if (!empty($student->user_id)) {
+        // A students row may exist under a different mobile-matched users
+        // link (e.g. user_id set but mobile changed later) — prefer the
+        // users row already resolved above, but fall back to students.user_id
+        // if the direct mobile match above found nothing.
+        if (!$user && $student && !empty($student->user_id)) {
             $user = User::find($student->user_id);
         }
 
-        // Fallback: user registered with same mobile in users table, portal=student
-        if (!$user) {
-            $user = User::where('mobile', $request->mobile)
-                        ->where('portal', 'student')
-                        ->first();
-        }
-
-        // ── 3. Verify password ────────────────────────────────────────────────
         if ($user) {
-            // Standard path — password lives in users table
+            // ── 3a. Standard path — password lives in users table ──────────────
             if (!Hash::check($request->password, $user->password)) {
                 throw ValidationException::withMessages([
                     'mobile' => ['Invalid password. Please check and try again.'],
                 ]);
             }
 
-            // Keep portal correct
             if ($user->portal !== 'student') {
                 $user->update(['portal' => 'student']);
             }
-        } else {
-            // Legacy path — password on students table directly
+
+            // Keep the link current if a students row exists but wasn't linked yet.
+            if ($student && empty($student->user_id)) {
+                DB::table('students')->where('id', $student->id)->update(['user_id' => $user->id]);
+            }
+        } elseif ($student) {
+            // ── 3b. Legacy path — password lived on students table directly ────
             $studentPw = $student->password ?? null;
 
             if (!$studentPw) {
@@ -170,24 +183,41 @@ class AuthController extends Controller
                 ]);
             }
 
+            // users_email_unique_idx is a live constraint. $student->mobile
+            // is safe here (the earlier by-mobile users lookup already came
+            // back empty, or we wouldn't be in this branch), but
+            // $student->email could still already belong to a different
+            // users row — fall back to the same synthetic-email pattern
+            // already used when a legacy student has no email on file at
+            // all, rather than let User::create() throw and block a
+            // legitimate login over a data collision.
+            $emailToUse = $student->email ?? null;
+            if ($emailToUse && User::where('email', $emailToUse)->exists()) {
+                \Illuminate\Support\Facades\Log::warning("Legacy login promotion for student {$student->id}: email {$emailToUse} already used by another users row — using a synthetic email instead to avoid a unique-constraint collision.");
+                $emailToUse = null;
+            }
+
             // Promote: create a proper users row so Sanctum can issue tokens
             $user = User::create([
                 'name'      => $student->full_name ?? $student->name ?? 'Student',
-                'email'     => $student->email ?? "s{$student->mobile}@sdpg.local",
+                'email'     => $emailToUse ?? "s{$student->mobile}@sdpg.local",
                 'mobile'    => $student->mobile,
                 'password'  => Hash::make($request->password), // ensure it's hashed
                 'portal'    => 'student',
                 'is_active' => true,
             ]);
 
-            // Link back so next login skips this path
-            DB::table('students')
-                ->where('id', $student->id)
-                ->update(['user_id' => $user->id]);
+            DB::table('students')->where('id', $student->id)->update(['user_id' => $user->id]);
+        } else {
+            // Neither a users row nor a students row exists for this mobile —
+            // there is genuinely no account to log into.
+            throw ValidationException::withMessages([
+                'mobile' => ['No account found with this mobile number.'],
+            ]);
         }
 
-        // ── 4. Block / active checks ─────────────────────────────────────────
-        if ($student->is_blocked ?? false) {
+        // ── 4. Block / active checks — the ONLY things allowed to stop login ──
+        if ($student && ($student->is_blocked ?? false)) {
             $reason = $student->block_reason ?? 'Contact the college office.';
             return response()->json(['message' => "Account blocked. Reason: {$reason}"], 403);
         }
@@ -207,14 +237,14 @@ class AuthController extends Controller
 
         return response()->json([
             'user'    => $this->formatUser($user),
-            'student' => [
+            'student' => $student ? [
                 'id'            => $student->id,
                 'enrollment_no' => $student->enrollment_no ?? null,
                 'name'          => $student->full_name ?? $student->name ?? $user->name,
                 'mobile'        => $student->mobile,
                 'photo_path'    => $student->photo_path ?? null,
                 'status'        => $student->status ?? 'active',
-            ],
+            ] : null,
             'token'      => $token,
             'token_type' => 'Bearer',
         ]);

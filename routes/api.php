@@ -316,6 +316,15 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('{id}/details', [StudentRegistrationController::class, 'showDraft']);
             Route::put('{id}/details', [StudentRegistrationController::class, 'adminUpdateDraft']);
 
+            // Office-mode one-click verify (see officeVerifyPhone/Email doc comment)
+            Route::patch('{id}/verify-phone', [StudentRegistrationController::class, 'officeVerifyPhone']);
+            Route::patch('{id}/verify-email', [StudentRegistrationController::class, 'officeVerifyEmail']);
+
+            // Office-mode "Fill Form" — create the fresh application on
+            // behalf of the student when none exists yet (see doc comment
+            // on officeInitApplication()).
+            Route::post('{id}/init-application', [StudentRegistrationController::class, 'officeInitApplication']);
+
             // Cancel — the only way the same mobile/aadhar/abc_id can register
             // again for the same session + course.
             Route::post('{id}/cancel', [StudentRegistrationController::class, 'cancelRegistration']);
@@ -546,7 +555,7 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('users', [SecurityController::class, 'users']);
             Route::post('users', [SecurityController::class, 'createUser']);
             Route::patch('users/{id}/deactivate', [SecurityController::class, 'deactivateUser']);
-            Route::post('users/{id}/reset-password', [SecurityController::class, 'resetPassword']);
+            Route::patch('users/{id}/activate', [SecurityController::class, 'activateUser']);
             Route::get('reset-password/users', [SecurityController::class, 'searchAllUsers']);
             Route::post('reset-password', [SecurityController::class, 'resetAnyPassword']);
             Route::get('permissions', [SecurityController::class, 'permissions']);
@@ -691,13 +700,20 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::middleware(['auth:sanctum', 'portal:student'])->prefix('student')->group(function () {
 
-        Route::get('programs', [ProgramController::class, 'index']);
-
-
         // ── Student profile ───────────────────────────────────────────────────────
         Route::get('profile', [StudentController::class, 'myProfile']);
         Route::put('profile', [StudentController::class, 'updateProfile']);
 
+        // studentPrograms() is the correct handler here — eligibility- and
+        // is_active/deleted_at-filtered to what THIS student may apply for.
+        // A duplicate `Route::get('programs', [ProgramController::class,
+        // 'index'])` used to sit above this (registered first, so shadowed
+        // by this one under Laravel's last-registration-wins-on-exact-
+        // duplicate rule) — it returned every org program unfiltered by
+        // is_active, which is very likely why inactive/retired programs
+        // were showing up in student-facing dropdowns. Removed rather than
+        // reordered, since ProgramController::index was never meant for
+        // students in the first place (no eligibility scoping at all).
         Route::get('programs', [ApplicationController::class, 'studentPrograms']);
         // Numeric-only so it does not swallow /student/applications, /student/profile, etc.
         Route::get('/{id}', [ApplicationController::class, 'studentShow'])->whereNumber('id');

@@ -17,25 +17,33 @@ class AdmissionController extends Controller
         $query = Admission::with(['student', 'program', 'application'])
             ->where('organization_id', $request->user()->organization_id);
 
-        if ($request->filled('status'))          $query->where('status', $request->status);
-        if ($request->filled('program_id'))      $query->where('program_id', $request->program_id);
-        if ($request->filled('academic_year'))   $query->where('academic_year', $request->academic_year);
-        if ($request->filled('semester_no'))     $query->where('semester_no', $request->semester_no);
-        if ($request->filled('admission_type'))  $query->where('admission_type', $request->admission_type);
-        if ($request->filled('is_verified'))     $query->where('is_verified', $request->boolean('is_verified'));
+        if ($request->filled('status'))
+            $query->where('status', $request->status);
+        if ($request->filled('program_id'))
+            $query->where('program_id', $request->program_id);
+        if ($request->filled('academic_year'))
+            $query->where('academic_year', $request->academic_year);
+        if ($request->filled('semester_no'))
+            $query->where('semester_no', $request->semester_no);
+        if ($request->filled('admission_type'))
+            $query->where('admission_type', $request->admission_type);
+        if ($request->filled('is_verified'))
+            $query->where('is_verified', $request->boolean('is_verified'));
         if ($request->filled('search')) {
             $q = $request->search;
-            $query->whereHas('student', fn($w) =>
-                $w->where('first_name', 'ilike', "%{$q}%")
-                  ->orWhere('last_name', 'ilike', "%{$q}%")
-                  ->orWhere('enrollment_no', 'ilike', "%{$q}%")
-                  ->orWhere('mobile', 'like', "%{$q}%")
+            $query->whereHas(
+                'student',
+                fn($w) =>
+                    $w->where('first_name', 'ilike', "%{$q}%")
+                        ->orWhere('last_name', 'ilike', "%{$q}%")
+                        ->orWhere('enrollment_no', 'ilike', "%{$q}%")
+                        ->orWhere('mobile', 'like', "%{$q}%")
             )->orWhere('admission_no', 'ilike', "%{$q}%");
         }
 
         return response()->json(
             $query->orderBy('admission_date', 'desc')
-                  ->paginate($request->get('per_page', 20))
+                ->paginate($request->get('per_page', 20))
         );
     }
 
@@ -68,17 +76,17 @@ class AdmissionController extends Controller
         // Generate enrollment number if not set
         $student = $admission->student;
         if (!$student->enrollment_no) {
-            $year  = now()->format('Y');
+            $year = now()->format('Y');
             $count = Student::where('organization_id', $admission->organization_id)
-                            ->whereNotNull('enrollment_no')->count() + 1;
+                ->whereNotNull('enrollment_no')->count() + 1;
             $student->update([
                 'enrollment_no' => 'SDPG-' . $year . '-' . str_pad($count, 5, '0', STR_PAD_LEFT),
             ]);
         }
 
         return response()->json([
-            'message'        => 'Admission verified successfully.',
-            'enrollment_no'  => $student->enrollment_no,
+            'message' => 'Admission verified successfully.',
+            'enrollment_no' => $student->enrollment_no,
         ]);
     }
 
@@ -91,9 +99,9 @@ class AdmissionController extends Controller
         }
 
         $admission->update([
-            'status'       => 'cancelled',
-            'cancel_reason'=> $request->cancel_reason,
-            'cancel_date'  => now()->toDateString(),
+            'status' => 'cancelled',
+            'cancel_reason' => $request->cancel_reason,
+            'cancel_date' => now()->toDateString(),
             'cancelled_by' => $request->user()->id,
         ]);
 
@@ -113,8 +121,10 @@ class AdmissionController extends Controller
             ->where('status', 'active')
             ->whereRaw('semester_no < (SELECT total_semesters FROM programs WHERE id = admissions.program_id)');
 
-        if ($request->filled('program_id'))    $query->where('program_id', $request->program_id);
-        if ($request->filled('academic_year')) $query->where('academic_year', $request->academic_year);
+        if ($request->filled('program_id'))
+            $query->where('program_id', $request->program_id);
+        if ($request->filled('academic_year'))
+            $query->where('academic_year', $request->academic_year);
 
         return response()->json($query->paginate($request->get('per_page', 20)));
     }
@@ -122,8 +132,8 @@ class AdmissionController extends Controller
     public function upgrade(Request $request, Admission $admission): JsonResponse
     {
         $request->validate([
-            'new_semester_no'  => 'required|integer|exists:semester_masters,semester_num',
-            'new_academic_year'=> 'required|string',
+            'new_semester_no' => 'required|integer|exists:semester_masters,semester_num',
+            'new_academic_year' => 'required|string',
         ]);
 
         $program = $admission->program;
@@ -145,20 +155,20 @@ class AdmissionController extends Controller
 
         $newAdmission = Admission::create([
             'organization_id' => $admission->organization_id,
-            'student_id'      => $admission->student_id,
-            'program_id'      => $admission->program_id,
-            'application_id'  => $admission->application_id,
-            'academic_year'   => $request->new_academic_year,
-            'semester_no'     => $request->new_semester_no,
-            'admission_type'  => 'upgrade',
-            'admission_no'    => Admission::generateAdmissionNo($admission->organization_id, $request->new_academic_year),
-            'admission_date'  => now()->toDateString(),
-            'status'          => 'active',
+            'student_id' => $admission->student_id,
+            'program_id' => $admission->program_id,
+            'application_id' => $admission->application_id,
+            'academic_year' => $request->new_academic_year,
+            'semester_no' => $request->new_semester_no,
+            'admission_type' => 'upgrade',
+            'admission_no' => Admission::generateAdmissionNo($admission->organization_id, $request->new_academic_year),
+            'admission_date' => now()->toDateString(),
+            'status' => 'active',
         ]);
 
         return response()->json([
-            'message'      => "Admission upgraded to Semester {$request->new_semester_no}.",
-            'new_admission'=> $newAdmission->load('program'),
+            'message' => "Admission upgraded to Semester {$request->new_semester_no}.",
+            'new_admission' => $newAdmission->load('program'),
         ], 201);
     }
 
@@ -172,16 +182,25 @@ class AdmissionController extends Controller
 
         if ($request->filled('search')) {
             $q = $request->search;
-            $query->where(fn($w) =>
-                $w->where('first_name', 'ilike', "%{$q}%")
-                  ->orWhere('enrollment_no', 'ilike', "%{$q}%")
-                  ->orWhere('mobile', 'like', "%{$q}%")
+            $query->where(
+                fn($w) =>
+                    $w->where('first_name', 'ilike', "%{$q}%")
+                        ->orWhere('enrollment_no', 'ilike', "%{$q}%")
+                        ->orWhere('mobile', 'like', "%{$q}%")
             );
         }
 
         return response()->json($query->select([
-            'id', 'enrollment_no', 'first_name', 'middle_name', 'last_name',
-            'mobile', 'photo_path', 'biometric_id', 'aadhar_no', 'status',
+            'id',
+            'enrollment_no',
+            'first_name',
+            'middle_name',
+            'last_name',
+            'mobile',
+            'photo_path',
+            'biometric_id',
+            'aadhar_no',
+            'status',
         ])->paginate($request->get('per_page', 20)));
     }
 
@@ -201,30 +220,21 @@ class AdmissionController extends Controller
         $query = \App\Models\FeeStructure::with('program')
             ->where('organization_id', $orgId);
 
-        if ($request->filled('program_id'))    $query->where('program_id', $request->program_id);
-        if ($request->filled('academic_year')) $query->where('academic_year', $request->academic_year);
-        if ($request->filled('semester_no'))   $query->where('semester_no', $request->semester_no);
+        if ($request->filled('program_id'))
+            $query->where('program_id', $request->program_id);
+        if ($request->filled('academic_year'))
+            $query->where('academic_year', $request->academic_year);
+        if ($request->filled('semester_no'))
+            $query->where('semester_no', $request->semester_no);
 
         $structures = $query->orderBy('program_id')->orderBy('semester_no')->get();
 
-        // Each fee_structures row is one (course + category) — up to 5 rows
-        // per program/semester/session/admission-type (gen/obc/sc/st/ews) —
-        // with amount_json holding every fee particular's amount for every
-        // GENDER within that category. See the 2026_09_16 migration header.
-        // So each combo shown here is (this row's category, one gender key
-        // from its amount_json), never collapsed across categories or
-        // genders, since that would reintroduce exactly the ambiguity
-        // amount_json was written to remove.
         $feeHeadNames = DB::table('fee_heads')->pluck('name', 'id');
 
         $grouped = $structures->groupBy('program_id')->map(function ($items) use ($feeHeadNames) {
             return [
-                'program'   => $items->first()->program,
+                'program' => $items->first()->program,
                 'semesters' => $items->groupBy('semester_no')->map(function ($configRows) use ($feeHeadNames) {
-                    // Multiple rows can share a semester_no — up to 5
-                    // (one per category) times however many distinct
-                    // admission_type/sdpgc_student/ddu_affiliated variants
-                    // exist — each contributes its own combos.
                     $combos = [];
                     foreach ($configRows as $row) {
                         $amountJson = (array) ($row->amount_json ?? []);
@@ -232,11 +242,12 @@ class AdmissionController extends Controller
                             $headsOut = [];
                             $total = 0.0;
                             foreach ((array) $heads as $feeHeadId => $amount) {
-                                if ((float) $amount <= 0) continue;
+                                if ((float) $amount <= 0)
+                                    continue;
                                 $headsOut[] = [
                                     'fee_head' => $feeHeadNames[$feeHeadId] ?? "Fee Head #{$feeHeadId}",
-                                    'amount'   => (float) $amount,
-                                    'type'     => $row->admission_type,
+                                    'amount' => (float) $amount,
+                                    'type' => $row->admission_type,
                                 ];
                                 $total += (float) $amount;
                             }
@@ -244,11 +255,11 @@ class AdmissionController extends Controller
                                 continue;
                             }
                             $combos[] = [
-                                'gender'     => $gender,
-                                'category'   => $row->category,
-                                'total'      => $total,
+                                'gender' => $gender,
+                                'category' => $row->category,
+                                'total' => $total,
                                 'fee_ref_id' => $row->fee_ref_id,
-                                'heads'      => $headsOut,
+                                'heads' => $headsOut,
                             ];
                         }
                     }
@@ -271,18 +282,18 @@ class AdmissionController extends Controller
             'feeReceipts' => fn($q) => $q->where('status', 'active')->orderBy('receipt_date'),
         ])->findOrFail($request->student_id);
 
-        $receipts   = $student->feeReceipts;
-        $totalPaid  = $receipts->sum('net_amount');
-        $byType     = $receipts->groupBy('receipt_type')
-                               ->map(fn($r) => $r->sum('net_amount'));
+        $receipts = $student->feeReceipts;
+        $totalPaid = $receipts->sum('net_amount');
+        $byType = $receipts->groupBy('receipt_type')
+            ->map(fn($r) => $r->sum('net_amount'));
 
         return response()->json([
-            'student'    => $student->only(['id','full_name','enrollment_no','mobile','photo_path']),
-            'admission'  => $student->currentAdmission,
-            'receipts'   => $receipts,
-            'summary'    => [
-                'total_paid'    => $totalPaid,
-                'by_type'       => $byType,
+            'student' => $student->only(['id', 'full_name', 'enrollment_no', 'mobile', 'photo_path']),
+            'admission' => $student->currentAdmission,
+            'receipts' => $receipts,
+            'summary' => [
+                'total_paid' => $totalPaid,
+                'by_type' => $byType,
                 'receipt_count' => $receipts->count(),
             ],
         ]);
@@ -293,34 +304,35 @@ class AdmissionController extends Controller
     public function statistics(Request $request): JsonResponse
     {
         $orgId = $request->user()->organization_id;
-        $year  = $request->get('academic_year');
+        $year = $request->get('academic_year');
 
         $query = Admission::where('organization_id', $orgId);
-        if ($year) $query->where('academic_year', $year);
+        if ($year)
+            $query->where('academic_year', $year);
 
         return response()->json([
-            'total'              => $query->count(),
-            'by_status'          => (clone $query)->selectRaw('status, count(*) as count')
-                                        ->groupBy('status')->pluck('count', 'status'),
-            'by_program'         => (clone $query)->with('program:id,short_name,level')
-                                        ->selectRaw('program_id, count(*) as count')
-                                        ->groupBy('program_id')->get()
-                                        ->map(fn($a) => ['program' => $a->program?->short_name, 'count' => $a->count]),
-            'by_semester'        => (clone $query)->selectRaw('semester_no, count(*) as count')
-                                        ->groupBy('semester_no')->orderBy('semester_no')->pluck('count', 'semester_no'),
-            'by_admission_type'  => (clone $query)->selectRaw('admission_type, count(*) as count')
-                                        ->groupBy('admission_type')->pluck('count', 'admission_type'),
-            'by_month'           => (clone $query)->selectRaw("to_char(admission_date,'Mon YYYY') as month, count(*) as count")
-                                        ->groupBy('month')->orderBy('month')->pluck('count', 'month'),
-            'verified_count'     => (clone $query)->where('is_verified', true)->count(),
-            'unverified_count'   => (clone $query)->where('is_verified', false)->count(),
+            'total' => $query->count(),
+            'by_status' => (clone $query)->selectRaw('status, count(*) as count')
+                ->groupBy('status')->pluck('count', 'status'),
+            'by_program' => (clone $query)->with('program:id,short_name,level')
+                ->selectRaw('program_id, count(*) as count')
+                ->groupBy('program_id')->get()
+                ->map(fn($a) => ['program' => $a->program?->short_name, 'count' => $a->count]),
+            'by_semester' => (clone $query)->selectRaw('semester_no, count(*) as count')
+                ->groupBy('semester_no')->orderBy('semester_no')->pluck('count', 'semester_no'),
+            'by_admission_type' => (clone $query)->selectRaw('admission_type, count(*) as count')
+                ->groupBy('admission_type')->pluck('count', 'admission_type'),
+            'by_month' => (clone $query)->selectRaw("to_char(admission_date,'Mon YYYY') as month, count(*) as count")
+                ->groupBy('month')->orderBy('month')->pluck('count', 'month'),
+            'verified_count' => (clone $query)->where('is_verified', true)->count(),
+            'unverified_count' => (clone $query)->where('is_verified', false)->count(),
         ]);
     }
 
     public function subjectStatistics(Request $request): JsonResponse
     {
         $orgId = $request->user()->organization_id;
-        $year  = $request->get('academic_year');
+        $year = $request->get('academic_year');
 
         // Pull enrolled subjects from applications
         $apps = \App\Models\StudentApplication::with(['program:id,short_name', 'student:id,full_name,enrollment_no'])
@@ -329,11 +341,6 @@ class AdmissionController extends Controller
             ->when($year, fn($q) => $q->where('academic_year', $year))
             ->get();
 
-        // Count subjects selected across all applications. Subject selection
-        // lives on part_6 only (decode/encode everywhere) — the old
-        // selected_subjects/selected_optional_subjects columns were always
-        // null for real student-submitted applications. part_6 is not an
-        // Eloquent array-cast attribute, so decode it manually here.
         $subjectCounts = [];
         foreach ($apps as $app) {
             $part6 = $app->part_6 ?? null;
@@ -352,23 +359,23 @@ class AdmissionController extends Controller
 
         // Fetch subject names
         $subjectIds = array_keys($subjectCounts);
-        $subjects   = \App\Models\Subject::whereIn('id', $subjectIds)
-                         ->with('program:id,short_name')
-                         ->get()
-                         ->keyBy('id');
+        $subjects = \App\Models\Subject::whereIn('id', $subjectIds)
+            ->with('program:id,short_name')
+            ->get()
+            ->keyBy('id');
 
         $result = collect($subjectCounts)->map(fn($count, $id) => [
-            'subject_id'   => $id,
+            'subject_id' => $id,
             'subject_name' => $subjects[$id]?->name ?? 'Unknown',
             'subject_code' => $subjects[$id]?->code ?? '',
-            'program'      => $subjects[$id]?->program?->short_name ?? '',
-            'type'         => $subjects[$id]?->type ?? '',
-            'count'        => $count,
+            'program' => $subjects[$id]?->program?->short_name ?? '',
+            'type' => $subjects[$id]?->type ?? '',
+            'count' => $count,
         ])->sortByDesc('count')->values();
 
         return response()->json([
             'total_enrolled' => $apps->count(),
-            'subjects'       => $result,
+            'subjects' => $result,
         ]);
     }
 }
