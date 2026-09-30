@@ -58,10 +58,9 @@
     ])->filter()->implode(', ') ?: ($student->permanent_address ?? null);
 
     $typeOfCourse = match ($sa->application_type ?? null) {
-        'fresh'            => 'Regular',
+        'regular'          => 'Regular',
         'back_paper'       => 'Back Paper',
         'semester_upgrade' => 'Upgrade',
-        'lateral'          => 'Lateral',
         default            => $val(null),
     };
 

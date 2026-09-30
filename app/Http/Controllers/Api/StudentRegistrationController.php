@@ -478,22 +478,9 @@ class StudentRegistrationController extends Controller
 
         $userId = $reg->user_id;
 
-        // Scoped to direct_registration_id ONLY — deliberately NOT also
-        // matching on user_id the way store()'s own dup-check does for the
-        // authenticated student. store() can trust $userId because it's
-        // the caller's own verified session identity. Here $userId is just
-        // whatever provisionAccount() last wrote to this row, and
-        // provisionAccount() finds-or-creates that login by mobile number
-        // alone (User::where('mobile', ...)->where('portal','student')) —
-        // so two different registrants who happen to share a mobile number
-        // (a common real case: a parent's/guardian's phone used for more
-        // than one child) end up pointing at the SAME users.id. Matching
-        // on user_id here would find and return a completely different
-        // person's application for the same shared login — which is
-        // exactly the cross-user data leak this was reported as.
         $existing = DB::table('student_applications')
             ->where('direct_registration_id', $reg->id)
-            ->where('application_type', 'fresh')
+            ->where('application_type', 'regular')
             ->whereNotIn('status', ['rejected', 'cancelled'])
             ->whereNull('deleted_at')
             ->orderByDesc('id')
@@ -514,8 +501,8 @@ class StudentRegistrationController extends Controller
         $appNo = 'SA-' . date('Y') . '-' . str_pad($seq, 6, '0', STR_PAD_LEFT);
 
         // No existingStudent/student_id lookup here, unlike store()'s
-        // back_paper/semester_upgrade/lateral handling — this endpoint only
-        // ever creates 'fresh' applications, and a fresh applicant has no
+        // back_paper/semester_upgrade handling — this endpoint only
+        // ever creates 'regular' applications, and a regular applicant has no
         // students row yet by design (it's only ever created at approval,
         // see confirmStudentAndCreateAdmission()). A user_id-keyed lookup
         // would also inherit the same cross-registrant risk noted above,
@@ -527,7 +514,7 @@ class StudentRegistrationController extends Controller
             'program_id' => $reg->program_id,
             'direct_registration_id' => $reg->id,
             'academic_year' => $reg->session_year,
-            'application_type' => 'fresh',
+            'application_type' => 'regular',
             'application_no' => $appNo,
             'status' => 'draft',
             'form_progress' => json_encode([]),

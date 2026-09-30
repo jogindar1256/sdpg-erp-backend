@@ -13,7 +13,7 @@ return new class extends Migration {
             $table->foreignId('program_id')->constrained()->cascadeOnDelete();
             $table->integer('semester_no');               // which semester this fee applies to (0 = all)
             $table->string('academic_year', 10);          // 2024-25
-            $table->enum('admission_type', ['regular', 'back_paper', 'upgrade', 'lateral']);
+            $table->enum('admission_type', ['regular', 'back_paper', 'upgrade']);
             $table->decimal('late_fine_per_day', 8, 2)->default(0);
             $table->date('due_date')->nullable();
             $table->string('fee_ref_id', 40)->nullable();

@@ -15,7 +15,7 @@ return new class extends Migration
             $table->foreignId('program_id')->constrained()->cascadeOnDelete();
             $table->string('academic_year', 10);
             $table->string('application_no')->unique();
-            $table->enum('application_type', ['fresh', 'back_paper', 'semester_upgrade', 'lateral']);
+            $table->enum('application_type', ['regular', 'back_paper', 'semester_upgrade']);
             $table->integer('semester_no')->default(1);
 
             // Shapath Patr (declaration)

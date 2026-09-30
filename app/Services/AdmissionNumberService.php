@@ -62,7 +62,7 @@ class AdmissionNumberService
     {
         if ($admissionType === 'back_paper') return 'back_paper';
         // 'regular' and 'upgrade' share the same code; self-finance flips 101 -> 201.
-        if (in_array($admissionType, ['regular', 'upgrade', 'lateral'], true)) {
+        if (in_array($admissionType, ['regular', 'upgrade',], true)) {
             return $isSelfFinance ? 'self_finance' : 'regular';
         }
         return 'other';

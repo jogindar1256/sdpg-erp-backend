@@ -242,7 +242,7 @@ Route::middleware('auth:sanctum')->group(function () {
             // GET  /applications/{id}/print   (full application PDF — completed & fee-paid only)
             Route::get('/{id}/print', [ApplicationController::class, 'printForm']);
 
-            // Education fee (fresh / semester_upgrade / lateral) — office
+            // Education fee (regular / semester_upgrade) — office
             Route::post('/{id}/pay/initiate', [ApplicationController::class, 'applicationPayInitiate']);
             Route::post('/{id}/pay/verify', [ApplicationController::class, 'applicationPayVerify']);
             Route::post('/{id}/pay/failed', [ApplicationController::class, 'applicationPayFailed']);
@@ -767,7 +767,7 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('/{id}/receipt', [ApplicationController::class, 'studentReceiptDownload']);
 
             // Back paper — student self-service save / pay / print (ownership-checked)
-            // Education fee (fresh / semester_upgrade / lateral) — student
+            // Education fee (regular / semester_upgrade/ back_paper) — student
             Route::post('/{id}/pay/initiate', [ApplicationController::class, 'studentApplicationPayInitiate']);
             Route::post('/{id}/pay/verify', [ApplicationController::class, 'studentApplicationPayVerify']);
             Route::post('/{id}/pay/failed', [ApplicationController::class, 'studentApplicationPayFailed']);

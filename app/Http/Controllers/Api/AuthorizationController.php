@@ -18,11 +18,22 @@ class AuthorizationController extends Controller
     {
         $latestReg = $this->latestRegistrationSub();
 
+        // students is a LEFT join — was inner, which silently dropped every
+        // 'regular' application from this queue, since a regular
+        // application's student_id is null until admission approval (see
+        // ApplicationController::createStudentFromApprovedApplication()).
+        // That's the same bug fixed in ApplicationController::index() for
+        // /college/applications — this is the admission-verification queue,
+        // which explicitly includes 'regular' (see admissionVerificationIndex()
+        // below), so nothing regular could have been showing up here at all.
+        // drc (direct_registrations via sa.direct_registration_id) is the
+        // fallback identity source for exactly that case, same as index().
         $q = DB::table('student_applications as sa')
-            ->join('students as s', 's.id', '=', 'sa.student_id')
+            ->leftJoin('students as s', 's.id', '=', 'sa.student_id')
             ->join('programs as p', 'p.id', '=', 'sa.program_id')
             ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
+            ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
             ->leftJoin('admissions as a', 'a.application_id', '=', 'sa.id')
             ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'sa.fee_receipt_id')
             ->whereIn('sa.application_type', $types)
@@ -39,14 +50,14 @@ class AuthorizationController extends Controller
                 's.first_name',
                 's.middle_name',
                 's.last_name',
-                'dr.name as reg_name',
-                'dr.father_name',
-                'dr.mother_name',
-                'dr.dob',
-                's.gender',
-                's.category',
-                's.mobile',
-                's.aadhar_no',
+                DB::raw('COALESCE(dr.name, drc.name) as reg_name'),
+                DB::raw('COALESCE(dr.father_name, drc.father_name) as father_name'),
+                DB::raw('COALESCE(dr.mother_name, drc.mother_name) as mother_name'),
+                DB::raw('COALESCE(dr.dob, drc.dob) as dob'),
+                DB::raw('COALESCE(s.gender, drc.gender) as gender'),
+                DB::raw('COALESCE(s.category, drc.category) as category'),
+                DB::raw('COALESCE(s.mobile, drc.mobile) as mobile'),
+                DB::raw('COALESCE(s.aadhar_no, drc.aadhar_no) as aadhar_no'),
                 's.is_blocked',
                 'p.short_name as class_name',
                 'p.full_name as program_name',
@@ -80,10 +91,15 @@ class AuthorizationController extends Controller
 
         if ($search = $request->input('search')) {
             $q->where(function ($qb) use ($search) {
+                // Added drc.name/drc.mobile — was dr/s only, which a fresh
+                // application (no students row, no dr match via user_id)
+                // could never match at all.
                 $qb->where('sa.application_no', 'ilike', "%$search%")
                     ->orWhere('a.admission_no', 'ilike', "%$search%")
                     ->orWhere('s.mobile', 'ilike', "%$search%")
+                    ->orWhere('drc.mobile', 'ilike', "%$search%")
                     ->orWhere('dr.name', 'ilike', "%$search%")
+                    ->orWhere('drc.name', 'ilike', "%$search%")
                     ->orWhere('s.first_name', 'ilike', "%$search%")
                     ->orWhere('s.last_name', 'ilike', "%$search%");
             });
@@ -100,14 +116,14 @@ class AuthorizationController extends Controller
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 1. ADMISSION VERIFICATION — fresh / lateral applications
+    // 1. ADMISSION VERIFICATION — regular applications
     // GET /authorizations/admission-verification
     // ─────────────────────────────────────────────────────────────────────────
     public function admissionVerificationIndex(Request $request)
     {
-        $q = $this->baseApplicationQueue($request, ['fresh', 'lateral']);
+        $q = $this->baseApplicationQueue($request, ['regular']);
 
-        $counts = $this->baseApplicationQueue($request, ['fresh', 'lateral'])
+        $counts = $this->baseApplicationQueue($request, ['regular'])
             ->reorder()
             ->select(DB::raw("
                 COUNT(*) as total,
@@ -129,7 +145,7 @@ class AuthorizationController extends Controller
     // GET /authorizations/admission-verification/{applicationId}
     public function admissionVerificationShow(int $applicationId)
     {
-        $rows = $this->baseApplicationQueue(new Request(['status' => null]), ['fresh', 'lateral', 'semester_upgrade', 'back_paper'])
+        $rows = $this->baseApplicationQueue(new Request(['status' => null]), ['regular', 'semester_upgrade', 'back_paper'])
             ->reorder()
             ->where('sa.id', $applicationId)
             ->get();
@@ -397,9 +413,6 @@ class AuthorizationController extends Controller
                 // Selected subjects live on part_6 (decode/encode everywhere)
                 // on student_applications, not admissions — the old
                 // top-level selected_subjects column was always null for
-                // real student-submitted applications. part_6 also carries
-                // other keys (major_subject_1 etc.), so this is a
-                // read-merge-write, never a blind overwrite.
                 if ($log->admission_id && isset($data['selected_subjects'])) {
                     $appId = DB::table('admissions')->where('id', $log->admission_id)->value('application_id');
                     if ($appId) {

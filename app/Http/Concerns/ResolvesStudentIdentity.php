@@ -4,19 +4,6 @@ namespace App\Http\Concerns;
 
 use Illuminate\Support\Facades\DB;
 
-/**
- * `students` only has first_name/middle_name/last_name (+ date_of_birth,
- * permanent_*) — it has no name/father_name/mother_name/dob/spouse_name/
- * address columns. Those identity fields (given at self-registration) live
- * on `direct_registrations` instead. Every controller that used to select
- * `s.name`/`s.father_name`/etc. directly off `students` was querying columns
- * that don't exist and would throw `column s.name does not exist` the
- * moment that code path was hit.
- *
- * This trait centralizes the fix: a reusable subquery to join the latest
- * direct_registrations row per user, and a helper to compose a fallback
- * name from first/middle/last when no registration snapshot matched.
- */
 trait ResolvesStudentIdentity
 {
     /**
@@ -35,7 +22,7 @@ trait ResolvesStudentIdentity
     /**
      * Subquery: latest (non-deleted) student_applications row per
      * student_id, optionally filtered to one application_type (e.g.
-     * 'fresh'). Use with leftJoinSub(..., 'la', 'la.student_id', 's.id')
+     * 'regular'). Use with leftJoinSub(..., 'la', 'la.student_id', 's.id')
      * then leftJoin('student_applications as sa', 'sa.id', 'la.app_id').
      */
     protected function latestApplicationSub(?string $applicationType = null)

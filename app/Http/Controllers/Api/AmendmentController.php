@@ -774,7 +774,7 @@ class AmendmentController extends Controller
         $latestReg = $this->regJoinSub();
         $latestApp = DB::table('student_applications')
             ->select('student_id', DB::raw('MAX(id) as app_id'))
-            ->where('application_type', 'fresh')
+            ->where('application_type', 'regular')
             ->whereNull('deleted_at')
             ->groupBy('student_id');
 
@@ -852,7 +852,7 @@ class AmendmentController extends Controller
         $latestReg = $this->regJoinSub();
         $latestApp = DB::table('student_applications')
             ->select('student_id', DB::raw('MAX(id) as app_id'))
-            ->where('application_type', 'fresh')
+            ->where('application_type', 'regular')
             ->whereNull('deleted_at')
             ->groupBy('student_id');
 

@@ -350,7 +350,6 @@ class MasterSettingsController extends Controller
         'Regular' => 'regular',
         'Back Paper' => 'back_paper',
         'Upgrade' => 'upgrade',
-        'Lateral' => 'lateral',
     ];
 
     /** Categories a fee_structures row can exist under — one row per category, per configuration. */
@@ -427,13 +426,12 @@ class MasterSettingsController extends Controller
             'fee_head_id' => 'required|exists:fee_heads,id',
             'session_year' => 'required|string',
             'semester_no' => 'required|string',
-            'exam_mode' => 'required|in:Regular,Back Paper,Upgrade,Lateral',
+            'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
             'term' => 'required|in:Admission,Semester Registration',
             'amounts' => 'required|array',
             // PG/B.Ed.-only pass-out-source flags. Absent/false for every
             // other program level — see 2026_08_15_090000_add_pass_out_
-            // flags_to_fee_structures.php for why these are part of the
-            // row's identity rather than a plain attribute.
+            // flags_to_fee_structures.php
             'sdpgc_student' => 'nullable|boolean',
             'ddu_affiliated' => 'nullable|boolean',
             'in_favor_of' => 'nullable|in:College,University,Government',
@@ -524,7 +522,7 @@ class MasterSettingsController extends Controller
             'to_year' => 'required|string',
             'program_id' => 'required|exists:programs,id',
             'semester_no' => 'required|integer',
-            'exam_mode' => 'required|in:Regular,Back Paper,Upgrade,Lateral',
+            'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);

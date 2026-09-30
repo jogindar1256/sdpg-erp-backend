@@ -16,7 +16,7 @@ return new class extends Migration
             $table->foreignId('application_id')->constrained('student_applications')->cascadeOnDelete();
             $table->string('academic_year', 10);
             $table->integer('semester_no');
-            $table->enum('admission_type', ['regular', 'back_paper', 'upgrade', 'lateral']);
+            $table->enum('admission_type', ['regular', 'back_paper', 'upgrade']);
 
             // Unique admission identifier
             $table->string('admission_no')->unique();

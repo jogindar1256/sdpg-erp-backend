@@ -72,20 +72,6 @@ class ApplicationController extends Controller
             ->orderByDesc('id')
             ->first();
 
-        // Keyed strictly on this application's own direct_registration_id FK
-        // — the same pattern already used correctly by rejectIfCodeInvalid()
-        // and buildApplicationFormPdfData() below. The previous version of
-        // this lookup matched on user_id/mobile/email instead, and for a
-        // FRESH application (student_id is null until admission approval —
-        // by design, see confirmStudentAndCreateAdmission()) neither
-        // $sa->student nor a student viewer exist, so its where(function...)
-        // closure added zero conditions. Laravel drops an empty nested where
-        // group entirely, so the query silently became "grab whichever
-        // direct_registrations row was created most recently, system-wide"
-        // — a different registrant's identity data (name, father's name,
-        // mobile, DOB, etc.) prefilling onto a completely unrelated
-        // application's Part 1. Direct FK lookup can't do that: it either
-        // returns THIS application's own registration or nothing.
         $sa->registration = $sa->direct_registration_id
             ? DB::table('direct_registrations')->where('id', $sa->direct_registration_id)->whereNull('deleted_at')->first()
             : null;
@@ -170,17 +156,27 @@ class ApplicationController extends Controller
             ->select('student_id', 'program_id', DB::raw('MAX(id) as admission_id'))
             ->groupBy('student_id', 'program_id');
 
-        // `students` has no name/father_name/mother_name/dob columns (only
-        // first_name/middle_name/last_name + date_of_birth) — those identity
-        // fields live on direct_registrations. Pull the latest registration
-        // per user via a subquery, same source parseApp() uses.
         $latestReg = DB::table('direct_registrations')
             ->select('user_id', DB::raw('MAX(id) as reg_id'))
             ->whereNull('deleted_at')
             ->groupBy('user_id');
 
+        // students is now a LEFT join — was an inner join, which silently
+        // dropped every 'regular' application from this list.
+        // Identity fields (name/mobile/gender/dob/category/aadhar/abc_id)
+        // now COALESCE across three sources, in priority order:
+        //   1. s.*      — the students row, when one exists (authoritative
+        //                 and current for a returning applicant).
+        //   2. dr.*      — the registration linked via the student's own
+        //                 user_id (works for a returning applicant even
+        //                 before/without a students row in edge cases).
+        //   3. drc.*     — the registration linked directly via
+        //                 sa.direct_registration_id (the ONLY one of the
+        //                 three that works for a fresh application, since
+        //                 fresh apps have no student_id yet, so #1 and #2
+        //                 both resolve to nothing for them).
         $q = DB::table('student_applications as sa')
-            ->join('students as s', 's.id', 'sa.student_id')
+            ->leftJoin('students as s', 's.id', 'sa.student_id')
             ->join('programs as p', 'p.id', 'sa.program_id')
             ->leftJoinSub($latestAdmission, 'la', function ($j) {
                 $j->on('la.student_id', 'sa.student_id')->on('la.program_id', 'sa.program_id');
@@ -205,13 +201,15 @@ class ApplicationController extends Controller
                 's.first_name',
                 's.middle_name',
                 's.last_name',
-                'dr.name',
-                'dr.father_name',
-                'dr.mother_name',
-                's.mobile',
-                's.gender',
-                's.date_of_birth as dob',
-                's.category',
+                DB::raw('COALESCE(dr.name, drc.name) as name'),
+                DB::raw('COALESCE(dr.father_name, drc.father_name) as father_name'),
+                DB::raw('COALESCE(dr.mother_name, drc.mother_name) as mother_name'),
+                DB::raw('COALESCE(s.mobile, dr.mobile, drc.mobile) as mobile'),
+                DB::raw('COALESCE(s.gender, dr.gender, drc.gender) as gender'),
+                DB::raw('COALESCE(s.date_of_birth::text, dr.dob, drc.dob) as dob'),
+                DB::raw('COALESCE(s.category, dr.category, drc.category) as category'),
+                DB::raw('COALESCE(s.aadhar_no, drc.aadhar_no) as aadhar_no'),
+                DB::raw('COALESCE(s.abc_id, drc.abc_id) as abc_id'),
                 'p.short_name as class',
                 'p.full_name',
                 'p.level',
@@ -226,11 +224,18 @@ class ApplicationController extends Controller
             // office-created semester_upgrade flow (storeOffice()) right now
             ->when($req->exam_mode, fn($q, $v) => $q->whereRaw("sa.part_1->>'exam_mode' = ?", [$v]))
             ->when($req->search, fn($q) => $q->where(function ($q2) use ($req) {
+                // Extended to drc (was dr/s only) so a fresh application —
+                // no students row, no dr match via user_id — is still
+                // searchable by its own direct_registrations data.
                 $q2->where('dr.name', 'ilike', "%{$req->search}%")
+                    ->orWhere('drc.name', 'ilike', "%{$req->search}%")
                     ->orWhere('sa.application_no', 'ilike', "%{$req->search}%")
                     ->orWhere('s.mobile', 'ilike', "%{$req->search}%")
+                    ->orWhere('drc.mobile', 'ilike', "%{$req->search}%")
                     ->orWhere('s.aadhar_no', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.abc_id', 'ilike', "%{$req->search}%");
+                    ->orWhere('drc.aadhar_no', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.abc_id', 'ilike', "%{$req->search}%")
+                    ->orWhere('drc.abc_id', 'ilike', "%{$req->search}%");
             }))
             ->orderByDesc('sa.created_at');
 
@@ -294,22 +299,31 @@ class ApplicationController extends Controller
             ->whereNull('deleted_at')
             ->groupBy('user_id');
 
+        // students is a LEFT join — was inner, same bug as index() above:
+        // a fresh application's student_id is null until approval, so this
+        // lookup could never find one by application_no/mobile/aadhar/abc_id
+        // etc. drc (already joined for `code`) is the fallback identity
+        // source, same pattern as index() and baseApplicationQueue().
         $app = DB::table('student_applications as sa')
-            ->join('students as s', 's.id', 'sa.student_id')
+            ->leftJoin('students as s', 's.id', 'sa.student_id')
             ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
             ->where(function ($qb) use ($q) {
                 $qb->where('sa.application_no', $q)
                     ->orWhere('dr.registration_no', $q)
+                    ->orWhere('drc.registration_no', $q)
                     ->orWhere('s.university_roll_no', $q)
                     ->orWhere('s.enrollment_no', $q)
                     ->orWhere('s.mobile', $q)
+                    ->orWhere('drc.mobile', $q)
                     ->orWhere('s.aadhar_no', $q)
-                    ->orWhere('s.abc_id', $q);
+                    ->orWhere('drc.aadhar_no', $q)
+                    ->orWhere('s.abc_id', $q)
+                    ->orWhere('drc.abc_id', $q);
             })
             ->whereNull('sa.deleted_at')
-            ->select('sa.*', 'dr.registration_no', 'drc.unique_code as code')
+            ->select('sa.*', DB::raw('COALESCE(dr.registration_no, drc.registration_no) as registration_no'), 'drc.unique_code as code')
             ->orderByDesc('sa.created_at')
             ->first();
 
@@ -317,7 +331,10 @@ class ApplicationController extends Controller
             return response()->json(['message' => 'No record found.'], 404);
         }
 
-        $student = DB::table('students')->where('id', $app->student_id)->first();
+        // $app->student_id can be null (fresh, pre-approval) — $student
+        // stays null in that case, and every ?-> / ?? read below already
+        // handles that.
+        $student = $app->student_id ? DB::table('students')->where('id', $app->student_id)->first() : null;
         $program = DB::table('programs')->where('id', $app->program_id)->first();
 
         // Only exists once the college has approved this exact application.
@@ -329,8 +346,8 @@ class ApplicationController extends Controller
                 'application_id' => $app->id,
                 'reg_no' => $app->registration_no,
                 'registration_no' => $app->registration_no,
-                'roll_no' => $student->university_roll_no ?? null,
-                'university_roll_no' => $student->university_roll_no ?? null,
+                'roll_no' => $student?->university_roll_no,
+                'university_roll_no' => $student?->university_roll_no,
                 'admission_id' => $admissionRow->id ?? null,
                 'admission_no' => $admissionRow->admission_no ?? null,
             ]),
@@ -431,7 +448,7 @@ class ApplicationController extends Controller
             'student_id' => 'required|exists:students,id',
             'program_id' => 'required|exists:programs,id',
             'academic_year' => 'required|string|max:10',
-            'application_type' => 'required|in:back_paper,semester_upgrade,lateral',
+            'application_type' => 'required|in:back_paper,semester_upgrade',
             'semester_no' => 'nullable|integer|exists:semester_masters,semester_num',
             'paper_ids' => 'nullable|array',
             'selected_subjects' => 'nullable|array',
@@ -588,9 +605,6 @@ class ApplicationController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        // "Information Submitted By" is locked to the logged-in staff member
-        // — whatever the client sends for this is ignored, the server is
-        // the source of truth so the record can't be misattributed.
         $submittedByName = $req->user()->name ?? null;
 
         $app = DB::table('student_applications')->where('id', $id)->whereNull('deleted_at')->first();
@@ -711,13 +725,6 @@ class ApplicationController extends Controller
                 'updated_at' => now(),
             ]);
 
-            // NOTE: students.is_blocked/status are the dedicated Block/Unblock
-            // admin flag (see StudentController/AuthorizationController/
-            // AmendmentController) — releasing a hold must not touch it. It
-            // was never set by placing the hold (see blockRelatedRecords()
-            // below), so there is nothing to undo here, and forcing it to
-            // false could wrongly un-block a student who was separately,
-            // intentionally blocked for an unrelated reason.
         });
 
         return response()->json(['message' => 'Hold released.']);
@@ -797,13 +804,6 @@ class ApplicationController extends Controller
     }
 
     /**
-     * When an approved+paid application is cancelled or held, freeze the
-     * downstream admissions record too — not just the application row. If
-     * an admissions row was already created for this application (it only
-     * exists once approved+paid, via confirmStudentAndCreateAdmission),
-     * lock it to the same status. No-ops silently if no admission was ever
-     * created (nothing to lock yet).
-     *
      * IMPORTANT: this must NOT touch students.is_blocked/status. That flag
      * is a separate, intentional "Block/Unblock" admin action (see
      * StudentController::update()/updateStatus(), AuthorizationController's
@@ -864,9 +864,7 @@ class ApplicationController extends Controller
         $studentId = $app->student_id ?? null;
         if (!$studentId) {
             // A returning applicant (e.g. back_paper/semester_upgrade after
-            // an earlier fresh admission) may already have a confirmed
-            // students row from a previous application by this same user —
-            // reuse it rather than creating a second one.
+            // an earlier fresh admission) may already have a confirmed students row, but student_id was never backfilled on the application.
             $studentId = $app->user_id
                 ? DB::table('students')->where('user_id', $app->user_id)->value('id')
                 : null;
@@ -887,9 +885,8 @@ class ApplicationController extends Controller
         }
 
         $admissionTypeMap = [
-            'fresh' => 'regular',
             'semester_upgrade' => 'upgrade',
-            'lateral' => 'lateral',
+            'regular' => 'regular',
             'back_paper' => 'back_paper',
         ];
         $admissionType = $admissionTypeMap[$app->application_type] ?? 'regular';
@@ -963,28 +960,20 @@ class ApplicationController extends Controller
         $part1 = json_decode($app->part_1 ?? '{}', true) ?: [];
         $part2 = json_decode($app->part_2 ?? '{}', true) ?: [];
 
-        // Part 1 deliberately doesn't re-collect the applicant's own name —
-        // it's "locked" from registration on the frontend (see
-        // Part1Personal.tsx) — so the name/mobile only ever come from
-        // direct_registrations (or the users row as a last resort).
-        $name   = $registration->name ?? $user->name ?? null;
+        $name = $registration->name ?? $user->name ?? null;
         $mobile = $registration->mobile ?? $user->mobile ?? null;
         if (empty($name) || empty($mobile)) {
             return null; // nothing usable to create a real row from
         }
 
-        $parts  = preg_split('/\s+/', trim($name));
-        $first  = array_shift($parts) ?: $name;
-        $last   = $parts ? array_pop($parts) : '';
+        $parts = preg_split('/\s+/', trim($name));
+        $first = array_shift($parts) ?: $name;
+        $last = $parts ? array_pop($parts) : '';
         $middle = $parts ? implode(' ', $parts) : null;
 
-        // gender, date_of_birth, category, and the permanent_* address fields
-        // are all NOT NULL on students — never insert nulls into them, since
-        // the point of this method is to only ever create a row from real,
-        // complete data (submission requires every part filled).
         $genderRaw = $part1['gender'] ?? $registration->gender ?? null;
         $genderMap = ['male' => 'male', 'female' => 'female', 'transgender' => 'other', 'other' => 'other', 'trans' => 'other'];
-        $gender    = $genderMap[strtolower((string) $genderRaw)] ?? 'other';
+        $gender = $genderMap[strtolower((string) $genderRaw)] ?? 'other';
 
         $dobRaw = $part1['date_of_birth'] ?? $registration->dob ?? null;
         $dob = null;
@@ -998,20 +987,17 @@ class ApplicationController extends Controller
 
         $catMap = ['general' => 'general', 'gen' => 'general', 'obc' => 'obc', 'sc' => 'sc', 'st' => 'st', 'ews' => 'ews'];
         $categoryRaw = $part1['social_category'] ?? $registration->category ?? null;
-        $category    = $catMap[strtolower((string) $categoryRaw)] ?? 'general';
+        $category = $catMap[strtolower((string) $categoryRaw)] ?? 'general';
 
         $emailToUse = $registration->email ?? $user->email ?? null;
-        $aadharNo   = $part1['aadhar_no'] ?? $registration->aadhar_no ?? null;
+        $aadharNo = $part1['aadhar_no'] ?? $registration->aadhar_no ?? null;
 
-        $permAddress  = $part2['perm_house_no'] ?? null;
-        $permCity     = $part2['perm_mohalla'] ?? null;
+        $permAddress = $part2['perm_house_no'] ?? null;
+        $permCity = $part2['perm_mohalla'] ?? null;
         $permDistrict = $part2['perm_district'] ?? null;
-        $permState    = $part2['perm_state'] ?? $registration->domestic_state ?? null;
-        $permPin      = $part2['perm_pin_code'] ?? null;
+        $permState = $part2['perm_state'] ?? $registration->domestic_state ?? null;
+        $permPin = $part2['perm_pin_code'] ?? null;
 
-        // If the required-NOT-NULL fields genuinely aren't there (data
-        // integrity problem, not a normal case — submission validates all
-        // of this is filled), bail rather than write bad/garbage data.
         if (!$dob || !$permAddress || !$permCity || !$permDistrict || !$permState || !$permPin) {
             Log::error("createStudentFromApprovedApplication: incomplete data for application {$app->id} (user_id={$app->user_id}) — missing dob and/or permanent address fields. Cannot create students row.");
             return null;
@@ -1021,9 +1007,7 @@ class ApplicationController extends Controller
         // _aadhar_unique_active are global and now live constraints. Two
         // independent applicants can pass every earlier, session/course-
         // scoped registration check and still collide HERE, at approval
-        // time, since students uniqueness has no such scoping. Check first
-        // and abort cleanly (same pattern as the missing-data guard just
-        // above) instead of letting insertGetId() throw a raw exception.
+        // time,
         $conflict = DB::table('students')
             ->whereNull('deleted_at')
             ->where(function ($q) use ($mobile, $emailToUse, $aadharNo) {
@@ -1042,29 +1026,29 @@ class ApplicationController extends Controller
         }
 
         return DB::table('students')->insertGetId([
-            'organization_id'          => $app->organization_id,
-            'user_id'                  => $app->user_id,
-            'first_name'               => $first,
-            'middle_name'               => $middle,
-            'last_name'                => $last ?: $first,
-            'gender'                   => $gender,
-            'date_of_birth'            => $dob,
-            'category'                 => $category,
-            'religion'                 => $part1['religion'] ?? $registration->religion ?? null,
-            'nationality'              => $part1['nationality'] ?? $registration->nationality ?? 'Indian',
-            'aadhar_no'                => $aadharNo,
-            'abc_id'                   => $part1['abc_id'] ?? $registration->abc_id ?? null,
-            'email'                    => $emailToUse,
-            'mobile'                   => $mobile,
-            'permanent_address'        => $permAddress,
-            'permanent_city'           => $permCity,
-            'permanent_district'       => $permDistrict,
-            'permanent_state'          => $permState,
-            'permanent_pin'            => $permPin,
-            'status'                   => 'active',
-            'is_confirmed'             => false, // flipped true right after this returns
-            'created_at'               => now(),
-            'updated_at'               => now(),
+            'organization_id' => $app->organization_id,
+            'user_id' => $app->user_id,
+            'first_name' => $first,
+            'middle_name' => $middle,
+            'last_name' => $last ?: $first,
+            'gender' => $gender,
+            'date_of_birth' => $dob,
+            'category' => $category,
+            'religion' => $part1['religion'] ?? $registration->religion ?? null,
+            'nationality' => $part1['nationality'] ?? $registration->nationality ?? 'Indian',
+            'aadhar_no' => $aadharNo,
+            'abc_id' => $part1['abc_id'] ?? $registration->abc_id ?? null,
+            'email' => $emailToUse,
+            'mobile' => $mobile,
+            'permanent_address' => $permAddress,
+            'permanent_city' => $permCity,
+            'permanent_district' => $permDistrict,
+            'permanent_state' => $permState,
+            'permanent_pin' => $permPin,
+            'status' => 'active',
+            'is_confirmed' => false, // flipped true right after this returns
+            'created_at' => now(),
+            'updated_at' => now(),
         ]);
     }
 
@@ -1110,16 +1094,6 @@ class ApplicationController extends Controller
             return null;
         }
 
-        // Was previously fail-OPEN: a missing registration or a missing
-        // unique_code on it returned null (i.e. let the request through with
-        // no code check at all) on the reasoning of "don't lock the
-        // applicant out over missing data." In practice this only ever
-        // fires on bad/legacy data, since the one and only place a
-        // direct_registrations row is created (StudentRegistrationController
-        // ::initiate()) always generates and stores unique_code — so this
-        // branch was silently waving through exactly the URLs it was built
-        // to block. Now fail-CLOSED: no registration, no code on it, no
-        // code supplied, or a mismatch all reject the same way.
         $registration = DB::table('direct_registrations')->where('id', $sa->direct_registration_id)->first();
         $suppliedCode = (string) $req->query('code', '');
 
@@ -1420,10 +1394,11 @@ class ApplicationController extends Controller
             ->groupBy('student_application_id');
 
         $q = DB::table('student_applications as sa')
-            ->join('students as s', 's.id', 'sa.student_id')
+            ->leftJoin('students as s', 's.id', 'sa.student_id')
             ->join('programs as p', 'p.id', 'sa.program_id')
             ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
+            ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
             ->leftJoinSub($latestDecisionIds, 'ld', 'ld.student_application_id', 'sa.id')
             ->leftJoin('rejected_applications as ra', 'ra.id', 'ld.decision_id')
             ->leftJoin('users as decider', 'decider.id', 'ra.decided_by')
@@ -1456,21 +1431,26 @@ class ApplicationController extends Controller
                 's.first_name',
                 's.middle_name',
                 's.last_name',
-                'dr.name',
-                'dr.father_name',
-                's.mobile',
+                DB::raw('COALESCE(dr.name, drc.name) as name'),
+                DB::raw('COALESCE(dr.father_name, drc.father_name) as father_name'),
+                DB::raw('COALESCE(s.mobile, drc.mobile) as mobile'),
                 's.photo_path',
                 's.signature_path',
                 'p.short_name as class',
                 'p.full_name'
             )
             ->when($req->id, fn($qq) => $qq->where('sa.id', $req->id))
-            ->when($req->code, fn($qq) => $qq->where('dr.unique_code', $req->code))
+            ->when($req->code, fn($qq) => $qq->where(function ($q3) use ($req) {
+                $q3->where('dr.unique_code', $req->code)
+                    ->orWhere('drc.unique_code', $req->code);
+            }))
             ->when($req->search, fn($qq) => $qq->where(function ($q2) use ($req) {
                 $q2->where('sa.application_no', 'ilike', "%{$req->search}%")
                     ->orWhere('ra.ref_no', 'ilike', "%{$req->search}%")
                     ->orWhere('dr.name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.mobile', 'ilike', "%{$req->search}%");
+                    ->orWhere('drc.name', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.mobile', 'ilike', "%{$req->search}%")
+                    ->orWhere('drc.mobile', 'ilike', "%{$req->search}%");
             }))
             ->orderByDesc('sa.updated_at');
 
@@ -1490,7 +1470,8 @@ class ApplicationController extends Controller
             ->get()
             ->groupBy('application_id');
         $resolveDocUrl = function (?string $path) {
-            if (!$path) return null;
+            if (!$path)
+                return null;
             try {
                 return Storage::disk('supabase')->exists($path)
                     ? Storage::disk('supabase')->url($path)
@@ -1559,8 +1540,6 @@ class ApplicationController extends Controller
 
         // The Subject Master (`subjects`) row *is* the paper — it already
         // carries a real code, per-semester marks, credits, and a `type`
-        // (compulsory/optional/elective/practical/project) that tells us
-        // whether it prices against the Practical or Examination fee head.
         $papers = DB::table('subjects as sub')
             ->where('sub.program_id', $programId)
             ->where('sub.semester_no', (int) $req->semester_no)
@@ -1596,7 +1575,7 @@ class ApplicationController extends Controller
         $rows = DB::table('student_applications')
             ->where('student_id', $studentId)
             ->where('program_id', $programId)
-            ->whereIn('application_type', ['fresh', 'semester_upgrade'])
+            ->whereIn('application_type', ['regular', 'semester_upgrade'])
             ->whereNotNull('part_6')
             ->whereNull('deleted_at')
             ->orderByDesc('created_at')
@@ -1657,11 +1636,6 @@ class ApplicationController extends Controller
         $feeHeadIds = $paperRows->pluck('fee_head_id')->filter()->unique()->values()->all();
         [$gender, $category] = $this->feeGenderCategory($sa->student_id);
 
-        // fee_structures is one row per (course + category) with
-        // amount_json holding every particular's amount per gender —
-        // FeeStructure::breakdownFor() picks the row by category, then the
-        // amount_json key by gender, restricted to the selected papers'
-        // fee heads.
         $result = \App\Models\FeeStructure::breakdownFor(
             $sa->program_id,
             $sa->academic_year,
@@ -1697,7 +1671,7 @@ class ApplicationController extends Controller
 
     private function computeApplicationFee(object $sa): array
     {
-        $admissionType = 'regular'; // fresh, semester_upgrade and lateral all price off the 'regular' fee_structures rows
+        $admissionType = 'regular';
         [$gender, $category] = $this->feeGenderCategory($sa->student_id);
 
         $result = \App\Models\FeeStructure::breakdownFor(
@@ -1717,28 +1691,8 @@ class ApplicationController extends Controller
         ];
     }
 
-    /**
-     * Map a student's own gender/category onto fee_structures' values.
-     * $category picks WHICH fee_structures row (category is now real row
-     * identity — one row per course+category); $gender then picks the key
-     * inside that row's amount_json. Two known spelling mismatches across
-     * this schema, both intentional (not bugs to "fix" toward one
-     * spelling):
-     *   - students.gender is 'male'|'female'|'other'; fee_structures'
-     *     amount_json keys (and the Fee Structure UI, and GENDERS in
-     *     lib/genders.tsx) use 'male'|'female'|'transgender'.
-     *     'other' -> 'transgender' here.
-     *   - students.category defaults to the free-text 'general'; the Fee
-     *     Structure UI's category codes are 'gen'|'obc'|'sc'|'st'|'ews'.
-     *     'general' -> 'gen' here.
-     */
     private function feeGenderCategory(?int $studentId): array
     {
-        // studentId is null for any application still in draft/submitted
-        // state — the students row doesn't exist until approval (see
-        // confirmStudentAndCreateAdmission()). Falls back to male/general
-        // below exactly as it already did for a not-found id; this just
-        // stops that fallback from being reached via an uncaught TypeError.
         $student = $studentId ? DB::table('students')->where('id', $studentId)->first() : null;
 
         $gender = strtolower((string) ($student->gender ?? 'male'));
@@ -1750,27 +1704,6 @@ class ApplicationController extends Controller
         return [$gender, $category];
     }
 
-    /**
-     * Shared ownership check for the student-side education-fee pay
-     * endpoints (and reused as the general pattern below).
-     *
-     * Deliberately does NOT gate on student_applications.student_id.
-     * student_id is a post-approval fact (it's only ever set by
-     * confirmStudentAndCreateAdmission(), once the applicant is actually
-     * admitted) — it says nothing about who owns a draft/submitted
-     * application before that point, and gating access on it here is what
-     * caused real applicants to get locked out of (or 500 on) their own
-     * in-progress applications. Ownership before approval is exactly two
-     * things instead:
-     *   1. student_applications.user_id — set directly at creation, see
-     *      store() — the normal case for every application going forward.
-     *   2. direct_registration_id -> direct_registrations.user_id — for
-     *      applications created before the user_id column existed on this
-     *      table, still reachable through the registration they were
-     *      created from (direct_registration_id is backfilled on every
-     *      row — see the 2026-* "Backfill direct_registration_id"
-     *      migration).
-     */
     private function ownedStudentApp(Request $req, $id, ?string $applicationType = null)
     {
         $userId = $req->user()->id;
@@ -1779,11 +1712,11 @@ class ApplicationController extends Controller
             ->where('id', $id)
             ->where(function ($q) use ($userId) {
                 $q->where('user_id', $userId)
-                  ->orWhereIn('direct_registration_id', function ($sub) use ($userId) {
-                      $sub->select('id')->from('direct_registrations')->where('user_id', $userId);
-                  });
+                    ->orWhereIn('direct_registration_id', function ($sub) use ($userId) {
+                        $sub->select('id')->from('direct_registrations')->where('user_id', $userId);
+                    });
             })
-            ->when($applicationType, fn ($q) => $q->where('application_type', $applicationType))
+            ->when($applicationType, fn($q) => $q->where('application_type', $applicationType))
             ->whereNull('deleted_at')
             ->first();
 
@@ -1828,9 +1761,6 @@ class ApplicationController extends Controller
         }
         // Subject selection lives on part_6 only — the old top-level
         // selected_subjects column was always null for real student-
-        // submitted applications, so this gate never actually fired for
-        // the common case. Decode part_6 (raw JSON string here, since $sa
-        // comes from a DB::table() query, not an Eloquent model).
         $part6 = $sa->part_6 ?? null;
         $part6 = is_string($part6) ? (json_decode($part6, true) ?? []) : ($part6 ?? []);
         if (empty($part6['selected_subjects'])) {
@@ -1957,10 +1887,7 @@ class ApplicationController extends Controller
         // Approval already happened (gated above); this is the other half
         // of the "approved AND paid" requirement. confirmStudentAndCreate
         // Admission() now runs FIRST, before the receipt — fee_receipts.
-        // admission_id is a real NOT NULL FK, and there's no reason to
-        // relax that: creating the admission first means a real id is
-        // already there when the receipt row is written, so there's no
-        // create-with-null-then-update step at all.
+        // admission_id is a real NOT NULL FK
         $feeRefId = null;
         $receipt = DB::transaction(function () use ($sa, $fee, $breakdown, $isSelfFinance, $req, &$feeRefId) {
             $this->confirmStudentAndCreateAdmission($sa, (int) $sa->approved_by);
@@ -1986,12 +1913,6 @@ class ApplicationController extends Controller
                 'status' => 'active',
             ]);
 
-            // fee_ref_id: the application's own fee reference code, set once
-            // at successful payment. Course + category + gender + serial(3)
-            // (e.g. BAGENM001) — unlike a fee_structures row, one application
-            // genuinely does belong to one specific student, so all three
-            // segments apply here. AdmissionNumberService::feeRefId() shared
-            // with MasterSettingsController::feeStructureStore().
             $program = DB::table('programs')->where('id', $sa->program_id)->first();
             $student = DB::table('students')->where('id', $sa->student_id)->first();
             $feeRefId = app(\App\Services\AdmissionNumberService::class)
@@ -2505,7 +2426,7 @@ class ApplicationController extends Controller
                 // dr.user_id (the registration it was created from) covers
                 // legacy rows created before that column existed.
                 $q->where('sa.user_id', $userId)
-                  ->orWhere('dr.user_id', $userId);
+                    ->orWhere('dr.user_id', $userId);
             })
             ->whereNull('sa.deleted_at')
             ->when($typeFilter, fn($q) => $q->where('sa.application_type', $typeFilter))
@@ -2549,7 +2470,7 @@ class ApplicationController extends Controller
         $req->validate([
             'program_id' => 'required|exists:programs,id',
             'academic_year' => 'required|string|max:10',
-            'application_type' => 'required|in:fresh,back_paper,semester_upgrade,lateral',
+            'application_type' => 'required|in:regular,back_paper,semester_upgrade',
             'semester_no' => 'nullable|integer|exists:semester_masters,semester_num',
         ]);
 
@@ -2565,13 +2486,13 @@ class ApplicationController extends Controller
         $existing = DB::table('student_applications')
             ->where(function ($q) use ($userId) {
                 $q->where('user_id', $userId)
-                  // Legacy-row fallback — otherwise a returning applicant
-                  // with a pre-refactor draft (no user_id set) would pass
-                  // this check and get a second, duplicate application
-                  // created.
-                  ->orWhereIn('direct_registration_id', function ($sub) use ($userId) {
-                      $sub->select('id')->from('direct_registrations')->where('user_id', $userId);
-                  });
+                    // Legacy-row fallback — otherwise a returning applicant
+                    // with a pre-refactor draft (no user_id set) would pass
+                    // this check and get a second, duplicate application
+                    // created.
+                    ->orWhereIn('direct_registration_id', function ($sub) use ($userId) {
+                        $sub->select('id')->from('direct_registrations')->where('user_id', $userId);
+                    });
             })
             ->where('program_id', $req->program_id)
             ->where('academic_year', $req->academic_year)
@@ -2604,18 +2525,6 @@ class ApplicationController extends Controller
             ->orderByDesc('id')
             ->first();
 
-        // For a fresh applicant this is null (no students row exists yet —
-        // that's the whole point of this design, see the comment above) and
-        // student_id below is null too, filled in later by
-        // confirmStudentAndCreateAdmission(). For back_paper/semester_upgrade/
-        // lateral the applicant is by definition already admitted, so their
-        // students row already exists — recording that real, already-true
-        // relationship here is data population, NOT access control (nothing
-        // above this line, and nothing in ownedStudentApp()/myApplications(),
-        // uses student_id to decide who owns the row). Skipping this lookup
-        // would silently degrade eligibleBackPaperSubjectIds()'s "papers this
-        // student already took" list to "every paper in the program" for
-        // every new back-paper application, for no reason.
         $existingStudent = DB::table('students')->where('user_id', $userId)->first();
 
         $id = DB::table('student_applications')->insertGetId([
@@ -3183,7 +3092,7 @@ class ApplicationController extends Controller
         $session = (int) date('n') >= 7 ? "{$y}-" . ($y + 1) : ($y - 1) . "-{$y}";
 
         $user = $req->user();
-        $type = $req->query('type', 'fresh');
+        $type = $req->query('type', 'regular');
 
         $regRows = DB::table('direct_registrations')
             ->where(function ($q) use ($user) {
@@ -3204,7 +3113,7 @@ class ApplicationController extends Controller
             ]);
         }
 
-        if ($type === 'fresh') {
+        if ($type === 'regular') {
             $programIds = $regRows->pluck('program_id')->filter()->unique()->values()->all();
 
             $programs = DB::table('programs')
