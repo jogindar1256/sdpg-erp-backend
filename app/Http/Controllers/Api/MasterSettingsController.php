@@ -1218,36 +1218,16 @@ class MasterSettingsController extends Controller
         $label   = strtoupper($req->group_label);
         $groupNo = ord($label) - 64;   // A -> 1 (kept for reg/adm compatibility)
 
-        // A subject can only belong to ONE group per class + semester. Letting
-        // the same subject sit in two groups corrupts everything downstream
-        // that assumes a subject->group lookup is unambiguous (registration's
-        // group-based picker resolves a subject's group by searching the
-        // groups array and picks the first match — a duplicate silently
-        // mis-assigns picks to the wrong group and can make a legitimate 3rd
-        // pick look like it's hitting that group's max_select cap). Reject
-        // any submitted subject that's already saved under a DIFFERENT group
-        // for this program+semester (re-saving the SAME group is fine — that
-        // row gets replaced below, not treated as a conflict with itself).
-        // subjects also has its own program_id column, so every predicate
-        // below must be table-qualified once the join is in play — an
-        // unqualified 'program_id'/'semester_no' is ambiguous to Postgres
-        // and errors (SQLSTATE 42702) rather than picking either table.
-        $incomingIds = collect($req->subjects)->pluck('subject_id')->unique()->values();
-        $conflicts = DB::table('subject_selections')
-            ->join('subjects', 'subjects.id', '=', 'subject_selections.subject_id')
-            ->where('subject_selections.program_id', $req->program_id)
-            ->where('subject_selections.semester_no', $req->semester_no)
-            ->where('subject_selections.group_label', '!=', $label)
-            ->whereIn('subject_selections.subject_id', $incomingIds)
-            ->select('subjects.name', 'subject_selections.group_label')
-            ->get();
-        if ($conflicts->isNotEmpty()) {
-            $msgs = $conflicts->map(fn ($c) => "{$c->name} is already in Group {$c->group_label}")->unique()->values();
-            return response()->json([
-                'message' => 'Some subjects are already assigned to another group: ' . $msgs->implode('; '),
-                'errors'  => ['subjects' => $msgs->all()],
-            ], 422);
-        }
+        // Cross-group duplicate check removed per explicit instruction — a
+        // subject is now allowed to sit in more than one group for the same
+        // class+semester. NOTE (carried over, not acted on): the
+        // registration group-based picker resolves a subject's group by
+        // searching the groups array and taking the first match, so if the
+        // same subject now legitimately belongs to two groups, whichever
+        // group happens to come first in that array is the one the picker
+        // will attribute it to. If that turns out to matter in practice,
+        // the picker (not this endpoint) is what needs to become
+        // group-aware rather than subject-aware.
 
         DB::transaction(function () use ($req, $label, $groupNo) {
             // Replace the whole group.

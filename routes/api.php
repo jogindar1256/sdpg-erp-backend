@@ -239,6 +239,9 @@ Route::middleware('auth:sanctum')->group(function () {
             // PUT  /applications/{id}/part/{part}   (office edits any part — no ownership check)
             Route::put('/{id}/part/{part}', [ApplicationController::class, 'updatePartOffice']);
 
+            // POST /applications/{id}/submit   (office final-submit — no ownership check, see submitOffice())
+            Route::post('/{id}/submit', [ApplicationController::class, 'submitOffice']);
+
             // GET  /applications/{id}/print   (full application PDF — completed & fee-paid only)
             Route::get('/{id}/print', [ApplicationController::class, 'printForm']);
 

@@ -36,6 +36,12 @@ class StudentController extends Controller
         if ($request->filled('program_id')) {
             $query->whereHas('currentAdmission', fn($q) => $q->where('program_id', $request->program_id));
         }
+        // A student has no session-year column of their own — the session
+        // is on their current admission (same source AdmissionController::
+        // index() filters on), so this list is scoped the same way.
+        if ($request->filled('academic_year')) {
+            $query->whereHas('currentAdmission', fn($q) => $q->where('academic_year', $request->academic_year));
+        }
 
         $students = $query->orderBy('created_at', 'desc')->paginate($request->get('per_page', 20));
 

@@ -887,6 +887,25 @@ class StudentRegistrationController extends Controller
         $reg = $this->findReg($reg->id); // refresh
         $this->provisionAccount($reg, paid: true);
 
+        // registration_success — this status ('registered') is set in
+        // exactly one place in the whole codebase, right above, so this is
+        // the one true "successfully registered" moment. No students row
+        // exists yet at this point (that's only created much later, at
+        // application approval + fee payment), so the notify target is
+        // built straight from the registration row, same as every other
+        // pre-admission notification in this controller/ApplicationController.
+        $program = $reg->program_id ? DB::table('programs')->where('id', $reg->program_id)->first() : null;
+        app(\App\Services\NotificationService::class)->sendByTrigger(
+            (object) [
+                'id' => null,
+                'organization_id' => $reg->organization_id,
+                'mobile' => $reg->mobile,
+                'email' => $reg->email,
+            ],
+            'registration_success',
+            [$reg->name, $program->short_name ?? ($reg->reg_type ?? ''), $reg->registration_no]
+        );
+
         return response()->json([
             'message' => 'Payment successful. Login credentials have been emailed to you.',
             'registration_id' => $reg->id,

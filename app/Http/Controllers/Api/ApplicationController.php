@@ -136,6 +136,28 @@ class ApplicationController extends Controller
         $sigDoc = $sa->documents->firstWhere('document_type', 'signature');
         $sa->photo_url = $photoDoc->url ?? null;
         $sa->signature_url = $sigDoc->url ?? null;
+        $requiredDocs = $this->buildRequiredDocuments($sa);
+        $sa->required_documents_complete = collect($requiredDocs)
+            ->where('importance', 'important')
+            ->every(fn($d) => $d['uploaded']);
+
+        // Part 5 (Bank Detail) green-check — a Save Draft on this step can
+        // legitimately write an all-empty part_5 (e.g. the "Have you a bank
+        // account?" radio defaults to '' before the applicant ever touches
+        // it, which hides every required field and skips their validation
+        // entirely — see Part5Bank.tsx). So "part_5 exists" is NOT the same
+        // as "bank detail is actually complete": only count it done once the
+        // applicant explicitly said they have no account, or said they do
+        // and filled in every field Part5Bank itself requires in that case.
+        $p5 = is_array($sa->part_5 ?? null) ? $sa->part_5 : [];
+        $sa->bank_detail_complete = ($p5['has_bank_account'] ?? null) === 'no'
+            || (($p5['has_bank_account'] ?? null) === 'yes'
+                && trim((string) ($p5['name_in_account'] ?? '')) !== ''
+                && trim((string) ($p5['bank_name'] ?? '')) !== ''
+                && trim((string) ($p5['bank_branch'] ?? '')) !== ''
+                && trim((string) ($p5['bank_account_no'] ?? '')) !== ''
+                && trim((string) ($p5['bank_ifsc'] ?? '')) !== ''
+                && trim((string) ($p5['branch_address'] ?? '')) !== '');
 
         return $sa;
     }
@@ -150,8 +172,6 @@ class ApplicationController extends Controller
     public function index(Request $req)
     {
         // Latest admission per (student, program) — drives the "paid" flag
-        // (education fee payment status), same source of truth used by
-        // RegistrationController's edu_fee_paid.
         $latestAdmission = DB::table('admissions')
             ->select('student_id', 'program_id', DB::raw('MAX(id) as admission_id'))
             ->groupBy('student_id', 'program_id');
@@ -578,18 +598,49 @@ class ApplicationController extends Controller
             'updated_at' => now(),
         ]);
 
-        $student = DB::table('students')->where('id', $app->student_id)->first();
-        if ($student) {
+        $notifyTarget = $this->resolveNotifyTarget($app);
+        if ($notifyTarget) {
             // application_approved template: {#var#} = application no,
             // {#var#} = the email the fee-payment link goes to.
             app(NotificationService::class)->sendByTrigger(
-                $student,
+                $notifyTarget,
                 'application_approved',
-                [$app->application_no, $student->email]
+                [$app->application_no, $notifyTarget->email]
             );
+        } else {
+            Log::error("approve(): no mobile/email resolvable to notify for application {$id} (student_id=" . ($app->student_id ?? 'null') . ", user_id=" . ($app->user_id ?? 'null') . ") — application_approved not sent.");
         }
 
         return response()->json(['message' => 'Application approved.']);
+    }
+    private function resolveNotifyTarget(object $app): ?object
+    {
+        if ($app->student_id) {
+            $student = DB::table('students')->where('id', $app->student_id)->first();
+            if ($student) return $student;
+        }
+        if ($app->user_id) {
+            $student = DB::table('students')->where('user_id', $app->user_id)->first();
+            if ($student) return $student;
+        }
+
+        $registration = $app->direct_registration_id
+            ? DB::table('direct_registrations')->where('id', $app->direct_registration_id)->first()
+            : null;
+        $user = $app->user_id ? DB::table('users')->where('id', $app->user_id)->first() : null;
+
+        $mobile = $registration->mobile ?? $user->mobile ?? null;
+        $email = $registration->email ?? $user->email ?? null;
+        if (!$mobile && !$email) {
+            return null; // nothing to notify through
+        }
+
+        return (object) [
+            'id' => null,
+            'organization_id' => $app->organization_id,
+            'mobile' => $mobile,
+            'email' => $email,
+        ];
     }
 
     public function rejectOrHold(Request $req, $id)
@@ -646,18 +697,20 @@ class ApplicationController extends Controller
 
         $this->blockRelatedRecords($app, $newStatus, $req->reason, $req->user()?->id);
 
-        $student = DB::table('students')->where('id', $app->student_id)->first();
-        if ($student) {
+        $notifyTarget = $this->resolveNotifyTarget($app);
+        if ($notifyTarget) {
             // application_rejected / application_hold templates both take
             // {#var#} = application no, {#var#} = the reason text. The hold
             // template has no dlt_template_id, so sendByTrigger() sends it
             // by email only, per spec.
             $trigger = $req->decision === 'hold' ? 'application_hold' : 'application_rejected';
             app(NotificationService::class)->sendByTrigger(
-                $student,
+                $notifyTarget,
                 $trigger,
                 [$app->application_no, $req->reason]
             );
+        } else {
+            Log::error("rejectOrHold(): no mobile/email resolvable to notify for application {$id} (student_id=" . ($app->student_id ?? 'null') . ", user_id=" . ($app->user_id ?? 'null') . ") — {$newStatus} notification not sent.");
         }
 
         $decisionLabel = $req->decision === 'hold' ? 'placed on hold' : 'rejected';
@@ -808,13 +861,7 @@ class ApplicationController extends Controller
      * is a separate, intentional "Block/Unblock" admin action (see
      * StudentController::update()/updateStatus(), AuthorizationController's
      * block/unblock action handlers, and AmendmentController's dedicated
-     * block/unblock amendment type) and is the sole condition
-     * AuthController::studentLogin() treats as "login blocked". An
-     * application being rejected, put on hold, or cancelled — or a
-     * registration/education fee being unpaid — is a normal step in the
-     * student's journey, not a reason to lock them out of the account they
-     * need in order to fix it. Conflating the two here previously caused a
-     * rejected/held application to silently lock the student out of login.
+     * block/unblock amendment type)
      */
     public function blockRelatedRecords(object $app, string $newStatus, ?string $reason, ?int $byUserId): void
     {
@@ -858,13 +905,15 @@ class ApplicationController extends Controller
     {
         $existing = DB::table('admissions')->where('application_id', $app->id)->first();
         if ($existing) {
-            return; // already processed (e.g. re-approving after a status bounce)
+            // Already processed (e.g. re-approving after a status bounce) —
+            // still sync $app->student_id in memory (see the note below for
+            // why this matters to the caller) before returning.
+            $app->student_id = $existing->student_id;
+            return;
         }
 
         $studentId = $app->student_id ?? null;
         if (!$studentId) {
-            // A returning applicant (e.g. back_paper/semester_upgrade after
-            // an earlier fresh admission) may already have a confirmed students row, but student_id was never backfilled on the application.
             $studentId = $app->user_id
                 ? DB::table('students')->where('user_id', $app->user_id)->value('id')
                 : null;
@@ -883,6 +932,7 @@ class ApplicationController extends Controller
                 'updated_at' => now(),
             ]);
         }
+        $app->student_id = $studentId;
 
         $admissionTypeMap = [
             'semester_upgrade' => 'upgrade',
@@ -1600,9 +1650,6 @@ class ApplicationController extends Controller
             return $ids;
         }
 
-        // No selection history yet (e.g. office-created back-paper for a
-        // legacy student) — fall back to every subject allotted to the
-        // program so the list is never empty.
         return DB::table('allotted_subjects')
             ->where('program_id', $programId)
             ->pluck('subject_id')
@@ -1610,12 +1657,6 @@ class ApplicationController extends Controller
             ->all();
     }
 
-    /**
-     * fee_heads.code carries a *global* unique constraint in this schema
-     * (see 2024_01_01_000004_create_fee_heads_table), so a code lookup is
-     * organization-agnostic by construction — but we still prefer the
-     * caller's own organization row when more than one happens to exist.
-     */
     private function feeHeadId(string $code, ?int $orgId = null): ?int
     {
         return DB::table('fee_heads')
@@ -1624,13 +1665,6 @@ class ApplicationController extends Controller
             ->value('id');
     }
 
-    /**
-     * Sum the master fee_structures amount for the fee heads implied by the
-     * selected papers (EF always, +PF if any selected paper is Practical),
-     * for (program, academic_year, semester_no, admission_type=back_paper).
-     * Adds the back_paper_schedules late fee when the schedule's window has
-     * closed. Never a hardcoded per-paper amount — entirely master-driven.
-     */
     private function computeBackPaperFee(object $sa, \Illuminate\Support\Collection $paperRows): array
     {
         $feeHeadIds = $paperRows->pluck('fee_head_id')->filter()->unique()->values()->all();
@@ -2511,12 +2545,6 @@ class ApplicationController extends Controller
         $seq = DB::table('student_applications')->count() + 1;
         $appNo = 'SA-' . date('Y') . '-' . str_pad($seq, 6, '0', STR_PAD_LEFT);
 
-        // Match this application back to the student's own active
-        // direct_registrations row for this program + session, so the
-        // registration's unique_code can gate opening the form later. A
-        // student may legitimately have no matching row (e.g. an office-
-        // initiated application, or a legacy flow) — in that case the
-        // application is created without a code gate rather than blocked.
         $registration = DB::table('direct_registrations')
             ->where('user_id', $req->user()->id)
             ->where('program_id', $req->program_id)
@@ -2784,6 +2812,14 @@ class ApplicationController extends Controller
             return response()->json(['message' => "Application is already {$app->status}."], 422);
         }
 
+        $missing = $this->missingPriorParts($app);
+        if ($missing) {
+            return response()->json([
+                'message' => 'Complete every part before final submit. Missing: ' . implode(', ', $missing) . '.',
+                'missing_parts' => $missing,
+            ], 422);
+        }
+
         $part8 = json_decode($app->part_8 ?? '{}', true) ?: [];
         $part8 = array_merge($part8, [
             'declaration_accepted' => true,
@@ -2810,6 +2846,112 @@ class ApplicationController extends Controller
         ]);
     }
 
+    /**
+     * POST /college/applications/{id}/submit
+     * Office-side final submit — same status transition as the student's own
+     * submit() above, minus the student-ownership check (mirrors
+     * updatePartOffice() above it). Needed for office-initiated applications
+     * (see StudentRegistrationController::officeInitApplication()) where
+     * there is no student in the loop to ever click "Final Submit" —
+     * without this, an office-filled application had no way out of 'draft'.
+     */
+    public function submitOffice(Request $req, $id)
+    {
+        $req->validate(['declaration_accepted' => 'required|accepted']);
+
+        $app = DB::table('student_applications')
+            ->where('id', $id)
+            ->whereNull('deleted_at')
+            ->first();
+
+        if (!$app) {
+            return response()->json(['message' => 'Application not found.'], 404);
+        }
+
+        if ($app->status !== 'draft') {
+            return response()->json(['message' => "Application is already {$app->status}."], 422);
+        }
+
+        $missing = $this->missingPriorParts($app);
+        if ($missing) {
+            return response()->json([
+                'message' => 'Complete every part before final submit. Missing: ' . implode(', ', $missing) . '.',
+                'missing_parts' => $missing,
+            ], 422);
+        }
+
+        $part8 = json_decode($app->part_8 ?? '{}', true) ?: [];
+        $part8 = array_merge($part8, [
+            'declaration_accepted' => true,
+            'principal_ack' => (bool) $req->input('principal_ack', $part8['principal_ack'] ?? false),
+            'fact_confirmations' => $req->input('fact_confirmations', $part8['fact_confirmations'] ?? []),
+        ]);
+
+        $prog = json_decode($app->form_progress ?? '{}', true) ?: [];
+        $prog['part8'] = true;
+
+        DB::table('student_applications')->where('id', $id)->update([
+            'status' => 'submitted',
+            'declaration_accepted' => true,
+            'declaration_at' => now(),
+            'part_8' => json_encode($part8),
+            'form_progress' => json_encode($prog),
+            'updated_at' => now(),
+        ]);
+
+        return response()->json([
+            'message' => 'Application submitted successfully.',
+            'application_no' => $app->application_no,
+            'status' => 'submitted',
+        ]);
+    }
+
+    /**
+     * Guard for submit()/submitOffice() — mirrors the frontend's own
+     * priorPartsComplete check (Part8Declaration.tsx / HorizontalStepper's
+     * step-9 unlock) so Final Submit can't be forced past it with a raw API
+     * call. Parts 1-4 and 6 just need to have been saved at least once
+     * (same "touched" definition the stepper itself still uses for those
+     * parts); Bank Detail and Documents use the same real-completeness
+     * checks parseApp() exposes as bank_detail_complete /
+     * required_documents_complete, since "part_5 exists" was exactly the
+     * false-green-tick bug this whole audit started from.
+     *
+     * @return string[] Human-readable list of what's missing (empty = complete).
+     */
+    private function missingPriorParts(object $app): array
+    {
+        $missing = [];
+        $labels = [1 => 'Personal Detail', 2 => 'Address & Communication', 3 => 'Educational Detail', 4 => 'TC & Migration Detail', 6 => 'Subject & Paper Selection'];
+        foreach ($labels as $n => $label) {
+            $col = "part_{$n}";
+            if (empty($app->$col)) {
+                $missing[] = $label;
+            }
+        }
+
+        $p5 = is_array($app->part_5 ?? null) ? $app->part_5 : ($app->part_5 ? json_decode($app->part_5, true) : []);
+        $bankComplete = ($p5['has_bank_account'] ?? null) === 'no'
+            || (($p5['has_bank_account'] ?? null) === 'yes'
+                && trim((string) ($p5['name_in_account'] ?? '')) !== ''
+                && trim((string) ($p5['bank_name'] ?? '')) !== ''
+                && trim((string) ($p5['bank_branch'] ?? '')) !== ''
+                && trim((string) ($p5['bank_account_no'] ?? '')) !== ''
+                && trim((string) ($p5['bank_ifsc'] ?? '')) !== ''
+                && trim((string) ($p5['branch_address'] ?? '')) !== '');
+        if (!$bankComplete) {
+            $missing[] = 'Bank Detail';
+        }
+
+        $requiredDocs = $this->buildRequiredDocuments($app);
+        $docsComplete = collect($requiredDocs)->where('importance', 'important')->every(fn($d) => $d['uploaded']);
+        if (!$docsComplete) {
+            $missing[] = 'Required Documents';
+        }
+
+        return $missing;
+    }
+
     private function buildRequiredDocuments(object $sa): array
     {
         $admissionMode = $sa->application_type === 'back_paper' ? 'Back Paper' : 'Regular';
@@ -2824,8 +2966,13 @@ class ApplicationController extends Controller
             ->orderBy('et.sort_order')
             ->get(['em.condition', 'et.key', 'et.name as document_name']);
 
-        $part1 = $sa->part_1 ? json_decode($sa->part_1, true) : [];
-        $part4 = $sa->part_4 ? json_decode($sa->part_4, true) : [];
+        // part_1/part_4 arrive as a raw JSON string from every direct DB::table
+        // caller of this method (studentRequiredDocuments()/requiredDocumentsOffice()),
+        // but parseApp() below calls this AFTER already json_decode-ing every
+        // part_N column into an array — json_decode() on a non-string throws
+        // a TypeError in PHP 8, so both shapes have to be accepted here.
+        $part1 = is_array($sa->part_1 ?? null) ? $sa->part_1 : ($sa->part_1 ? json_decode($sa->part_1, true) : []);
+        $part4 = is_array($sa->part_4 ?? null) ? $sa->part_4 : ($sa->part_4 ? json_decode($sa->part_4, true) : []);
 
         // "did the student fill the related detail in the application form" —
         // keyword-matched against the admin-typed document_name since Master

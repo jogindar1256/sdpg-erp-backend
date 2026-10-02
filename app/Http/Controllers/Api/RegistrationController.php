@@ -235,7 +235,16 @@ class RegistrationController extends Controller
 
         // Derive pipeline flags for each row.
         $rows = $records->map(function ($r) {
-            $regComplete = $r->reg_status !== 'incomplete';
+            // direct_registrations.status never actually holds the literal value
+        // 'incomplete' in practice for a row that's otherwise fine — the
+        // real values in use are 'pending'/'draft'/'registered'/'incomplete'
+        // (set only on a failed-payment retry path)/'cancelled'. 'registered'
+        // is the one status set on successful payment/registration
+        // completion (see RegistrationController::verify()/markFailed() and
+        // StudentRegistrationController), so that's the actual "complete"
+        // signal — checking merely "!= incomplete" counted pending/draft
+        // rows as complete too.
+        $regComplete = $r->reg_status === 'registered';
             $regFeePaid = $r->reg_payment_status === 'paid';
             $appSubmit = $r->app_status && $r->app_status !== 'draft';
             $approval = match ($r->app_status) {
@@ -577,7 +586,9 @@ class RegistrationController extends Controller
             }
         }
 
-        $regComplete = $reg->status !== 'incomplete';
+        // Same fix as registrationStatus() above — 'registered' is the real
+        // completion status, not merely "not incomplete".
+        $regComplete = $reg->status === 'registered';
         $feePaid = $reg->payment_status === 'paid';
 
         return response()->json([
