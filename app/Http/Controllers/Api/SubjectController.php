@@ -12,7 +12,7 @@ class SubjectController extends Controller
 {
     public function index(Request $request): JsonResponse
     {
-        $query = Subject::with('program:id,short_name,level')
+        $query = Subject::with('program:id,short_name,samarth_code,level')
             ->whereHas('program', fn($q) => $q->where('organization_id', $request->user()->organization_id));
 
         if ($request->filled('program_id'))  $query->where('program_id', $request->program_id);
@@ -49,7 +49,7 @@ class SubjectController extends Controller
 
         $validated['is_active'] = true;
         $subject = Subject::create($validated);
-        return response()->json($subject->load('program:id,short_name'), 201);
+        return response()->json($subject->load('program:id,short_name,samarth_code'), 201);
     }
 
     public function update(Request $request, Subject $subject): JsonResponse

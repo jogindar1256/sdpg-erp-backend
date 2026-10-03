@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
 
 use App\Models\Program;
 use App\Models\Subject;
@@ -24,7 +25,7 @@ class MasterSettingsController extends Controller
     {
         $data = DB::table('application_schedules as s')
             ->join('programs as p', 'p.id', 's.program_id')
-            ->select('s.*', 'p.short_name as class', 'p.full_name')
+            ->select('s.*', 'p.short_name as course', 'p.full_name')
             ->when($req->session_year, fn($q) => $q->where('s.session_year', $req->session_year))
             ->orderBy('s.created_at', 'desc')
             ->paginate(20);
@@ -111,7 +112,7 @@ class MasterSettingsController extends Controller
         // was always empty even though program_id was saved correctly.
         $rows = DB::table('admission_conditions as ac')
             ->join('programs as p', 'p.id', 'ac.program_id')
-            ->select('ac.*', 'p.short_name as class', 'p.full_name', 'p.name as program_name')
+            ->select('ac.*', 'p.short_name as course', 'p.full_name', 'p.name as program_name')
             ->when($req->program_id, fn($q) => $q->where('ac.program_id', $req->program_id))
             ->when($req->session_year, fn($q) => $q->where('ac.session_year', $req->session_year))
             ->orderByDesc('ac.id')
@@ -403,7 +404,7 @@ class MasterSettingsController extends Controller
                 'fee_head_id'    => (int) $feeHeadId,
                 'fee_head'       => $feeHeadNames[$feeHeadId] ?? "Fee Head #{$feeHeadId}",
                 'program_id'     => $first->program_id,
-                'class'          => $programClass,
+                'course'         => $programClass,
                 'semester_no'    => $first->semester_no,
                 'academic_year'  => $first->academic_year,
                 'admission_type' => $first->admission_type,
@@ -715,13 +716,36 @@ class MasterSettingsController extends Controller
 
     private const CLASS_LEVEL_TO_ENUM = ['B.Ed' => 'BEd'];
 
-    public function classMasterIndex()
+    /** SAMARTH code: digits only, unique among live (non soft-deleted)
+     * programs — mirrors the partial unique index on programs.samarth_code. */
+    private function samarthCodeRules($ignoreId = null): array
+    {
+        return [
+            'required', 'string', 'max:20', 'regex:/^[0-9]+$/',
+            Rule::unique('programs', 'samarth_code')->ignore($ignoreId)->whereNull('deleted_at'),
+        ];
+    }
+
+    private const SAMARTH_CODE_MESSAGES = [
+        'samarth_code.required' => 'SAMARTH Code is required.',
+        'samarth_code.regex' => 'SAMARTH Code must contain digits only.',
+        'samarth_code.unique' => 'This SAMARTH Code is already assigned to another course.',
+    ];
+
+    /**
+     * Course list. Inactive courses are excluded by default — this endpoint
+     * feeds every course dropdown in the app. Course Master (and the
+     * name → SAMARTH-code lookup for existing records) pass ?with_inactive=1.
+     */
+    public function classMasterIndex(Request $req)
     {
         return response()->json(
-            Program::orderBy('short_name')->get()->map(function ($p) {
-                $p->status = $p->is_active ? 'Active' : 'Inactive';
-                return $p;
-            })
+            Program::query()
+                ->when(!$req->boolean('with_inactive'), fn($q) => $q->where('is_active', true))
+                ->orderBy('short_name')->get()->map(function ($p) {
+                    $p->status = $p->is_active ? 'Active' : 'Inactive';
+                    return $p;
+                })
         );
     }
 
@@ -731,12 +755,13 @@ class MasterSettingsController extends Controller
             'level' => 'required|in:UG,PG,B.Ed,BEd,Diploma,Certificate',
             'approval_type' => 'required|in:Under Finance,Self Finance',
             'short_name' => 'required|string|max:20|unique:programs,short_name',
+            'samarth_code' => $this->samarthCodeRules(),
             'full_name' => 'required|string|max:255',
             'duration_years' => 'required|integer|min:1',
             'exam_mode' => 'required|in:Regular,Back Paper',
             'total_semesters' => 'required|integer|min:1',
             'status' => 'required|in:Active,Inactive',
-        ]);
+        ], self::SAMARTH_CODE_MESSAGES);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
@@ -747,6 +772,7 @@ class MasterSettingsController extends Controller
             'name' => $req->full_name,
             'full_name' => $req->full_name,
             'short_name' => $req->short_name,
+            'samarth_code' => $req->samarth_code,
             'code' => $this->generateProgramCode($req->short_name),
             'level' => self::CLASS_LEVEL_TO_ENUM[$req->level] ?? $req->level,
             'duration_years' => $req->duration_years,
@@ -766,12 +792,13 @@ class MasterSettingsController extends Controller
             'level' => 'required|in:UG,PG,B.Ed,BEd,Diploma,Certificate',
             'approval_type' => 'required|in:Under Finance,Self Finance',
             'short_name' => 'required|string|max:20|unique:programs,short_name,' . $id,
+            'samarth_code' => $this->samarthCodeRules($id),
             'full_name' => 'required|string|max:255',
             'duration_years' => 'required|integer|min:1',
             'exam_mode' => 'required|in:Regular,Back Paper',
             'total_semesters' => 'required|integer|min:1',
             'status' => 'required|in:Active,Inactive',
-        ]);
+        ], self::SAMARTH_CODE_MESSAGES);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
@@ -779,6 +806,7 @@ class MasterSettingsController extends Controller
             'name' => $req->full_name,
             'full_name' => $req->full_name,
             'short_name' => $req->short_name,
+            'samarth_code' => $req->samarth_code,
             'level' => self::CLASS_LEVEL_TO_ENUM[$req->level] ?? $req->level,
             'duration_years' => $req->duration_years,
             'total_semesters' => $req->total_semesters,
@@ -806,10 +834,56 @@ class MasterSettingsController extends Controller
         return $code;
     }
 
-    public function classMasterDestroy($id)
+    /** Tables holding student records for a course. Every one of them has
+     * ON DELETE CASCADE on program_id, so a hard delete of the course would
+     * silently wipe them — deletion is refused while any of these has rows. */
+    private const COURSE_STUDENT_TABLES = [
+        'admissions' => 'admissions',
+        'student_applications' => 'applications',
+        'direct_registrations' => 'registrations',
+        'semester_registrations' => 'semester registrations',
+        'counselling_reports' => 'counselling records',
+        'examinations' => 'examinations',
+    ];
+
+    /**
+     * Permanent delete (not a soft delete). Requires the logged-in user's
+     * password. Refused while the course has student records — set it
+     * Inactive instead. Course setup rows (subjects, papers, fee structure,
+     * schedules…) are removed with it by the database cascade.
+     */
+    public function classMasterDestroy(Request $req, $id)
     {
-        Program::findOrFail($id)->delete();
-        return response()->json(['message' => 'Deleted.']);
+        $v = Validator::make($req->all(), ['password' => 'required|string']);
+        if ($v->fails())
+            return response()->json(['errors' => ['password' => ['Password is required to delete a course.']]], 422);
+
+        $user = $req->user();
+        if (!$user || !\Illuminate\Support\Facades\Hash::check($req->password, $user->password))
+            return response()->json(['errors' => ['password' => ['Incorrect password.']]], 422);
+
+        $program = Program::findOrFail($id);
+
+        $blocking = [];
+        foreach (self::COURSE_STUDENT_TABLES as $table => $label) {
+            if (!\Illuminate\Support\Facades\Schema::hasTable($table)
+                || !\Illuminate\Support\Facades\Schema::hasColumn($table, 'program_id')) {
+                continue;
+            }
+            $count = DB::table($table)->where('program_id', $id)->count();
+            if ($count > 0) {
+                $blocking[] = "{$count} {$label}";
+            }
+        }
+        if ($blocking) {
+            return response()->json([
+                'message' => "Cannot delete {$program->short_name}: it has " . implode(', ', $blocking)
+                    . '. Set the course to Inactive instead.',
+            ], 409);
+        }
+
+        $program->forceDelete();
+        return response()->json(['message' => 'Course deleted permanently.']);
     }
 
     // 9. Semester Master (READ-ONLY) ──────────────────────────────────
@@ -929,7 +1003,7 @@ class MasterSettingsController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
                 ->join('subjects as s', 's.id', 'a.subject_id')
                 ->select(
-                    'a.*', 'p.short_name as class', 'p.full_name', 'p.level', 'p.approval_type',
+                    'a.*', 'p.short_name as course', 'p.full_name', 'p.level', 'p.approval_type',
                     's.name as subject_name', 's.has_practical', 's.practical_fee'
                 )
                 ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
@@ -966,6 +1040,11 @@ class MasterSettingsController extends Controller
     // subject_papers real columns: program_id, subject_id, session_year,
     // semester_no, paper_type, paper_name, group_no, max_marks, min_marks,
     // plus paper_code
+    // paper_type is Theory / Practical, set per paper row. The request-level
+    // paper_type (Configuration panel) is only the default for rows that
+    // don't carry their own.
+    private const PAPER_TYPES = ['Theory', 'Practical'];
+
     private function programIsBsc($program): bool
     {
         if (!$program) return false;
@@ -982,7 +1061,7 @@ class MasterSettingsController extends Controller
                 // subject_papers row from this list.
                 ->leftJoin('programs as p', 'p.id', 'sp.program_id')
                 ->leftJoin('subjects as s', 's.id', 'sp.subject_id')
-                ->select('sp.*', 'p.short_name as class', 's.name as subject_name')
+                ->select('sp.*', 'p.short_name as course', 'p.samarth_code', 's.name as subject_name')
                 ->when($req->program_id, fn($q) => $q->where('sp.program_id', $req->program_id))
                 ->when($req->semester_no, fn($q) => $q->where('sp.semester_no', $req->semester_no))
                 ->when($req->session_year, fn($q) => $q->where('sp.session_year', $req->session_year))
@@ -1001,11 +1080,12 @@ class MasterSettingsController extends Controller
             'subject_id' => 'required|exists:subjects,id',
             'session_year' => 'required|string',
             'semester_no' => 'required|string',
-            'paper_type' => 'required|string',
+            'paper_type' => ['nullable', Rule::in(self::PAPER_TYPES)],
             'group_label' => 'nullable|string|max:50',
             'papers' => 'required|array|min:1',
             'papers.*.paper_code' => 'nullable|string|max:50',
             'papers.*.paper_name' => 'required|string',
+            'papers.*.paper_type' => ['nullable', Rule::in(self::PAPER_TYPES)],
             'papers.*.max_marks' => 'nullable|integer|min:1',
             'papers.*.min_marks' => 'nullable|integer|min:0',
         ]);
@@ -1027,7 +1107,7 @@ class MasterSettingsController extends Controller
                 'subject_id' => $req->subject_id,
                 'session_year' => $req->session_year,
                 'semester_no' => $req->semester_no,
-                'paper_type' => $req->paper_type,
+                'paper_type' => ($p['paper_type'] ?? null) ?: ($req->paper_type ?: 'Theory'),
                 'paper_code' => $p['paper_code'] ?? null,
                 'paper_name' => $p['paper_name'],
                 'group_no' => null,
@@ -1049,6 +1129,7 @@ class MasterSettingsController extends Controller
         $v = Validator::make($req->all(), [
             'paper_code' => 'nullable|string|max:50',
             'paper_name' => 'required|string',
+            'paper_type' => ['nullable', Rule::in(self::PAPER_TYPES)],
             'group_label' => 'nullable|string|max:50',
             'max_marks' => 'nullable|integer|min:1',
             'min_marks' => 'nullable|integer|min:0',
@@ -1065,6 +1146,10 @@ class MasterSettingsController extends Controller
         ];
         if ($req->has('group_label')) {
             $update['group_label'] = $req->group_label ?: null;
+        }
+        // Only touch paper_type when the caller actually sent one.
+        if ($req->filled('paper_type')) {
+            $update['paper_type'] = $req->paper_type;
         }
 
         DB::table('subject_papers')->where('id', $id)->update($update);
@@ -1126,7 +1211,7 @@ class MasterSettingsController extends Controller
 
             return response()->streamDownload(
                 fn () => print($pdf->output()),
-                "Subject-Paper-Master-{$program->short_name}-Sem{$req->semester_no}.pdf",
+                "Subject-Paper-Master-" . Program::fileSlug($program) . "-Sem{$req->semester_no}.pdf",
                 ['Content-Type' => 'application/pdf']
             );
         } catch (\Throwable $e) {
@@ -1142,7 +1227,7 @@ class MasterSettingsController extends Controller
             DB::table('subject_seats as ss')
                 ->join('programs as p', 'p.id', 'ss.program_id')
                 ->join('subjects as s', 's.id', 'ss.subject_id')
-                ->select('ss.*', 'p.short_name as class', 'p.full_name', 's.name as subject_name')
+                ->select('ss.*', 'p.short_name as course', 'p.full_name', 's.name as subject_name')
                 ->when($req->program_id, fn($q) => $q->where('ss.program_id', $req->program_id))
                 ->get()
         );
@@ -1185,7 +1270,7 @@ class MasterSettingsController extends Controller
         $class  = DB::table('programs')->where('id', $req->program_id)->value('short_name');
 
         return response()->json([
-            'class'        => $class,
+            'course'       => $class,
             'semester_no'  => $req->semester_no,
             'total_groups' => count($groups),
             'groups'       => $groups,
@@ -1217,17 +1302,6 @@ class MasterSettingsController extends Controller
 
         $label   = strtoupper($req->group_label);
         $groupNo = ord($label) - 64;   // A -> 1 (kept for reg/adm compatibility)
-
-        // Cross-group duplicate check removed per explicit instruction — a
-        // subject is now allowed to sit in more than one group for the same
-        // class+semester. NOTE (carried over, not acted on): the
-        // registration group-based picker resolves a subject's group by
-        // searching the groups array and taking the first match, so if the
-        // same subject now legitimately belongs to two groups, whichever
-        // group happens to come first in that array is the one the picker
-        // will attribute it to. If that turns out to matter in practice,
-        // the picker (not this endpoint) is what needs to become
-        // group-aware rather than subject-aware.
 
         DB::transaction(function () use ($req, $label, $groupNo) {
             // Replace the whole group.
@@ -1306,7 +1380,7 @@ class MasterSettingsController extends Controller
 
             return response()->streamDownload(
                 fn () => print($pdf->output()),
-                "Subject-Selection-Master-{$program->short_name}.pdf",
+                "Subject-Selection-Master-" . Program::fileSlug($program) . ".pdf",
                 ['Content-Type' => 'application/pdf']
             );
         } catch (\Throwable $e) {
@@ -1401,7 +1475,7 @@ class MasterSettingsController extends Controller
         return response()->json(
             DB::table('vocational_papers as vp')
                 ->leftJoin('programs as p', 'p.id', 'vp.program_id')
-                ->select('vp.*', 'p.short_name as class')
+                ->select('vp.*', 'p.short_name as course')
                 ->when($req->program_id, fn($q) => $q->where('vp.program_id', $req->program_id))
                 ->when($req->semester_no, fn($q) => $q->where('vp.semester_no', $req->semester_no))
                 ->when($req->session_year, fn($q) => $q->where('vp.session_year', $req->session_year))
@@ -1410,13 +1484,6 @@ class MasterSettingsController extends Controller
         );
     }
 
-    /**
-     * Batch save — the office picks a Group (via Prev./Next Group nav),
-     * sets Group Name / Max. Select / Min Select once for that group, fills
-     * several Paper Code / Paper Name rows, then hits Save once. Every row
-     * lands in the group number the office is currently viewing — group_no
-     * here is chosen by the office (via navigation), never auto-incremented.
-     */
     public function vocationalPaperStore(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -1527,7 +1594,7 @@ class MasterSettingsController extends Controller
 
             return response()->streamDownload(
                 fn () => print($pdf->output()),
-                "Vocational-Paper-Master-{$program->short_name}-Sem{$req->semester_no}.pdf",
+                "Vocational-Paper-Master-" . Program::fileSlug($program) . "-Sem{$req->semester_no}.pdf",
                 ['Content-Type' => 'application/pdf']
             );
         } catch (\Throwable $e) {
@@ -1650,11 +1717,11 @@ class MasterSettingsController extends Controller
             'mother_name' => 'required|string|max:255',
             'gender' => 'required|in:Male,Female,Transgender',
             'social_category' => 'required|in:General,OBC,SC,ST,EWS',
-            'admission_category' => 'required|in:Regular,Private',
+            'admission_category' => 'required|in:General,OBC,SC,ST,EWS',
+            'admission_type' => 'required|in:Regular,Private',
             'state_rank' => 'required|integer',
             'category_rank' => 'nullable|integer',
             'cut_off_mark' => 'nullable|numeric',
-            'allotment_no' => 'nullable|string',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);

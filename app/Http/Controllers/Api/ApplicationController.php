@@ -230,7 +230,7 @@ class ApplicationController extends Controller
                 DB::raw('COALESCE(s.category, dr.category, drc.category) as category'),
                 DB::raw('COALESCE(s.aadhar_no, drc.aadhar_no) as aadhar_no'),
                 DB::raw('COALESCE(s.abc_id, drc.abc_id) as abc_id'),
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.full_name',
                 'p.level',
                 'adm.payment_status as edu_payment_status',
@@ -278,8 +278,6 @@ class ApplicationController extends Controller
             // "Completed" = final-submitted (or further along the pipeline).
             $row->completed = !in_array($row->status, ['draft', 'cancelled'], true);
             // "Paid" — back paper applications track their own exam fee
-            // (sa.fee_paid); every other type is gated on the education fee
-            // paid against the linked admission record.
             $row->paid = $row->application_type === 'back_paper'
                 ? (bool) $row->fee_paid
                 : $row->edu_payment_status === 'paid';
@@ -319,11 +317,6 @@ class ApplicationController extends Controller
             ->whereNull('deleted_at')
             ->groupBy('user_id');
 
-        // students is a LEFT join — was inner, same bug as index() above:
-        // a fresh application's student_id is null until approval, so this
-        // lookup could never find one by application_no/mobile/aadhar/abc_id
-        // etc. drc (already joined for `code`) is the fallback identity
-        // source, same pattern as index() and baseApplicationQueue().
         $app = DB::table('student_applications as sa')
             ->leftJoin('students as s', 's.id', 'sa.student_id')
             ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
@@ -424,7 +417,7 @@ class ApplicationController extends Controller
             ->where('a.student_id', $student->id)
             ->where('a.status', 'active')
             ->orderByDesc('a.id')
-            ->select('a.*', 'p.short_name as class', 'p.full_name', 'p.level', 'p.total_semesters')
+            ->select('a.*', 'p.short_name as course', 'p.full_name', 'p.level', 'p.total_semesters')
             ->first();
 
         if (!$admission) {
@@ -1486,7 +1479,7 @@ class ApplicationController extends Controller
                 DB::raw('COALESCE(s.mobile, drc.mobile) as mobile'),
                 's.photo_path',
                 's.signature_path',
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.full_name'
             )
             ->when($req->id, fn($qq) => $qq->where('sa.id', $req->id))
@@ -1918,10 +1911,6 @@ class ApplicationController extends Controller
             'amount' => $b['amount'],
         ])->values()->all();
 
-        // Approval already happened (gated above); this is the other half
-        // of the "approved AND paid" requirement. confirmStudentAndCreate
-        // Admission() now runs FIRST, before the receipt — fee_receipts.
-        // admission_id is a real NOT NULL FK
         $feeRefId = null;
         $receipt = DB::transaction(function () use ($sa, $fee, $breakdown, $isSelfFinance, $req, &$feeRefId) {
             $this->confirmStudentAndCreateAdmission($sa, (int) $sa->approved_by);
@@ -2455,10 +2444,6 @@ class ApplicationController extends Controller
             ->leftJoinSub($latestDecisionIds, 'ld', 'ld.student_application_id', 'sa.id')
             ->leftJoin('rejected_applications as ra', 'ra.id', 'ld.decision_id')
             ->where(function ($q) use ($userId) {
-                // No student_id here — see ownedStudentApp()'s doc comment.
-                // sa.user_id covers every application going forward;
-                // dr.user_id (the registration it was created from) covers
-                // legacy rows created before that column existed.
                 $q->where('sa.user_id', $userId)
                     ->orWhere('dr.user_id', $userId);
             })
@@ -2846,15 +2831,6 @@ class ApplicationController extends Controller
         ]);
     }
 
-    /**
-     * POST /college/applications/{id}/submit
-     * Office-side final submit — same status transition as the student's own
-     * submit() above, minus the student-ownership check (mirrors
-     * updatePartOffice() above it). Needed for office-initiated applications
-     * (see StudentRegistrationController::officeInitApplication()) where
-     * there is no student in the loop to ever click "Final Submit" —
-     * without this, an office-filled application had no way out of 'draft'.
-     */
     public function submitOffice(Request $req, $id)
     {
         $req->validate(['declaration_accepted' => 'required|accepted']);
@@ -2911,12 +2887,6 @@ class ApplicationController extends Controller
      * priorPartsComplete check (Part8Declaration.tsx / HorizontalStepper's
      * step-9 unlock) so Final Submit can't be forced past it with a raw API
      * call. Parts 1-4 and 6 just need to have been saved at least once
-     * (same "touched" definition the stepper itself still uses for those
-     * parts); Bank Detail and Documents use the same real-completeness
-     * checks parseApp() exposes as bank_detail_complete /
-     * required_documents_complete, since "part_5 exists" was exactly the
-     * false-green-tick bug this whole audit started from.
-     *
      * @return string[] Human-readable list of what's missing (empty = complete).
      */
     private function missingPriorParts(object $app): array
@@ -2965,18 +2935,9 @@ class ApplicationController extends Controller
             ->where('et.is_active', true)
             ->orderBy('et.sort_order')
             ->get(['em.condition', 'et.key', 'et.name as document_name']);
-
-        // part_1/part_4 arrive as a raw JSON string from every direct DB::table
-        // caller of this method (studentRequiredDocuments()/requiredDocumentsOffice()),
-        // but parseApp() below calls this AFTER already json_decode-ing every
-        // part_N column into an array — json_decode() on a non-string throws
-        // a TypeError in PHP 8, so both shapes have to be accepted here.
         $part1 = is_array($sa->part_1 ?? null) ? $sa->part_1 : ($sa->part_1 ? json_decode($sa->part_1, true) : []);
         $part4 = is_array($sa->part_4 ?? null) ? $sa->part_4 : ($sa->part_4 ? json_decode($sa->part_4, true) : []);
 
-        // "did the student fill the related detail in the application form" —
-        // keyword-matched against the admin-typed document_name since Master
-        // Settings has no formal link to a specific part/field.
         $isFilled = function (string $name) use ($part1, $part4): bool {
             $n = strtolower($name);
             if (str_contains($n, 'migration'))
@@ -3267,7 +3228,7 @@ class ApplicationController extends Controller
                 ->where('is_active', true)
                 ->whereNull('deleted_at')
                 ->whereIn('id', $programIds)
-                ->select('id', 'name', 'short_name', 'level', 'duration_years')
+                ->select('id', 'name', 'short_name', 'samarth_code', 'level', 'duration_years')
                 ->orderBy('name')
                 ->get();
 
@@ -3284,7 +3245,7 @@ class ApplicationController extends Controller
             ->where('is_active', true)
             ->whereNull('deleted_at')
             ->whereIn('level', $levels)
-            ->select('id', 'name', 'short_name', 'level', 'duration_years')
+            ->select('id', 'name', 'short_name', 'samarth_code', 'level', 'duration_years')
             ->orderBy('level')->orderBy('name')
             ->get();
 
@@ -3317,7 +3278,7 @@ class ApplicationController extends Controller
                 's.aadhar_no',
                 's.abc_id',
                 's.ddurn',
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.full_name',
                 'p.level'
             )

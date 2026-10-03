@@ -24,7 +24,7 @@
     $collegeAddr = trim(implode(', ', array_filter([$org->address ?? 'Math-Lar', $org->district ?? 'Deoria'])))
         . ' (' . ($org->state ?? 'Uttar Pradesh') . ') ' . ($org->pin_code ?? '');
     $affiliation = $org->university_name ?? 'Deen Dayal Upadhyay Gorakhpur University, Gorakhpur';
-    $course = $program->full_name ?? $program->short_name ?? $reg->reg_type;
+    $course = \App\Models\Program::label($program) ?? $reg->reg_type;
     $subjectNames = collect($subjects ?? [])->filter()->values();
 @endphp
 <!DOCTYPE html>

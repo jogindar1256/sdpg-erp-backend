@@ -48,7 +48,7 @@ class RegistrationController extends Controller
                 'a.roll_no',
                 'a.account_no',
                 'a.enrollment_no',
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.full_name',
                 'p.level'
             )
@@ -212,7 +212,7 @@ class RegistrationController extends Controller
                 'dr.paid_at as reg_paid_at',
                 'dr.reg_date',
                 'dr.created_at',
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.level',
                 'sa.id as application_id',
                 // student_applications has no code/unique_code column of its
@@ -309,7 +309,7 @@ class RegistrationController extends Controller
         $classes = DB::table('programs')
             ->where('is_active', true)
             ->whereNull('deleted_at')
-            ->select('id', 'short_name', 'level')
+            ->select('id', 'short_name', 'samarth_code', 'level')
             ->orderBy('level')->orderBy('short_name')
             ->get();
 
@@ -365,7 +365,7 @@ class RegistrationController extends Controller
                 's.mobile',
                 's.gender',
                 's.date_of_birth',
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.full_name',
                 'p.level',
                 'sr.id as reg_id',
@@ -565,7 +565,7 @@ class RegistrationController extends Controller
                 'dr.receipt_no',
                 'dr.updated_at',
                 'dr.program_id',
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.full_name as program_name'
             )
             ->first();
@@ -599,7 +599,7 @@ class RegistrationController extends Controller
                 'name' => $reg->name,
                 'father_name' => $reg->father_name,
                 'dob' => $reg->dob,
-                'class' => $reg->class,
+                'course' => $reg->course,
                 'program_id' => $reg->program_id,
                 'program_name' => $reg->program_name,
                 'semester' => $semester,

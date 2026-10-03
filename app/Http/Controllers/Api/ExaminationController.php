@@ -72,7 +72,7 @@ class ExaminationController extends Controller
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
-            ->select(array_merge(['ef.*', 's.university_roll_no as roll_no', 'a.account_no', 'p.short_name as class'], $this->identitySelect()))
+            ->select(array_merge(['ef.*', 's.university_roll_no as roll_no', 'a.account_no', 'p.short_name as course'], $this->identitySelect()))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
@@ -121,7 +121,7 @@ class ExaminationController extends Controller
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
-            ->select(array_merge(['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as class'], $this->identitySelect()))
+            ->select(array_merge(['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'], $this->identitySelect()))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
@@ -152,7 +152,7 @@ class ExaminationController extends Controller
             DB::table('exam_schedules as es')
                 ->join('subjects as sub', 'sub.id', 'es.subject_id')
                 ->join('programs as p', 'p.id', 'es.program_id')
-                ->select('es.*', 'sub.name as subject_name', 'p.short_name as class')
+                ->select('es.*', 'sub.name as subject_name', 'p.short_name as course')
                 ->where('es.session_year', $req->session_year ?? $this->sessionYear())
                 ->when($req->program_id,  fn($q) => $q->where('es.program_id',  $req->program_id))
                 ->when($req->semester_no, fn($q) => $q->where('es.semester_no', $req->semester_no))
@@ -195,7 +195,7 @@ class ExaminationController extends Controller
         $q = DB::table('exam_schedules as es')
             ->join('subjects as sub', 'sub.id', 'es.subject_id')
             ->join('programs as p', 'p.id', 'es.program_id')
-            ->select('es.*', 'sub.name as subject_name', 'p.short_name as class')
+            ->select('es.*', 'sub.name as subject_name', 'p.short_name as course')
             ->where('es.session_year', $req->session_year ?? $this->sessionYear());
 
         if ($req->search_by === 'date') {
@@ -370,7 +370,7 @@ class ExaminationController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
             ->where('s.university_roll_no', $req->roll_no)
-            ->select(array_merge(['a.*', 's.mobile', 's.permanent_address as address', 'p.short_name as class'], $this->identitySelect()))
+            ->select(array_merge(['a.*', 's.mobile', 's.permanent_address as address', 'p.short_name as course'], $this->identitySelect()))
             ->first();
 
         if (!$admission) return response()->json(['message' => 'Student not found.'], 404);
@@ -584,7 +584,7 @@ class ExaminationController extends Controller
         )
             ->select(array_merge(
                 ['ef.*', 's.gender', 's.date_of_birth as dob', 's.university_roll_no as roll_no',
-                 's.enrollment_no', 'p.short_name as class', 'efp.paper_code'],
+                 's.enrollment_no', 'p.short_name as course', 'efp.paper_code'],
                 $this->identitySelect()
             ))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
@@ -625,7 +625,7 @@ class ExaminationController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
             ->select(array_merge(
-                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as class'],
+                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'],
                 $this->identitySelect()
             ))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
@@ -676,7 +676,7 @@ class ExaminationController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
             ->select(array_merge(
-                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as class'],
+                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'],
                 $this->identitySelect()
             ))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
@@ -711,7 +711,7 @@ class ExaminationController extends Controller
             ->join('admissions as a', 'a.id', 'ef.admission_id')
             ->join('students as s', 's.id', 'a.student_id')
             ->join('programs as p', 'p.id', 'a.program_id')
-            ->select('p.short_name as class', 'p.level', 's.gender', DB::raw('count(*) as total'))
+            ->select('p.short_name as course', 'p.level', 's.gender', DB::raw('count(*) as total'))
             ->where('ef.session_year', $sessionYear)
             ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
             ->where('ef.status', 'Accepted')
@@ -731,7 +731,7 @@ class ExaminationController extends Controller
             ->join('students as s', 's.id', 'a.student_id')
             ->join('programs as p', 'p.id', 'a.program_id')
             ->join('subjects as sub', 'sub.id', 'efp.subject_id')
-            ->select('p.short_name as class', 'sub.name as subject', 'efp.exam_type', DB::raw('count(*) as total'))
+            ->select('p.short_name as course', 'sub.name as subject', 'efp.exam_type', DB::raw('count(*) as total'))
             ->where('ef.session_year', $sessionYear)
             ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
@@ -793,7 +793,7 @@ class ExaminationController extends Controller
                 ->leftJoin('exam_form_papers as efp', 'efp.exam_form_id', 'ef.id')
         )
             ->select(array_merge(
-                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'p.short_name as class', 'efp.paper_code'],
+                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'p.short_name as course', 'efp.paper_code'],
                 $this->identitySelect()
             ))
             ->where('ef.center_code', $req->center_code)
@@ -816,7 +816,7 @@ class ExaminationController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
             ->where('s.university_roll_no', $req->roll_no)
-            ->select(array_merge(['a.*', 's.mobile', 's.permanent_address as address', 'p.short_name as class'], $this->identitySelect()))
+            ->select(array_merge(['a.*', 's.mobile', 's.permanent_address as address', 'p.short_name as course'], $this->identitySelect()))
             ->first();
 
         if (!$admission) return response()->json(['message' => 'Not found.'], 404);

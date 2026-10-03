@@ -64,7 +64,7 @@
         default            => $val(null),
     };
 
-    $courseName = $program->full_name ?? $program->short_name ?? null;
+    $courseName = \App\Models\Program::label($program);
 
     $majorSubjects = collect([
         $p6['major_subject_1'] ?? null,

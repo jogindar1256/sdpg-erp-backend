@@ -83,7 +83,7 @@ class AmendmentController extends Controller
                 's.abc_id',
                 's.ddurn',
                 's.permanent_address as address',
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.full_name',
                 'p.level',
                 'sa.application_no',
@@ -165,7 +165,7 @@ class AmendmentController extends Controller
                 's.aadhar_no',
                 's.abc_id',
                 's.ddurn',
-                'p.short_name as class',
+                'p.short_name as course',
                 'p.level',
                 'sa.application_no',
                 'dr.registration_no as reg_no',
@@ -557,10 +557,7 @@ class AmendmentController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function updateMobileGet(Request $req)
     {
-        // update-mobile/page.tsx doesn't call this GET either — it gets
-        // `student` from the default /amendments/search lookup and posts
-        // straight to send-otp/update-mobile. Same dead-code param bug as
-        // blockUnblockGet; fixed for consistency in case it's ever wired up.
+
         $v = Validator::make($req->all(), ['student_id' => 'required|string']);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -704,7 +701,11 @@ class AmendmentController extends Controller
         // Get all papers for program+semester
         $papers = DB::table('subject_papers as sp')
             ->join('subjects as sub', 'sub.id', 'sp.subject_id')
+            // Was missing the program filter — returned every program's
+            // papers for that semester number — and ignored paper_type.
+            ->where('sp.program_id', $req->program_id)
             ->when($req->subject_id, fn($q) => $q->where('sp.subject_id', $req->subject_id))
+            ->when($req->paper_type, fn($q) => $q->where('sp.paper_type', $req->paper_type))
             ->where('sp.semester_no', $req->semester_no)
             ->select('sp.*', 'sub.name as subject_name')
             ->get();
@@ -784,6 +785,7 @@ class AmendmentController extends Controller
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->leftJoinSub($latestApp, 'la', 'la.student_id', 's.id')
             ->leftJoin('student_applications as sa', 'sa.id', 'la.app_id')
+            ->leftJoin('programs as p', 'p.id', 'a.program_id')
             ->where('a.program_id', $req->program_id)
             ->when(
                 $req->semester_no && $req->semester_no !== 'All',
@@ -799,7 +801,8 @@ class AmendmentController extends Controller
                 's.last_name',
                 'dr.name',
                 's.mobile',
-                'sa.application_no'
+                'sa.application_no',
+                'p.short_name as course'
             )
             ->orderBy('a.roll_no')
             ->get();
@@ -934,12 +937,6 @@ class AmendmentController extends Controller
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
-        // The frontend also expects a `portal_fees` key (not `fees`), with
-        // each row shaped as fee_type/amount/paid_amount/status/receipt_no —
-        // it renders f.fee_type, f.amount, f.paid_amount, f.status,
-        // f.receipt_no directly. Mapped 1:1 from real fee_receipts columns
-        // (receipt_type/total_amount/net_amount/fee_status/receipt_no); no
-        // invented data.
         $fees = DB::table('fee_receipts')
             ->where('admission_id', $student->admission_id)
             ->orderByDesc('id')
@@ -1050,7 +1047,7 @@ class AmendmentController extends Controller
                 'dr.name',
                 'dr.father_name',
                 's.mobile',
-                'p.short_name as class'
+                'p.short_name as course'
             )
             ->orderByDesc('sr.created_at')
             ->get();
@@ -1079,10 +1076,7 @@ class AmendmentController extends Controller
 
         DB::table('student_restrictions')->insert([
             'student_id' => $req->student_id,
-            // 'reason' is a fixed dropdown value (RESTRICTION_REASONS on the
-            // frontend) — left as-is so it still matches the option list on
-            // redisplay. 'other_reason' is a long free-text explanation the
-            // frontend deliberately keeps mixed-case for readability.
+            // 'reason' is a fixed dropdown value (RESTRICTION_REASONS on the frontend) — left as-is so it still matches the option list on redisplay.
             'reason' => $req->reason,
             'other_reason' => $req->other_reason,
             'restriction_by' => TextNormalizer::upperValue($req->restriction_by),
@@ -1138,7 +1132,7 @@ class AmendmentController extends Controller
                 'receipt_date' => $fee->receipt_date ?? null,
                 'deposited_amount' => (float) ($fee->net_amount ?? 0),
                 'session' => $student->academic_year,
-                'class_name' => $student->class,
+                'class_name' => $student->course,
             ],
         ]);
     }
@@ -1211,9 +1205,6 @@ class AmendmentController extends Controller
             return response()->json(['errors' => $v->errors()], 422);
 
         DB::table('admissions')->where('id', $req->admission_id)->update([
-            // 'reason' is a fixed dropdown value (CANCEL_REASONS) on the
-            // frontend — left as-is, not uppercased, so it matches the
-            // option list on redisplay (same rule as blockUnblockStore()).
             'status' => 'cancelled',
             'cancel_reason' => $req->reason,
             'cancel_date' => $req->cancel_date,
@@ -1263,7 +1254,7 @@ class AmendmentController extends Controller
                 'dr.name',
                 'dr.father_name',
                 's.mobile',
-                'p.short_name as class'
+                'p.short_name as course'
             )
             ->orderByDesc('ap.updated_at');
 

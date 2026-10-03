@@ -122,7 +122,7 @@ class FeesController extends Controller
             'data'    => $data,
             'meta'    => ['total' => $total, 'last_page' => (int) ceil($total / $perPage), 'per_page' => $perPage],
             'summary' => $summary,
-            'classes' => DB::table('programs')->where('is_active', true)->select('id', 'short_name as name')->orderBy('short_name')->get(),
+            'classes' => DB::table('programs')->where('is_active', true)->whereNull('deleted_at')->select('id', 'short_name as name')->orderBy('short_name')->get(),
         ]);
     }
 
@@ -149,7 +149,7 @@ class FeesController extends Controller
         return response()->json([
             'data'    => $data,
             'summary' => $summary,
-            'classes' => DB::table('programs')->where('is_active', true)->select('id', 'short_name as name')->orderBy('short_name')->get(),
+            'classes' => DB::table('programs')->where('is_active', true)->whereNull('deleted_at')->select('id', 'short_name as name')->orderBy('short_name')->get(),
         ]);
     }
 
@@ -444,7 +444,7 @@ class FeesController extends Controller
             'by_class'        => $byClass,
             'by_semester'     => $bySemester,
             'recent_receipts' => $recentReceipts,
-            'classes'         => DB::table('programs')->where('is_active', true)->select('id', 'short_name as name')->orderBy('short_name')->get(),
+            'classes'         => DB::table('programs')->where('is_active', true)->whereNull('deleted_at')->select('id', 'short_name as name')->orderBy('short_name')->get(),
         ]);
     }
 }

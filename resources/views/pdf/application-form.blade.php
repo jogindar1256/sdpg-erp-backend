@@ -9,7 +9,7 @@
 
     $collegeName = $org->name ?? 'Swami Devanand Post Graduate College';
     $collegeAddr = $org->address ?? 'Math Lar, Deoria (Uttar Pradesh)';
-    $course      = $program->full_name ?? $program->short_name ?? '—';
+    $course      = \App\Models\Program::label($program) ?? '—';
 
     $studentName = $p1['name_english'] ?? $reg->name ?? $student->name ?? '—';
     $fatherName  = $p1['father_name_english'] ?? $reg->father_name ?? $student->father_name ?? '—';

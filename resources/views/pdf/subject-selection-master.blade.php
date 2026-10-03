@@ -35,7 +35,7 @@
 
     <table class="info">
         <tr>
-            <td class="k">Class</td><td>{{ $program->short_name ?? '-' }} — {{ $courseName }}</td>
+            <td class="k">Class</td><td>{{ \App\Models\Program::label($program, 'short') ?? '-' }} — {{ $courseName }}</td>
             <td class="k">Total Groups</td><td>{{ count($groups) }}</td>
         </tr>
     </table>

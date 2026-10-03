@@ -1124,14 +1124,16 @@ class StudentRegistrationController extends Controller
 
         $rows = DB::table('programs')
             ->where('is_active', true)
+            ->whereNull('deleted_at')
             ->when($org, fn($q) => $q->where('organization_id', $org->id))
             ->when($dbLevel, fn($q) => $q->where('level', $dbLevel))
             ->orderBy('name')
-            ->get(['id', 'name', 'short_name', 'code', 'level', 'total_semesters']);
+            ->get(['id', 'name', 'short_name', 'samarth_code', 'code', 'level', 'total_semesters']);
 
         $data = $rows->map(fn($p) => [
             'id' => $p->id,
             'short_name' => $p->short_name,
+            'samarth_code' => $p->samarth_code,
             'full_name' => $p->name,           // alias so the dropdown shows the long name
             'name' => $p->name,
             'code' => $p->code,

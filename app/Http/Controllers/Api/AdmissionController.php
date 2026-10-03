@@ -314,7 +314,7 @@ class AdmissionController extends Controller
             'total' => $query->count(),
             'by_status' => (clone $query)->selectRaw('status, count(*) as count')
                 ->groupBy('status')->pluck('count', 'status'),
-            'by_program' => (clone $query)->with('program:id,short_name,level')
+            'by_program' => (clone $query)->with('program:id,short_name,samarth_code,level')
                 ->selectRaw('program_id, count(*) as count')
                 ->groupBy('program_id')->get()
                 ->map(fn($a) => ['program' => $a->program?->short_name, 'count' => $a->count]),
@@ -335,7 +335,7 @@ class AdmissionController extends Controller
         $year = $request->get('academic_year');
 
         // Pull enrolled subjects from applications
-        $apps = \App\Models\StudentApplication::with(['program:id,short_name', 'student:id,full_name,enrollment_no'])
+        $apps = \App\Models\StudentApplication::with(['program:id,short_name,samarth_code', 'student:id,full_name,enrollment_no'])
             ->where('organization_id', $orgId)
             ->where('status', 'approved')
             ->when($year, fn($q) => $q->where('academic_year', $year))
@@ -360,7 +360,7 @@ class AdmissionController extends Controller
         // Fetch subject names
         $subjectIds = array_keys($subjectCounts);
         $subjects = \App\Models\Subject::whereIn('id', $subjectIds)
-            ->with('program:id,short_name')
+            ->with('program:id,short_name,samarth_code')
             ->get()
             ->keyBy('id');
 

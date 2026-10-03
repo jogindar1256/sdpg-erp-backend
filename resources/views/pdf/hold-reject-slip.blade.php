@@ -101,7 +101,7 @@
             <td class="k">Academic Session</td><td class="v">{{ $val($sa->academic_year ?? null) }}</td>
         </tr>
         <tr>
-            <td class="k">Course</td><td class="v">{{ $val($program->full_name ?? $program->short_name ?? null) }}</td>
+            <td class="k">Course</td><td class="v">{{ $val(\App\Models\Program::label($program)) }}</td>
             <td class="k">Semester</td><td class="v">{{ $val($sa->semester_no ?? null) }}</td>
         </tr>
         <tr>

@@ -97,6 +97,16 @@ return [
             'prefix_indexes' => true,
             'search_path' => 'public',
             'sslmode' => env('DB_SSLMODE', 'prefer'),
+            // DB_HOST is Supabase's Supavisor pooler on port 6543 — PgBouncer
+            // in TRANSACTION mode, which hands each statement to whichever
+            // backend Postgres connection is free at that moment. PDO's
+            // pgsql driver uses real server-side PREPARE by default, so the
+            // prepared statement created on one backend can vanish by the
+            // time a later query on the same PHP-FPM worker reuses that
+            // statement name against a different backend
+            'options' => extension_loaded('pdo_pgsql') ? array_filter([
+                PDO::ATTR_EMULATE_PREPARES => true,
+            ]) : [],
         ],
 
         'sqlsrv' => [

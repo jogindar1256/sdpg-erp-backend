@@ -35,7 +35,7 @@
 
     <table class="info">
         <tr>
-            <td class="k">Class</td><td>{{ $program->short_name ?? '-' }} — {{ $courseName }}</td>
+            <td class="k">Class</td><td>{{ \App\Models\Program::label($program, 'short') ?? '-' }} — {{ $courseName }}</td>
             <td class="k">Semester No.</td><td>{{ $semesterNo }}</td>
         </tr>
     </table>
@@ -49,10 +49,10 @@
                 <tr>
                     <th style="width:20%">Subject</th>
                     <th style="width:15%">Paper Code</th>
-                    <th style="width:35%">Paper Name</th>
-                    <th style="width:8%">Type</th>
-                    <th style="width:11%">Max</th>
-                    <th style="width:11%">Min</th>
+                    <th style="width:31%">Paper Name</th>
+                    <th style="width:14%">Paper Type</th>
+                    <th style="width:10%">Max</th>
+                    <th style="width:10%">Min</th>
                 </tr>
             </thead>
             <tbody>

@@ -2,7 +2,7 @@
     $fmt = fn ($d) => $d ? \Illuminate\Support\Carbon::parse($d)->format('d-M-Y') : '—';
     $val = fn ($v) => ($v === null || $v === '') ? '—' : $v;
     $collegeName = $org->name ?? 'Swami Devanand Post Graduate College, Math Lar';
-    $course = $program->full_name ?? $program->short_name ?? '—';
+    $course = \App\Models\Program::label($program) ?? '—';
     $total = collect($papers)->count();
 @endphp
 <!DOCTYPE html>

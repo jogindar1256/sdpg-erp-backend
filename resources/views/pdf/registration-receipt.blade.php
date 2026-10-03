@@ -28,7 +28,7 @@
 <body>
     @php
         $paid    = ($reg->payment_status === 'paid');
-        $course  = $program->full_name ?? ($program->short_name ?? $reg->reg_type);
+        $course  = \App\Models\Program::label($program) ?? $reg->reg_type;
         $orgName = $org->name ?? 'S.D.P.G. College, Mukhed';
     @endphp
 
