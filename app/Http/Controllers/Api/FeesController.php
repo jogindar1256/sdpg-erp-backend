@@ -51,16 +51,20 @@ class FeesController extends Controller
         $latestReg = $this->latestRegistrationSub();
 
         $q = DB::table('fee_receipts as fr')
-            ->join('students as s', 's.id', '=', 'fr.student_id')
+            // students is a LEFT join: a first-time applicant's receipt is
+            // issued at payment, before their students row exists (it is
+            // created when this receipt is verified). The applicant is then
+            // identified through the admission instead.
+            ->leftJoin('students as s', 's.id', '=', 'fr.student_id')
             ->leftJoin('admissions as adm', 'adm.id', '=', 'fr.admission_id')
             ->leftJoin('programs as p', 'p.id', '=', 'adm.program_id')
-            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
+            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', '=', DB::raw('COALESCE(s.user_id, adm.user_id)'))
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->select([
                 'fr.id', 'fr.receipt_no', 'fr.receipt_type as fee_type', 'fr.net_amount as amount',
                 'fr.transaction_id as utr_no', 'fr.bank_ref_no', 'fr.receipt_date as payment_date',
                 'fr.is_verified', 'fr.status', 'fr.created_at',
-                's.first_name', 's.middle_name', 's.last_name',
+                's.personal_info->first_name as first_name', 's.personal_info->middle_name as middle_name', 's.personal_info->last_name as last_name',
                 'dr.name as reg_name', 'dr.father_name',
                 'p.short_name as class_name', 'fr.semester_no',
                 'fr.admission_id', 'adm.admission_no',
@@ -81,9 +85,10 @@ class FeesController extends Controller
 
         if ($search = $request->search) {
             $q->where(function ($w) use ($search) {
-                $w->where('s.first_name', 'ilike', "%$search%")
-                  ->orWhere('s.last_name', 'ilike', "%$search%")
+                $w->where('s.personal_info->first_name', 'ilike', "%$search%")
+                  ->orWhere('s.personal_info->last_name', 'ilike', "%$search%")
                   ->orWhere('dr.name', 'ilike', "%$search%")
+                  ->orWhere('adm.applicant_info->name', 'ilike', "%$search%")
                   ->orWhere('adm.admission_no', 'ilike', "%$search%")
                   ->orWhere('fr.transaction_id', 'ilike', "%$search%")
                   ->orWhere('fr.receipt_no', 'ilike', "%$search%");
@@ -170,6 +175,15 @@ class FeesController extends Controller
                 'verified_at' => now(),
                 'updated_at'  => now(),
             ]);
+
+            // Verifying the receipt is what turns a first-time applicant
+            // into a student (students row + active admission).
+            $appId = $receipt->admission_id
+                ? DB::table('admissions')->where('id', $receipt->admission_id)->value('application_id')
+                : null;
+            if ($appId) {
+                app(ApplicationController::class)->finalizeAdmissionAfterReceipt((int) $appId, (int) Auth::id());
+            }
             $status = 'Verified';
         } else {
             DB::table('fee_receipts')->where('id', $id)->update([
@@ -214,9 +228,9 @@ class FeesController extends Controller
                 'adm.id as admission_id', 'adm.admission_no', 'adm.program_id',
                 'adm.academic_year as session', 'adm.semester_no', 'adm.admission_type',
                 'adm.fee_status', 'adm.student_id',
-                's.first_name', 's.middle_name', 's.last_name',
+                's.personal_info->first_name as first_name', 's.personal_info->middle_name as middle_name', 's.personal_info->last_name as last_name',
                 'dr.name as reg_name', 'dr.father_name', 'dr.mother_name',
-                's.mobile', 's.gender', 's.category',
+                's.mobile', 's.personal_info->gender as gender', 's.personal_info->category as category',
                 'p.short_name as class_name',
             ])
             ->where(function ($w) use ($query) {
@@ -295,7 +309,7 @@ class FeesController extends Controller
             ->join('students as s', 's.id', '=', 'adm.student_id')
             ->where('adm.academic_year', $session)
             ->when($progId, fn ($q) => $q->where('adm.program_id', $progId))
-            ->select('adm.id', 'adm.program_id', 'adm.semester_no', 'adm.admission_type', 's.gender', 's.category')
+            ->select('adm.id', 'adm.program_id', 'adm.semester_no', 'adm.admission_type', 's.personal_info->gender as gender', 's.personal_info->category as category')
             ->get();
 
         $feeBlobMap = \App\Models\FeeStructure::requiredFeeBlobMap($session, $progId ?: null);
@@ -426,7 +440,7 @@ class FeesController extends Controller
             ->where('fr.is_verified', true)
             ->select(
                 'fr.id', 'fr.receipt_type as fee_type', 'fr.net_amount as amount', 'fr.transaction_id as utr_no', 'fr.created_at',
-                's.first_name', 's.middle_name', 's.last_name', 'dr.name as reg_name',
+                's.personal_info->first_name as first_name', 's.personal_info->middle_name as middle_name', 's.personal_info->last_name as last_name', 'dr.name as reg_name',
                 'p.short_name as class_name', 'adm.semester_no',
                 DB::raw('(SELECT name FROM users WHERE id=fr.generated_by LIMIT 1) as issued_by')
             )

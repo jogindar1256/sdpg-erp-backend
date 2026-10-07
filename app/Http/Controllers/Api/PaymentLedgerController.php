@@ -28,11 +28,11 @@ class PaymentLedgerController extends Controller
             ->select(
                 'pl.*',
                 'dr.name as student_name',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 's.mobile',
-                's.category',
+                's.personal_info->category as category',
                 'a.reg_no',
                 'a.semester_no as adm_semester',
                 'p.short_name as prog_short',
@@ -52,8 +52,8 @@ class PaymentLedgerController extends Controller
                     ->orWhere('pl.receipt_no', 'ilike', "%{$req->search}%")
                     ->orWhere('pl.reg_no', 'ilike', "%{$req->search}%")
                     ->orWhere('dr.name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.first_name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.last_name', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.personal_info->first_name', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.personal_info->last_name', 'ilike', "%{$req->search}%")
                     ->orWhere('s.mobile', 'ilike', "%{$req->search}%")
                     ->orWhere('pl.utr_no', 'ilike', "%{$req->search}%")
                     ->orWhere('pl.bank_ref_no', 'ilike', "%{$req->search}%");
@@ -166,12 +166,12 @@ class PaymentLedgerController extends Controller
                 'pl.*',
                 'dr.name as student_name',
                 'dr.father_name',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 's.mobile',
                 's.email',
-                's.category',
+                's.personal_info->category as category',
                 'a.reg_no',
                 'a.semester_no as adm_semester',
                 'a.academic_year',

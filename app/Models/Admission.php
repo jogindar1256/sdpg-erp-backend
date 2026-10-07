@@ -17,6 +17,8 @@ class Admission extends Model
         'admission_no', 'admission_date',
         'is_verified', 'verified_by', 'verified_at',
         'status', 'cancel_reason', 'cancel_date', 'cancelled_by',
+        'user_id', 'direct_registration_id', 'applicant_info',
+        'documents_verified', 'approved_by', 'approved_at',
     ];
 
     protected $casts = [
@@ -24,6 +26,9 @@ class Admission extends Model
         'cancel_date' => 'date',
         'verified_at' => 'datetime',
         'is_verified' => 'boolean',
+        'applicant_info' => 'array',
+        'documents_verified' => 'boolean',
+        'approved_at' => 'datetime',
     ];
 
     public function organization(): BelongsTo

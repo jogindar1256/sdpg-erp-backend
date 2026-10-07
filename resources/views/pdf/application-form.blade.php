@@ -2,6 +2,13 @@
     $fmt   = fn ($d) => $d ? \Illuminate\Support\Carbon::parse($d)->format('d-M-Y') : '—';
     $val   = fn ($v) => ($v === null || $v === '' ) ? '—' : $v;
     $yesno = fn ($v) => $v ? 'Yes' : 'No';
+    // Identity-document numbers print masked: only the last 4 characters show.
+    $mask  = function ($v) {
+        $v = trim((string) $v);
+        if ($v === '') return '—';
+        $n = mb_strlen($v);
+        return $n <= 4 ? str_repeat('X', $n) : str_repeat('X', $n - 4) . mb_substr($v, -4);
+    };
 
     $reg  = $registration;
     $p    = fn (int $n) => $parts[$n] ?? [];
@@ -261,6 +268,75 @@
             <td class="k">Domestic State</td><td>{{ $val($p1['domestic_state'] ?? $reg->domestic_state ?? null) }}</td>
         </tr>
     </table>
+
+    {{-- Certificate / voter / passport groups from Part 1. A group prints
+         only when at least one of its fields was filled. --}}
+    @php
+        $g = fn (string $k) => $p1[$k] ?? null;
+        $certGroups = [
+            'Admission Category Evidence' => [
+                ['Admission Category', $val($g('admission_category'))],
+                ['Certificate No.', $val($g('admission_category_cert_no'))],
+            ],
+            'Domestic Evidence' => [
+                ['Domicile Cert. No.', $val($g('domicile_cert_no'))],
+                ['Issue District', $val($g('domicile_issue_district'))],
+                ['Issue Date', $fmt($g('domicile_issue_date'))],
+            ],
+            'Other Certificate Evidence' => [
+                ['Name of Cert.', $val($g('other_cert_name'))],
+                ['Certificate No.', $val($g('other_cert_no'))],
+                ['Issue From State', $val($g('other_cert_state'))],
+                ['Issue Date', $fmt($g('other_cert_date'))],
+            ],
+            'Physical Disablement Info.' => [
+                ['Disability Type', $val($g('disability_type'))],
+                ['Disability %', $val($g('disability_percent'))],
+                ["CMO's Certificate No.", $val($g('cmo_cert_no'))],
+                ['Certificate Issued Date', $fmt($g('cmo_cert_date'))],
+                ['Cert. Issue District', $val($g('cmo_cert_district'))],
+                ['Issue From State', $val($g('cmo_cert_state'))],
+            ],
+            'Guardian Income Info.' => [
+                ['Income Certificate No.', $val($g('income_cert_no'))],
+                ['Issued Date', $fmt($g('income_cert_date'))],
+                ['Issue From State', $val($g('income_cert_state'))],
+                ['Issue District', $val($g('income_cert_district'))],
+                ['Issued Sub. Dist.', $val($g('income_cert_sub_district'))],
+            ],
+            'Voter Info' => [
+                ['Is Voter', $val($g('is_voter'))],
+                ['Has EPIC', $val($g('has_epic'))],
+                ['EPIC No.', $mask($g('epic_no'))],
+                ['Voter In State', $val($g('voter_state'))],
+                ['Constituency', $val($g('voter_constituency'))],
+            ],
+            'Passport Info.' => [
+                ['Has Passport', $val($g('has_passport'))],
+                ['Passport No.', $mask($g('passport_no'))],
+                ['Issued By State', $val($g('passport_state'))],
+                ['Issue District', $val($g('passport_district'))],
+            ],
+        ];
+        // A bare "No" answer on its own is not worth a printed section.
+        $certGroups = array_filter($certGroups, fn ($rows) => collect($rows)
+            ->contains(fn ($r) => $r[1] !== '—' && strcasecmp((string) $r[1], 'No') !== 0));
+    @endphp
+    @foreach ($certGroups as $groupTitle => $rows)
+        <div class="sec-title blue">{{ $groupTitle }}</div>
+        <table class="kv">
+            @foreach (array_chunk($rows, 2) as $pair)
+                <tr>
+                    <td class="k">{{ $pair[0][0] }}</td><td>{{ $pair[0][1] }}</td>
+                    @if (isset($pair[1]))
+                        <td class="k">{{ $pair[1][0] }}</td><td>{{ $pair[1][1] }}</td>
+                    @else
+                        <td class="k"></td><td></td>
+                    @endif
+                </tr>
+            @endforeach
+        </table>
+    @endforeach
 
     <div class="sec-title blue">Electronic Communication</div>
     <table class="kv">

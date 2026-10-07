@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Models\Student;
 use App\Http\Concerns\ResolvesStudentIdentity;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
@@ -47,15 +48,15 @@ class AuthorizationController extends Controller
                 'sa.status',
                 'sa.fee_paid',
                 'sa.created_at',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 DB::raw('COALESCE(dr.name, drc.name) as reg_name'),
                 DB::raw('COALESCE(dr.father_name, drc.father_name) as father_name'),
                 DB::raw('COALESCE(dr.mother_name, drc.mother_name) as mother_name'),
                 DB::raw('COALESCE(dr.dob, drc.dob) as dob'),
-                DB::raw('COALESCE(s.gender, drc.gender) as gender'),
-                DB::raw('COALESCE(s.category, drc.category) as category'),
+                DB::raw("COALESCE(s.personal_info->>'gender', drc.gender) as gender"),
+                DB::raw("COALESCE(s.personal_info->>'category', drc.category) as category"),
                 DB::raw('COALESCE(s.mobile, drc.mobile) as mobile'),
                 DB::raw('COALESCE(s.aadhar_no, drc.aadhar_no) as aadhar_no'),
                 's.is_blocked',
@@ -100,8 +101,8 @@ class AuthorizationController extends Controller
                     ->orWhere('drc.mobile', 'ilike', "%$search%")
                     ->orWhere('dr.name', 'ilike', "%$search%")
                     ->orWhere('drc.name', 'ilike', "%$search%")
-                    ->orWhere('s.first_name', 'ilike', "%$search%")
-                    ->orWhere('s.last_name', 'ilike', "%$search%");
+                    ->orWhere('s.personal_info->first_name', 'ilike', "%$search%")
+                    ->orWhere('s.personal_info->last_name', 'ilike', "%$search%");
             });
         }
 
@@ -121,6 +122,11 @@ class AuthorizationController extends Controller
     // ─────────────────────────────────────────────────────────────────────────
     public function admissionVerificationIndex(Request $request)
     {
+        // No status filter on this queue any more — it is always the
+        // pending list. (Semester Approval still filters by status.)
+        $request->request->remove('status');
+        $request->query->remove('status');
+
         $q = $this->baseApplicationQueue($request, ['regular']);
 
         $counts = $this->baseApplicationQueue($request, ['regular'])
@@ -139,6 +145,86 @@ class AuthorizationController extends Controller
         return response()->json([
             'stats' => $counts,
             'records' => $records,
+        ]);
+    }
+
+    /**
+     * Admissions waiting for approval on the verification page: odd
+     * semesters only (new admissions and year upgrades) — even-semester
+     * upgrades are handled by Semester Approval below.
+     */
+    private function pendingAdmissionQueue(Request $request)
+    {
+        $q = DB::table('admissions as a')
+            ->whereNull('a.deleted_at')
+            ->where('a.status', 'pending')
+            ->whereRaw('a.semester_no % 2 = 1');
+
+        if ($v = $request->input('session'))
+            $q->where('a.academic_year', $v);
+        if ($v = $request->input('class_id') ?? $request->input('course_id'))
+            $q->where('a.program_id', $v);
+        if ($v = $request->input('semester'))
+            $q->where('a.semester_no', $v);
+        if ($v = $request->input('date_from'))
+            $q->whereDate('a.created_at', '>=', $v);
+        if ($v = $request->input('date_to'))
+            $q->whereDate('a.created_at', '<=', $v);
+
+        return $q;
+    }
+
+    // GET /authorizations/admission-verification/next
+    // The one admission to review now: oldest pending first.
+    public function admissionVerificationNext(Request $request)
+    {
+        $pending = $this->pendingAdmissionQueue($request)->count();
+        $admission = $this->pendingAdmissionQueue($request)
+            ->orderBy('a.updated_at')
+            ->orderBy('a.id')
+            ->select('a.*')
+            ->first();
+
+        return response()->json([
+            'pending_count' => $pending,
+            'record' => $admission ? app(ApplicationController::class)->verificationCardData($admission) : null,
+        ]);
+    }
+
+    // GET /authorizations/admission-verification/fetch?q=
+    // Pull up one specific record, whatever its status, by admission no /
+    // application no / registration no / mobile.
+    public function admissionVerificationFetch(Request $request)
+    {
+        $term = trim((string) $request->input('q', ''));
+        if ($term === '') {
+            return response()->json(['message' => 'Enter an Application No, Admission No, Registration No or Mobile No.'], 422);
+        }
+        $lower = mb_strtolower($term);
+
+        $admission = DB::table('admissions as a')
+            ->join('student_applications as sa', 'sa.id', '=', 'a.application_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', '=', 'a.direct_registration_id')
+            ->whereNull('a.deleted_at')
+            ->whereNull('sa.deleted_at')
+            ->where(function ($w) use ($lower) {
+                $w->whereRaw('LOWER(a.admission_no) = ?', [$lower])
+                    ->orWhereRaw('LOWER(sa.application_no) = ?', [$lower])
+                    ->orWhereRaw('LOWER(dr.registration_no) = ?', [$lower])
+                    ->orWhereRaw("a.applicant_info->>'mobile' = ?", [$lower])
+                    ->orWhereRaw('dr.mobile = ?', [$lower]);
+            })
+            ->orderByRaw("CASE WHEN a.status = 'pending' THEN 0 ELSE 1 END")
+            ->orderByDesc('a.id')
+            ->select('a.*')
+            ->first();
+
+        if (!$admission) {
+            return response()->json(['message' => "No submitted application found for \"{$term}\"."], 404);
+        }
+
+        return response()->json([
+            'record' => app(ApplicationController::class)->verificationCardData($admission),
         ]);
     }
 
@@ -174,9 +260,19 @@ class AuthorizationController extends Controller
         $request->validate([
             'action' => 'required|in:Approved,Rejected,RollBack',
             'remarks' => 'nullable|string',
+            'documents_checked' => 'nullable|boolean',
         ]);
 
         $action = $request->input('action');
+
+        // The verification card sends documents_checked; approving without
+        // ticking it is refused. Callers that don't send it are unaffected.
+        if ($action === 'Approved' && $request->has('documents_checked') && !$request->boolean('documents_checked')) {
+            return response()->json(['message' => 'Confirm that all attached documents have been checked before approving.'], 422);
+        }
+        if (in_array($action, ['Rejected', 'RollBack'], true) && $request->has('documents_checked') && trim((string) $request->input('remarks')) === '') {
+            return response()->json(['message' => 'Enter the reason for roll back or reject.'], 422);
+        }
 
         if ($action === 'Approved') {
             // Delegate to the one place approval happens — student_applications
@@ -219,6 +315,14 @@ class AuthorizationController extends Controller
             DB::table('student_applications')->where('id', $applicationId)->update([
                 'status' => $newStatus,
                 'updated_at' => now(),
+            ]);
+            // Back to pending — and, since updated_at moves, to the end of the queue.
+            app(ApplicationController::class)->syncAdmissionForApplication($applicationId);
+        }
+
+        if ($request->has('documents_checked')) {
+            DB::table('admissions')->where('application_id', $applicationId)->update([
+                'documents_verified' => $action === 'Approved',
             ]);
         }
 
@@ -301,9 +405,9 @@ class AuthorizationController extends Controller
                 'al.modified_by',
                 'al.created_at',
                 'al.student_id',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name as reg_name',
                 'dr.father_name',
                 's.mobile',
@@ -324,7 +428,7 @@ class AuthorizationController extends Controller
             $q->where(function ($qb) use ($search) {
                 $qb->where('al.ref_no', 'ilike', "%$search%")
                     ->orWhere('dr.name', 'ilike', "%$search%")
-                    ->orWhere('s.first_name', 'ilike', "%$search%")
+                    ->orWhere('s.personal_info->first_name', 'ilike', "%$search%")
                     ->orWhere('a.admission_no', 'ilike', "%$search%");
             });
         }
@@ -405,8 +509,8 @@ class AuthorizationController extends Controller
                     'correspondence_state',
                     'correspondence_pin'
                 ];
-                DB::table('students')->where('id', $log->student_id)
-                    ->update(array_intersect_key($data, array_flip($allowed)));
+                // Every one of these now lives inside a grouped jsonb column.
+                Student::groupedUpdate($log->student_id, array_intersect_key($data, array_flip($allowed)));
                 break;
 
             case 'SubjectChange':
@@ -476,14 +580,14 @@ class AuthorizationController extends Controller
                 'a.admission_no',
                 'a.academic_year as session',
                 'a.semester_no',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name as reg_name',
                 'dr.father_name',
                 'dr.mother_name',
-                's.gender',
-                's.category',
+                's.personal_info->gender as gender',
+                's.personal_info->category as category',
                 's.mobile',
                 's.aadhar_no',
                 's.is_blocked',

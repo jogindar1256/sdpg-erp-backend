@@ -70,6 +70,15 @@ class FeeReceiptController extends Controller
             'verified_at' => now(),
         ]);
 
+        // Verifying the receipt is what turns a first-time applicant into a
+        // student (students row + active admission).
+        $appId = $feeReceipt->admission_id
+            ? \Illuminate\Support\Facades\DB::table('admissions')->where('id', $feeReceipt->admission_id)->value('application_id')
+            : null;
+        if ($appId) {
+            app(ApplicationController::class)->finalizeAdmissionAfterReceipt((int) $appId, (int) $request->user()->id);
+        }
+
         return response()->json(['message' => 'Receipt verified successfully.']);
     }
 

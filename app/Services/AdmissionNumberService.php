@@ -45,7 +45,7 @@ class AdmissionNumberService
             . $this->courseCode($program)
             . $this->categoryCode($category);
 
-        return $prefix . $this->nextSerial('students', 'student_code', $prefix, 4);
+        return $prefix . $this->nextSerial('students', 'student_uid', $prefix, 4);
     }
 
     // ── 2. Fee Receipt No ──────────────────────────────────────────────────

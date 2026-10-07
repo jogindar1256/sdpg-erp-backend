@@ -274,6 +274,8 @@ Route::middleware('auth:sanctum')->group(function () {
 
         // Admissions
         Route::prefix('admissions')->group(function () {
+            // Literal route first so the resource's id wildcard can't swallow it.
+            Route::get('pipeline-summary', [AdmissionController::class, 'pipelineSummary']);
             Route::apiResource('/', AdmissionController::class)->except(['store', 'destroy']);
             Route::post('{admission}/verify', [AdmissionController::class, 'verify']);
             Route::post('{admission}/cancel', [AdmissionController::class, 'cancel']);
@@ -486,7 +488,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::prefix('authorizations')->group(function () {
             // 1. Admission Verification — Odd semesters (1,3,5,7)
             Route::get('/admission-verification', [AuthorizationController::class, 'admissionVerificationIndex']);
-            Route::get('/admission-verification/{admissionId}', [AuthorizationController::class, 'admissionVerificationShow']);
+            Route::get('/admission-verification/next', [AuthorizationController::class, 'admissionVerificationNext']);
+            Route::get('/admission-verification/fetch', [AuthorizationController::class, 'admissionVerificationFetch']);
+            Route::get('/admission-verification/{admissionId}', [AuthorizationController::class, 'admissionVerificationShow'])->whereNumber('admissionId');
             Route::post('/admission-verification/{admissionId}/action', [AuthorizationController::class, 'admissionVerificationAction']);
 
             // 2. Semester Registration Approval — Even semesters (2,4,6,8)
@@ -607,6 +611,7 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('fee-structure', [MasterSettingsController::class, 'feeStructureIndex']);
             Route::post('fee-structure', [MasterSettingsController::class, 'feeStructureStore']);
             Route::post('fee-structure/copy', [MasterSettingsController::class, 'feeStructureCopyYear']);
+            Route::post('fee-structure/practical', [MasterSettingsController::class, 'feeStructurePracticalStore']);
             Route::post('reg-fee/copy', [MasterSettingsController::class, 'registrationFeeCopyYear']);
 
             // Registration Fee

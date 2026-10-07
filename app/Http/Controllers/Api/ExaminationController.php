@@ -42,7 +42,7 @@ class ExaminationController extends Controller
     private function identitySelect(string $studentAlias = 's'): array
     {
         return [
-            "{$studentAlias}.first_name", "{$studentAlias}.middle_name", "{$studentAlias}.last_name",
+            "{$studentAlias}.personal_info->first_name as first_name", "{$studentAlias}.personal_info->middle_name as middle_name", "{$studentAlias}.personal_info->last_name as last_name",
             'dr.name as reg_name', 'dr.father_name', 'dr.mother_name',
         ];
     }
@@ -121,7 +121,7 @@ class ExaminationController extends Controller
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
-            ->select(array_merge(['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'], $this->identitySelect()))
+            ->select(array_merge(['ef.*', 's.personal_info->gender as gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'], $this->identitySelect()))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
@@ -325,7 +325,7 @@ class ExaminationController extends Controller
             ->whereIn('efp.paper_code', $schedules)
             ->where('ef.session_year', $req->session_year)
             ->where('ef.exam_type', $req->exam_type)
-            ->when($req->gender && $req->gender !== 'All', fn($q) => $q->where('s.gender', $req->gender))
+            ->when($req->gender && $req->gender !== 'All', fn($q) => $q->where('s.personal_info->gender', $req->gender))
             ->where('ef.status', 'Accepted')
             ->select('s.id as student_id', 's.university_roll_no as roll_no', 'efp.paper_code')
             ->get();
@@ -370,7 +370,7 @@ class ExaminationController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
             ->where('s.university_roll_no', $req->roll_no)
-            ->select(array_merge(['a.*', 's.mobile', 's.permanent_address as address', 'p.short_name as course'], $this->identitySelect()))
+            ->select(array_merge(['a.*', 's.mobile', 's.address_info->permanent_address as address', 'p.short_name as course'], $this->identitySelect()))
             ->first();
 
         if (!$admission) return response()->json(['message' => 'Student not found.'], 404);
@@ -412,9 +412,9 @@ class ExaminationController extends Controller
             ->where('ef.exam_type', $req->exam_type)
             ->where('a.program_id', $req->program_id)
             ->where('a.semester_no', $req->semester_no)
-            ->when($req->gender && $req->gender !== 'All', fn($q) => $q->where('s.gender', $req->gender))
+            ->when($req->gender && $req->gender !== 'All', fn($q) => $q->where('s.personal_info->gender', $req->gender))
             ->where('ef.status', 'Accepted')
-            ->select('s.university_roll_no as roll_no', 's.gender')
+            ->select('s.university_roll_no as roll_no', 's.personal_info->gender as gender')
             ->get();
 
         return response()->json([
@@ -583,7 +583,7 @@ class ExaminationController extends Controller
                 ->leftJoin('exam_form_papers as efp', 'efp.exam_form_id', 'ef.id')
         )
             ->select(array_merge(
-                ['ef.*', 's.gender', 's.date_of_birth as dob', 's.university_roll_no as roll_no',
+                ['ef.*', 's.personal_info->gender as gender', 's.personal_info->date_of_birth as dob', 's.university_roll_no as roll_no',
                  's.enrollment_no', 'p.short_name as course', 'efp.paper_code'],
                 $this->identitySelect()
             ))
@@ -625,14 +625,14 @@ class ExaminationController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
             ->select(array_merge(
-                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'],
+                ['ef.*', 's.personal_info->gender as gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'],
                 $this->identitySelect()
             ))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
             ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-            ->when($req->gender,      fn($q) => $q->where('s.gender',       $req->gender))
+            ->when($req->gender,      fn($q) => $q->where('s.personal_info->gender',       $req->gender))
             ->where('ef.status', 'Accepted')
             ->orderBy('s.university_roll_no')
             ->paginate(50);
@@ -676,14 +676,14 @@ class ExaminationController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
             ->select(array_merge(
-                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'],
+                ['ef.*', 's.personal_info->gender as gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'],
                 $this->identitySelect()
             ))
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
             ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-            ->when($req->gender,      fn($q) => $q->where('s.gender',       $req->gender))
+            ->when($req->gender,      fn($q) => $q->where('s.personal_info->gender',       $req->gender))
             ->where('ef.status', 'Accepted')
             ->orderBy('s.university_roll_no')
             ->paginate(50);
@@ -711,11 +711,11 @@ class ExaminationController extends Controller
             ->join('admissions as a', 'a.id', 'ef.admission_id')
             ->join('students as s', 's.id', 'a.student_id')
             ->join('programs as p', 'p.id', 'a.program_id')
-            ->select('p.short_name as course', 'p.level', 's.gender', DB::raw('count(*) as total'))
+            ->select('p.short_name as course', 'p.level', 's.personal_info->gender as gender', DB::raw('count(*) as total'))
             ->where('ef.session_year', $sessionYear)
             ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
             ->where('ef.status', 'Accepted')
-            ->groupBy('p.id', 'p.short_name', 'p.level', 's.gender')
+            ->groupBy('p.id', 'p.short_name', 'p.level', 's.personal_info->gender')
             ->get();
 
         return response()->json($data);
@@ -735,7 +735,7 @@ class ExaminationController extends Controller
             ->where('ef.session_year', $sessionYear)
             ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
-            ->when($req->gender, fn($q) => $q->where('s.gender', $req->gender))
+            ->when($req->gender, fn($q) => $q->where('s.personal_info->gender', $req->gender))
             ->where('ef.status', 'Accepted')
             ->groupBy('p.id', 'p.short_name', 'sub.id', 'sub.name', 'efp.exam_type')
             ->orderBy('p.short_name')->orderBy('sub.name')
@@ -793,7 +793,7 @@ class ExaminationController extends Controller
                 ->leftJoin('exam_form_papers as efp', 'efp.exam_form_id', 'ef.id')
         )
             ->select(array_merge(
-                ['ef.*', 's.gender', 's.university_roll_no as roll_no', 'p.short_name as course', 'efp.paper_code'],
+                ['ef.*', 's.personal_info->gender as gender', 's.university_roll_no as roll_no', 'p.short_name as course', 'efp.paper_code'],
                 $this->identitySelect()
             ))
             ->where('ef.center_code', $req->center_code)
@@ -816,7 +816,7 @@ class ExaminationController extends Controller
                 ->join('programs as p', 'p.id', 'a.program_id')
         )
             ->where('s.university_roll_no', $req->roll_no)
-            ->select(array_merge(['a.*', 's.mobile', 's.permanent_address as address', 'p.short_name as course'], $this->identitySelect()))
+            ->select(array_merge(['a.*', 's.mobile', 's.address_info->permanent_address as address', 'p.short_name as course'], $this->identitySelect()))
             ->first();
 
         if (!$admission) return response()->json(['message' => 'Not found.'], 404);

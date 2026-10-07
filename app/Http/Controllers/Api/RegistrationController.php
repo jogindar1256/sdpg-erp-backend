@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Http\Concerns\ResolvesStudentIdentity;
 use Illuminate\Http\Request;
@@ -38,16 +39,16 @@ class RegistrationController extends Controller
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->select(
                 'sr.*',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name',
                 's.mobile',
-                's.gender',
-                'a.roll_no',
+                's.personal_info->gender as gender',
+                's.university_roll_no as roll_no',
                 'a.account_no',
-                'a.enrollment_no',
+                's.enrollment_no',
                 'p.short_name as course',
                 'p.full_name',
                 'p.level'
@@ -59,11 +60,11 @@ class RegistrationController extends Controller
             ->when($req->status, fn($q) => $q->where('sr.status', $req->status))
             ->when($req->search, fn($q) => $q->where(function ($q2) use ($req) {
                 $q2->where('dr.name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.first_name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.last_name', 'ilike', "%{$req->search}%")
-                    ->orWhere('a.roll_no', 'ilike', "%{$req->search}%");
+                    ->orWhere('s.personal_info->first_name', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.personal_info->last_name', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.university_roll_no', 'ilike', "%{$req->search}%");
             }))
-            ->orderBy('a.roll_no');
+            ->orderBy('s.university_roll_no');
 
         $result = $q->paginate(50);
         $result->getCollection()->transform(fn($row) => $this->withComposedName($row));
@@ -352,19 +353,19 @@ class RegistrationController extends Controller
             })
             ->select(
                 'a.id as admission_id',
-                'a.roll_no',
+                's.university_roll_no as roll_no',
                 'a.account_no',
-                'a.enrollment_no',
+                's.enrollment_no',
                 'a.semester_no',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name',
                 'dr.dob',
                 's.mobile',
-                's.gender',
-                's.date_of_birth',
+                's.personal_info->gender as gender',
+                's.personal_info->date_of_birth as date_of_birth',
                 'p.short_name as course',
                 'p.full_name',
                 'p.level',
@@ -375,12 +376,12 @@ class RegistrationController extends Controller
                 'sr.fee_paid',
                 'sr.approved_at'
             )
-            ->when($req->roll_no, fn($q) => $q->where('a.roll_no', $req->roll_no))
+            ->when($req->roll_no, fn($q) => $q->where('s.university_roll_no', $req->roll_no))
             ->when($req->search, fn($q) => $q->where(function ($q2) use ($req) {
                 $q2->where('dr.name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.first_name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.last_name', 'ilike', "%{$req->search}%")
-                    ->orWhere('a.roll_no', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.personal_info->first_name', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.personal_info->last_name', 'ilike', "%{$req->search}%")
+                    ->orWhere('s.university_roll_no', 'ilike', "%{$req->search}%")
                     ->orWhere('s.mobile', 'ilike', "%{$req->search}%");
             }))
             ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id));
@@ -417,7 +418,7 @@ class RegistrationController extends Controller
     public function studentPortalStatus(Request $req)
     {
         $user = $req->user();
-        $student = DB::table('students')->where('user_id', $user->id)->first();
+        $student = Student::flat(DB::table('students')->where('user_id', $user->id)->first());
         $sessionYear = $req->session_year ?? $this->sessionYear();
         $pending = $this->pendingRegistrationFor($user);
 
@@ -433,6 +434,7 @@ class RegistrationController extends Controller
         }
 
         $record = DB::table('admissions as a')
+            ->join('students as s', 's.id', 'a.student_id')
             ->join('programs as p', 'p.id', 'a.program_id')
             ->leftJoin('semester_registrations as sr', function ($j) use ($sessionYear) {
                 $j->on('sr.admission_id', 'a.id')
@@ -440,8 +442,8 @@ class RegistrationController extends Controller
             })
             ->where('a.student_id', $student->id)
             ->select(
-                'a.roll_no',
-                'a.enrollment_no',
+                's.university_roll_no as roll_no',
+                's.enrollment_no',
                 'a.semester_no as semester',
                 'p.short_name as program',
                 'p.full_name as program_name',
@@ -577,7 +579,7 @@ class RegistrationController extends Controller
         // Fresh registration is semester 1; use the latest admission if the
         // student has already progressed beyond registration.
         $semester = 1;
-        $student = DB::table('students')->where('user_id', $user->id)->first();
+        $student = Student::flat(DB::table('students')->where('user_id', $user->id)->first());
         if ($student) {
             $adm = DB::table('admissions')->where('student_id', $student->id)
                 ->orderByDesc('id')->first();

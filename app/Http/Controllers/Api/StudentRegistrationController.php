@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Support\RegistrationInputGuard;
@@ -1191,6 +1192,7 @@ class StudentRegistrationController extends Controller
             })
             ->whereNull('deleted_at')
             ->first();
+        Student::flat($student); // expose grouped fields (name, address…) flat
 
         if (!$student) {
             return response()->json([

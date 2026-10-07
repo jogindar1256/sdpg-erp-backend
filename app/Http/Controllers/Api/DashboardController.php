@@ -118,10 +118,10 @@ class DashboardController extends Controller
             $q = $applySemNo($q, $semNo);
 
             $rows = $q->select(
-                DB::raw("LOWER(s.gender) as gender"),
+                DB::raw("LOWER(s.personal_info->>'gender') as gender"),
                 DB::raw("COUNT(*) as total")
             )
-            ->groupBy('s.gender')
+            ->groupBy('s.personal_info->gender')
             ->get();
 
             $male   = 0; $female = 0; $trans = 0;

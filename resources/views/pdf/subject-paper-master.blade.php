@@ -51,6 +51,9 @@
                     <th style="width:15%">Paper Code</th>
                     <th style="width:31%">Paper Name</th>
                     <th style="width:14%">Paper Type</th>
+                    @if($showSelection ?? false)
+                        <th style="width:16%">Selection Type</th>
+                    @endif
                     <th style="width:10%">Max</th>
                     <th style="width:10%">Min</th>
                 </tr>
@@ -62,6 +65,9 @@
                         <td>{{ $p->paper_code ?? '-' }}</td>
                         <td>{{ $p->paper_name }}</td>
                         <td>{{ $p->paper_type }}</td>
+                        @if($showSelection ?? false)
+                            <td>{{ $p->selection_type ?? '-' }}</td>
+                        @endif
                         <td>{{ $p->max_marks }}</td>
                         <td>{{ $p->min_marks }}</td>
                     </tr>

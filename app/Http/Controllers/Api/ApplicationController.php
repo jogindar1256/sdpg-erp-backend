@@ -2,12 +2,14 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Http\Concerns\LocksStudentIdentity;
 use App\Jobs\GenerateFeeReceiptPdf;
 use App\Models\FeeReceipt;
 use App\Services\AdmissionNumberService;
 use App\Services\NotificationService;
+use App\Support\Part6Rules;
 use App\Support\TextNormalizer;
 use Barryvdh\DomPDF\Facade\Pdf;
 use Illuminate\Http\JsonResponse;
@@ -48,9 +50,9 @@ class ApplicationController extends Controller
             }
         }
 
-        $sa->student = DB::table('students')
+        $sa->student = Student::flat(DB::table('students')
             ->where('id', $sa->student_id)
-            ->first();
+            ->first());
 
         if ($sa->student) {
             $sa->student->name = trim(implode(' ', array_filter([
@@ -113,8 +115,14 @@ class ApplicationController extends Controller
         if ($sa->application_type !== 'back_paper') {
             $feePreview = $this->computeApplicationFee($sa);
             $sa->computed_fee_amount = $feePreview['missing_structure'] ? null : $feePreview['total'];
+            // How much of that is the practical-subject fee, and for how many subjects.
+            $sa->practical_subject_count = $feePreview['practical_subject_count'] ?? 0;
+            $sa->computed_practical_fee = (float) collect($feePreview['breakdown'])
+                ->whereNull('fee_head_id')->sum('amount');
         } else {
             $sa->computed_fee_amount = null;
+            $sa->practical_subject_count = 0;
+            $sa->computed_practical_fee = 0.0;
         }
 
         $sa->documents = DB::table('student_application_documents')
@@ -150,14 +158,24 @@ class ApplicationController extends Controller
         // applicant explicitly said they have no account, or said they do
         // and filled in every field Part5Bank itself requires in that case.
         $p5 = is_array($sa->part_5 ?? null) ? $sa->part_5 : [];
-        $sa->bank_detail_complete = ($p5['has_bank_account'] ?? null) === 'no'
-            || (($p5['has_bank_account'] ?? null) === 'yes'
+        // Case-insensitive: older saves stored this answer upper-cased.
+        $hasBank = strtolower((string) ($p5['has_bank_account'] ?? ''));
+        $sa->bank_detail_complete = $hasBank === 'no'
+            || ($hasBank === 'yes'
                 && trim((string) ($p5['name_in_account'] ?? '')) !== ''
                 && trim((string) ($p5['bank_name'] ?? '')) !== ''
                 && trim((string) ($p5['bank_branch'] ?? '')) !== ''
                 && trim((string) ($p5['bank_account_no'] ?? '')) !== ''
                 && trim((string) ($p5['bank_ifsc'] ?? '')) !== ''
                 && trim((string) ($p5['branch_address'] ?? '')) !== '');
+
+        // Part 6 green-check — same reasoning as bank_detail_complete: a
+        // Save Draft with nothing picked still writes a part_6 object.
+        $sa->part6_complete = Part6Rules::isComplete(
+            $sa,
+            $sa->program,
+            is_array($sa->part_6 ?? null) ? $sa->part_6 : []
+        );
 
         return $sa;
     }
@@ -218,16 +236,16 @@ class ApplicationController extends Controller
                 'sa.fee_paid',
                 'sa.created_at',
                 'sa.updated_at',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 DB::raw('COALESCE(dr.name, drc.name) as name'),
                 DB::raw('COALESCE(dr.father_name, drc.father_name) as father_name'),
                 DB::raw('COALESCE(dr.mother_name, drc.mother_name) as mother_name'),
                 DB::raw('COALESCE(s.mobile, dr.mobile, drc.mobile) as mobile'),
-                DB::raw('COALESCE(s.gender, dr.gender, drc.gender) as gender'),
-                DB::raw('COALESCE(s.date_of_birth::text, dr.dob, drc.dob) as dob'),
-                DB::raw('COALESCE(s.category, dr.category, drc.category) as category'),
+                DB::raw("COALESCE(s.personal_info->>'gender', dr.gender, drc.gender) as gender"),
+                DB::raw("COALESCE(s.personal_info->>'date_of_birth', dr.dob, drc.dob) as dob"),
+                DB::raw("COALESCE(s.personal_info->>'category', dr.category, drc.category) as category"),
                 DB::raw('COALESCE(s.aadhar_no, drc.aadhar_no) as aadhar_no'),
                 DB::raw('COALESCE(s.abc_id, drc.abc_id) as abc_id'),
                 'p.short_name as course',
@@ -347,7 +365,7 @@ class ApplicationController extends Controller
         // $app->student_id can be null (fresh, pre-approval) — $student
         // stays null in that case, and every ?-> / ?? read below already
         // handles that.
-        $student = $app->student_id ? DB::table('students')->where('id', $app->student_id)->first() : null;
+        $student = $app->student_id ? Student::flat(DB::table('students')->where('id', $app->student_id)->first()) : null;
         $program = DB::table('programs')->where('id', $app->program_id)->first();
 
         // Only exists once the college has approved this exact application.
@@ -407,6 +425,7 @@ class ApplicationController extends Controller
                 'sa.application_no'
             )
             ->first();
+        Student::flat($student); // s.* carries the grouped jsonb columns
 
         if (!$student) {
             return response()->json(['message' => 'No matching student found.'], 404);
@@ -561,6 +580,8 @@ class ApplicationController extends Controller
             'updated_at' => now(),
         ]);
 
+        $this->syncAdmissionForApplication((int) $id);
+
         return response()->json([
             'id' => $id,
             'application_no' => $appNo,
@@ -591,6 +612,25 @@ class ApplicationController extends Controller
             'updated_at' => now(),
         ]);
 
+        $this->syncAdmissionForApplication((int) $id);
+        // Approval is the office's confirmation that the documents were checked.
+        DB::table('admissions')->where('application_id', $id)->update(['documents_verified' => true]);
+
+        // Fee already collected (office Pay Fee before approval)? Then
+        // approval is the last step: an existing student is admitted now,
+        // a first-time applicant once the receipt has been verified (which
+        // may already have happened).
+        $paidApp = DB::table('student_applications')->where('id', $id)->first();
+        if ($paidApp && $paidApp->fee_paid && in_array($paidApp->application_type, self::ADMISSION_APP_TYPES, true)) {
+            $knownStudent = $paidApp->student_id
+                ?: ($paidApp->user_id ? DB::table('students')->where('user_id', $paidApp->user_id)->value('id') : null);
+            $receiptVerified = $paidApp->fee_receipt_id
+                && DB::table('fee_receipts')->where('id', $paidApp->fee_receipt_id)->value('is_verified');
+            if ($knownStudent || $receiptVerified) {
+                DB::transaction(fn() => $this->confirmStudentAndCreateAdmission($paidApp, (int) $req->user()->id));
+            }
+        }
+
         $notifyTarget = $this->resolveNotifyTarget($app);
         if ($notifyTarget) {
             // application_approved template: {#var#} = application no,
@@ -609,11 +649,11 @@ class ApplicationController extends Controller
     private function resolveNotifyTarget(object $app): ?object
     {
         if ($app->student_id) {
-            $student = DB::table('students')->where('id', $app->student_id)->first();
+            $student = Student::flat(DB::table('students')->where('id', $app->student_id)->first());
             if ($student) return $student;
         }
         if ($app->user_id) {
-            $student = DB::table('students')->where('user_id', $app->user_id)->first();
+            $student = Student::flat(DB::table('students')->where('user_id', $app->user_id)->first());
             if ($student) return $student;
         }
 
@@ -688,6 +728,7 @@ class ApplicationController extends Controller
             ]);
         });
 
+        $this->syncAdmissionForApplication((int) $app->id);
         $this->blockRelatedRecords($app, $newStatus, $req->reason, $req->user()?->id);
 
         $notifyTarget = $this->resolveNotifyTarget($app);
@@ -766,12 +807,17 @@ class ApplicationController extends Controller
                 'updated_at' => now(),
             ]);
 
-            DB::table('admissions')->where('application_id', $app->id)->update([
-                'status' => 'active',
-                'updated_at' => now(),
-            ]);
-
+            // Back to the pending queue. An admission that had already been
+            // confirmed (student attached and verified) returns to 'active'.
+            DB::table('admissions')
+                ->where('application_id', $app->id)
+                ->where('status', 'on_hold')
+                ->update([
+                    'status' => DB::raw("CASE WHEN student_id IS NOT NULL AND is_verified THEN 'active' ELSE 'pending' END"),
+                    'updated_at' => now(),
+                ]);
         });
+        $this->syncAdmissionForApplication((int) $app->id);
 
         return response()->json(['message' => 'Hold released.']);
     }
@@ -799,7 +845,7 @@ class ApplicationController extends Controller
             return response()->json(['message' => 'No hold or rejection record found for this application.'], 422);
         }
 
-        $student = DB::table('students')->where('id', $sa->student_id)->first();
+        $student = Student::flat(DB::table('students')->where('id', $sa->student_id)->first());
         $program = DB::table('programs')->where('id', $sa->program_id)->first();
         $org = DB::table('organizations')->where('id', $sa->organization_id)->first();
         $decidedByName = $decision->decided_by ? DB::table('users')->where('id', $decision->decided_by)->value('name') : null;
@@ -849,6 +895,343 @@ class ApplicationController extends Controller
         return null;
     }
 
+    // =========================================================================
+    // ADMISSIONS — the office's working record, created at submit
+    // =========================================================================
+
+    /** Application types that get an admissions row (back papers do not). */
+    public const ADMISSION_APP_TYPES = ['regular', 'semester_upgrade'];
+
+    /** Admission states an application status change must never overwrite. */
+    private const ADMISSION_FINAL_STATUSES = ['active', 'cancelled', 'passed_out', 'transferred'];
+
+    /** The registration an application came from (its own link, else the user's latest). */
+    private function registrationForApp(object $app): ?object
+    {
+        if (!empty($app->direct_registration_id)) {
+            $reg = DB::table('direct_registrations')->where('id', $app->direct_registration_id)->first();
+            if ($reg) {
+                return $reg;
+            }
+        }
+        $userId = $app->user_id ?? null;
+        if (!$userId && !empty($app->student_id)) {
+            $userId = DB::table('students')->where('id', $app->student_id)->value('user_id');
+        }
+        if (!$userId) {
+            return null;
+        }
+        return DB::table('direct_registrations')
+            ->where('user_id', $userId)
+            ->where('status', '!=', 'cancelled')
+            ->whereNull('deleted_at')
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    /**
+     * Who the applicant is, copied onto admissions.applicant_info so lists
+     * can show a name/mobile before any students row exists.
+     */
+    private function applicantSnapshot(object $app, ?object $reg = null): array
+    {
+        $reg = $reg ?: $this->registrationForApp($app);
+        $part1 = is_array($app->part_1 ?? null) ? $app->part_1 : (json_decode($app->part_1 ?? '{}', true) ?: []);
+        $part2 = is_array($app->part_2 ?? null) ? $app->part_2 : (json_decode($app->part_2 ?? '{}', true) ?: []);
+        $student = !empty($app->student_id)
+            ? Student::flat(DB::table('students')->where('id', $app->student_id)->first())
+            : null;
+        $studentName = $student
+            ? trim(implode(' ', array_filter([$student->first_name ?? null, $student->middle_name ?? null, $student->last_name ?? null])))
+            : null;
+
+        return array_filter([
+            'name' => $reg->name ?? ($studentName ?: null),
+            'father_name' => $reg->father_name ?? ($student->father_name ?? null),
+            'mother_name' => $reg->mother_name ?? ($student->mother_name ?? null),
+            'dob' => $part1['date_of_birth'] ?? ($reg->dob ?? ($student->date_of_birth ?? null)),
+            'gender' => $part1['gender'] ?? ($reg->gender ?? ($student->gender ?? null)),
+            'category' => $part1['social_category'] ?? ($reg->category ?? ($student->category ?? null)),
+            'mobile' => $reg->mobile ?? ($student->mobile ?? null),
+            'email' => $reg->email ?? ($student->email ?? null),
+            'aadhar_no' => $reg->aadhar_no ?? ($student->aadhar_no ?? null),
+            'state' => $part2['permanent_state'] ?? ($reg->domestic_state ?? ($student->permanent_state ?? null)),
+            'registration_no' => $reg->registration_no ?? null,
+            'application_no' => $app->application_no ?? null,
+        ], fn($v) => $v !== null && $v !== '');
+    }
+
+    /**
+     * Keep the admissions row in step with its application. Call after every
+     * application status change. Creates the row the first time the
+     * application is submitted (status 'pending', no student yet).
+     *
+     *   submitted / under_review → pending
+     *   approved                 → approved   (active once student + fee exist)
+     *   on_hold / rejected / cancelled → same
+     *
+     * Returns the admission id, or null when this application type has none.
+     */
+    public function syncAdmissionForApplication(int $appId): ?int
+    {
+        $app = DB::table('student_applications')->where('id', $appId)->first();
+        if (!$app || !in_array($app->application_type, self::ADMISSION_APP_TYPES, true)) {
+            return null;
+        }
+
+        $existing = DB::table('admissions')->where('application_id', $app->id)->orderByDesc('id')->first();
+
+        $map = [
+            'submitted' => 'pending',
+            'under_review' => 'pending',
+            'approved' => 'approved',
+            'on_hold' => 'on_hold',
+            'rejected' => 'rejected',
+            'cancelled' => 'cancelled',
+        ];
+        $target = $map[$app->status] ?? null;
+        if (!$target) {
+            return $existing->id ?? null; // draft — nothing to mirror yet
+        }
+
+        $reg = $this->registrationForApp($app);
+        $userId = $app->user_id
+            ?: (!empty($app->student_id) ? DB::table('students')->where('id', $app->student_id)->value('user_id') : null)
+            ?: ($reg->user_id ?? null);
+
+        $data = [
+            'user_id' => $userId,
+            'direct_registration_id' => $app->direct_registration_id ?: ($reg->id ?? null),
+            'applicant_info' => json_encode($this->applicantSnapshot($app, $reg)),
+            'program_id' => $app->program_id,
+            'academic_year' => $app->academic_year,
+            'semester_no' => $app->semester_no,
+            'updated_at' => now(),
+        ];
+        if ($target === 'approved') {
+            $data['approved_by'] = $app->approved_by;
+            $data['approved_at'] = $app->approved_at;
+        }
+
+        if ($existing) {
+            $status = $target;
+            $blocking = in_array($target, ['on_hold', 'rejected', 'cancelled'], true);
+            if (!$blocking && in_array($existing->status, self::ADMISSION_FINAL_STATUSES, true)) {
+                $status = $existing->status; // already admitted — don't pull it back
+            } elseif ($target === 'approved' && $existing->student_id && $app->fee_paid && $existing->is_verified) {
+                $status = 'active'; // e.g. hold released after the admission was confirmed
+            }
+            $data['status'] = $status;
+            DB::table('admissions')->where('id', $existing->id)->update($data);
+            return (int) $existing->id;
+        }
+
+        return (int) DB::table('admissions')->insertGetId($data + [
+            'organization_id' => $app->organization_id,
+            // Deliberately null even for an existing student (upgrade): the
+            // student is attached only on confirmation, so a pending row
+            // stays out of every list that joins admissions to students
+            // (exams, amendments, ledgers). admissions.user_id identifies
+            // the applicant until then.
+            'student_id' => null,
+            'application_id' => $app->id,
+            'admission_type' => $app->application_type === 'semester_upgrade' ? 'upgrade' : 'regular',
+            'admission_no' => $app->academic_year . '-' . str_pad((string) $app->id, 6, '0', STR_PAD_LEFT),
+            'admission_date' => now()->toDateString(),
+            'is_verified' => false,
+            'status' => $target,
+            'created_at' => now(),
+        ]);
+    }
+
+    /**
+     * Called when college staff verify the fee receipt — the point at which
+     * a first-time applicant finally becomes a student. Safe to call more
+     * than once, and a no-op for anything that isn't approved + paid.
+     */
+    public function finalizeAdmissionAfterReceipt(int $appId, int $byUserId): void
+    {
+        $app = DB::table('student_applications')->where('id', $appId)->whereNull('deleted_at')->first();
+        if (
+            !$app
+            || !in_array($app->application_type, self::ADMISSION_APP_TYPES, true)
+            || $app->status !== 'approved'
+            || !$app->fee_paid
+        ) {
+            return;
+        }
+        DB::transaction(fn() => $this->confirmStudentAndCreateAdmission($app, $byUserId));
+    }
+
+    /** Subject summary for the verification card, from Part 6. */
+    private function subjectSummary(object $app, array $part6): array
+    {
+        $names = fn(array $ids) => $ids
+            ? DB::table('subjects')->whereIn('id', $ids)->pluck('name', 'id')
+            : collect();
+        $out = ['subject' => null, 'basic_subject' => null, 'drop_subject' => null, 'practical_subject' => null];
+
+        $formType = strtoupper((string) ($part6['form_type'] ?? ''));
+        if (in_array($formType, ['PG', 'BED'], true)) {
+            $paperIds = collect([
+                $part6['compulsory_paper_ids'] ?? [],
+                $part6['optional_paper_ids'] ?? [],
+                $part6['teaching_paper_ids'] ?? [],
+            ])->flatten()->filter()->map(fn($v) => (int) $v)->unique()->all();
+            if (!$paperIds) {
+                return $out;
+            }
+            $papers = DB::table('subject_papers as sp')
+                ->leftJoin('subjects as s', 's.id', 'sp.subject_id')
+                ->whereIn('sp.id', $paperIds)
+                ->get(['sp.paper_type', 's.name as subject_name']);
+            $out['subject'] = $papers->pluck('subject_name')->filter()->unique()->implode(', ') ?: null;
+            $out['practical_subject'] = $papers
+                ->filter(fn($p) => strtolower((string) $p->paper_type) === 'practical')
+                ->pluck('subject_name')->filter()->unique()->implode(', ') ?: null;
+            return $out;
+        }
+
+        $majorIds = array_values(array_filter([
+            $part6['major_subject_1'] ?? null,
+            $part6['major_subject_2'] ?? null,
+            $part6['major_subject_3'] ?? null,
+        ]));
+        $minorIds = array_values(array_filter([$part6['minor_subject_1'] ?? null]));
+        $all = $names(array_merge($majorIds, $minorIds));
+
+        $out['subject'] = collect($majorIds)->map(fn($id) => $all[$id] ?? null)->filter()->implode(', ') ?: null;
+        $out['basic_subject'] = collect($minorIds)->map(fn($id) => $all[$id] ?? null)->filter()->implode(', ') ?: null;
+
+        if ($majorIds || $minorIds) {
+            $practicalIds = DB::table('subject_papers')
+                ->whereIn('subject_id', array_merge($majorIds, $minorIds))
+                ->where('semester_no', (string) $app->semester_no) // varchar column
+                ->whereRaw("LOWER(paper_type) = 'practical'")
+                ->pluck('subject_id')->unique()->all();
+            $out['practical_subject'] = collect($practicalIds)->map(fn($id) => $all[$id] ?? null)->filter()->implode(', ') ?: null;
+        }
+        return $out;
+    }
+
+    /**
+     * Everything the Admission Verification review card shows for one
+     * admission: who, what course, subjects, TC/migration, both fees,
+     * documents.
+     */
+    public function verificationCardData(object $admission): ?array
+    {
+        $raw = DB::table('student_applications')->where('id', $admission->application_id)->first();
+        if (!$raw) {
+            return null;
+        }
+        $reg = $this->registrationForApp($raw);
+        $who = $this->applicantSnapshot($raw, $reg);
+        $sa = $this->parseApp($raw); // decodes part_* in place, adds documents / photo / program
+
+        $part4 = is_array($sa->part_4 ?? null) ? $sa->part_4 : [];
+        $part6 = is_array($sa->part_6 ?? null) ? $sa->part_6 : [];
+
+        $fee = $this->computeApplicationFee($sa);
+        $headNames = DB::table('fee_heads')
+            ->whereIn('id', collect($fee['breakdown'])->pluck('fee_head_id')->filter()->all() ?: [0])
+            ->pluck('name', 'id');
+        $receipt = $sa->fee_receipt_id
+            ? DB::table('fee_receipts')->where('id', $sa->fee_receipt_id)->first()
+            : null;
+        $required = $fee['missing_structure'] ? null : (float) $fee['total'];
+        $paid = (float) ($receipt->net_amount ?? 0);
+
+        $yesNo = fn($v) => $v === null || $v === '' ? null : (in_array(strtolower((string) $v), ['yes', '1', 'true'], true) || $v === true ? 'Yes' : 'No');
+
+        return [
+            'admission_id' => $admission->id,
+            'application_id' => $sa->id,
+            'registration_id' => $reg->id ?? null,
+            'code' => $reg->unique_code ?? null, // needed in the application view URL
+            'student_id' => $admission->student_id,
+            'admission_no' => $admission->admission_no,
+            'admission_status' => $admission->status,
+            'application_status' => $sa->status,
+            'documents_verified' => (bool) ($admission->documents_verified ?? false),
+            'submitted_at' => $sa->declaration_at ?? $admission->created_at,
+            'updated_at' => $admission->updated_at,
+
+            'admission_mode' => $admission->admission_type === 'upgrade' ? 'Upgrade' : 'Regular',
+            'session' => $admission->academic_year,
+            'course' => $sa->program->short_name ?? null,
+            'course_full_name' => $sa->program->full_name ?? null,
+            'samarth_code' => $sa->program->samarth_code ?? null,
+            'semester_no' => $admission->semester_no,
+            'tc_status' => $part4['tc_condition'] ?? null,
+            'migration' => $part4['mig_condition'] ?? $yesNo($part4['has_migration'] ?? null),
+        ] + $this->subjectSummary($sa, $part6) + [
+            'name' => $who['name'] ?? null,
+            'father_name' => $who['father_name'] ?? null,
+            'mother_name' => $who['mother_name'] ?? null,
+            'dob' => $who['dob'] ?? null,
+            'category' => $who['category'] ?? null,
+            'gender' => $who['gender'] ?? null,
+            'state' => $who['state'] ?? null,
+            'mobile' => $who['mobile'] ?? null,
+            'aadhar_no' => $who['aadhar_no'] ?? null,
+            'photo_url' => $sa->photo_url,
+            'signature_url' => $sa->signature_url,
+
+            'registration_no' => $reg->registration_no ?? null,
+            'reg_fee_status' => ($reg->payment_status ?? null) === 'paid' ? 'Paid' : 'Pending',
+            'reg_fee_paid' => ($reg->payment_status ?? null) === 'paid' ? (float) ($reg->fee_amount ?? 0) : 0,
+            'reg_fee_utr' => $reg->razorpay_payment_id ?? null,
+            'reg_fee_paid_at' => $reg->paid_at ?? null,
+
+            'application_no' => $sa->application_no,
+            'edu_fee_status' => $sa->fee_paid ? 'Paid' : 'Pending',
+            'edu_fee_paid' => $paid,
+            'edu_fee_utr' => $receipt->transaction_id ?? $sa->payment_ref ?? null,
+            'fee_receipt_id' => $receipt->id ?? null,
+            'fee_receipt_verified' => (bool) ($receipt->is_verified ?? false),
+
+            'required_fee' => $required,
+            'pending_fee' => $required === null ? null : max(0, $required - $paid),
+            'fine_amount' => (float) ($receipt->late_fine ?? 0),
+            'practical_subject_count' => $fee['practical_subject_count'] ?? 0,
+            'fee_breakdown' => collect($fee['breakdown'])->map(fn($b) => [
+                'fee_head' => $b['label'] ?? ($headNames[$b['fee_head_id']] ?? 'Fee'),
+                'amount' => (float) $b['amount'],
+            ])->values()->all(),
+
+            'documents' => collect($sa->documents)->map(fn($d) => [
+                'document_type' => $d->document_type,
+                'filename' => $d->filename ?? null,
+                'url' => $d->url ?? null,
+            ])->values()->all(),
+            'required_documents_complete' => (bool) $sa->required_documents_complete,
+
+            'hold_reject_reason' => in_array($sa->status, ['on_hold', 'rejected'], true) ? $sa->reason : null,
+
+            // What the Approve and Reject / Hold popups need.
+            'program_id' => $sa->program_id,
+            'application_type' => $sa->application_type,
+            'email' => $who['email'] ?? null,
+            'part_1' => $sa->part_1,
+            'part_6' => $sa->part_6,
+            'decision' => [
+                'ref_no' => $sa->ref_no,
+                'decision' => $sa->decision,
+                'decision_status' => $sa->decision_status,
+                'hold_type' => $sa->hold_type,
+                'reason' => $sa->reason,
+                'objections' => $sa->objections,
+                'submitted_by' => $sa->submitted_by,
+                'submitted_at' => $sa->submitted_at,
+                'release_due_to' => $sa->release_due_to,
+                'release_remarks' => $sa->release_remarks,
+                'released_at' => $sa->released_at,
+                'released_by_name' => $sa->released_by_name,
+            ],
+        ];
+    }
+
     /**
      * IMPORTANT: this must NOT touch students.is_blocked/status. That flag
      * is a separate, intentional "Block/Unblock" admin action (see
@@ -890,17 +1273,18 @@ class ApplicationController extends Controller
      *     in this schema — admissions.application_id is a NOT NULL FK back
      *     to this exact application).
      *  3. Flip students.is_confirmed to true and assign the official
-     *     student_code if this is the student's first confirmed admission.
+     *     student_uid if this is the student's first confirmed admission.
      *     Backfill student_applications.student_id now that it's known.
      * Idempotent — skips everything if already done for this application.
      */
     private function confirmStudentAndCreateAdmission(object $app, int $approvedByUserId): void
     {
-        $existing = DB::table('admissions')->where('application_id', $app->id)->first();
-        if ($existing) {
-            // Already processed (e.g. re-approving after a status bounce) —
-            // still sync $app->student_id in memory (see the note below for
-            // why this matters to the caller) before returning.
+        // The admissions row normally exists already — it is created as
+        // 'pending' at submit (syncAdmissionForApplication()). This step
+        // attaches the student to it and makes it 'active'.
+        $existing = DB::table('admissions')->where('application_id', $app->id)->orderByDesc('id')->first();
+        if ($existing && $existing->student_id && in_array($existing->status, self::ADMISSION_FINAL_STATUSES, true)) {
+            // Already confirmed — just keep $app->student_id in step for the caller.
             $app->student_id = $existing->student_id;
             return;
         }
@@ -935,31 +1319,58 @@ class ApplicationController extends Controller
         $admissionType = $admissionTypeMap[$app->application_type] ?? 'regular';
 
         $program = DB::table('programs')->where('id', $app->program_id)->first();
-        $student = DB::table('students')->where('id', $studentId)->first();
+        $student = Student::flat(DB::table('students')->where('id', $studentId)->first());
 
         $svc = app(AdmissionNumberService::class);
 
         $admissionNo = $app->academic_year . '-' . str_pad((string) $app->id, 6, '0', STR_PAD_LEFT);
 
-        DB::table('admissions')->insertGetId([
-            'organization_id' => $app->organization_id,
-            'student_id' => $studentId,
-            'program_id' => $app->program_id,
-            'application_id' => $app->id,
-            'academic_year' => $app->academic_year,
-            'semester_no' => $app->semester_no,
-            'admission_type' => $admissionType,
-            'admission_no' => $admissionNo,
-            'admission_date' => now()->toDateString(),
-            'is_verified' => true,
-            'verified_by' => $approvedByUserId,
-            'verified_at' => now(),
-            'status' => 'active',
-            'file_no' => $svc->fileNo($app->academic_year),
-            'record_no' => $svc->recordNo(),
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
+        if ($existing) {
+            $keep = in_array($existing->status, ['on_hold', 'rejected', 'cancelled'], true);
+            DB::table('admissions')->where('id', $existing->id)->update([
+                'student_id' => $studentId,
+                'user_id' => $existing->user_id ?: ($student->user_id ?? $app->user_id),
+                'admission_date' => now()->toDateString(),
+                'is_verified' => true,
+                'verified_by' => $approvedByUserId ?: null,
+                'verified_at' => now(),
+                'status' => $keep ? $existing->status : 'active',
+                'file_no' => $existing->file_no ?: $svc->fileNo($app->academic_year),
+                'record_no' => $existing->record_no ?: $svc->recordNo(),
+                'updated_at' => now(),
+            ]);
+            $admissionId = $existing->id;
+        } else {
+            $reg = $this->registrationForApp($app);
+            $admissionId = DB::table('admissions')->insertGetId([
+                'organization_id' => $app->organization_id,
+                'student_id' => $studentId,
+                'user_id' => $student->user_id ?? $app->user_id,
+                'direct_registration_id' => $app->direct_registration_id ?: ($reg->id ?? null),
+                'applicant_info' => json_encode($this->applicantSnapshot($app, $reg)),
+                'program_id' => $app->program_id,
+                'application_id' => $app->id,
+                'academic_year' => $app->academic_year,
+                'semester_no' => $app->semester_no,
+                'admission_type' => $admissionType,
+                'admission_no' => $admissionNo,
+                'admission_date' => now()->toDateString(),
+                'is_verified' => true,
+                'verified_by' => $approvedByUserId ?: null,
+                'verified_at' => now(),
+                'status' => 'active',
+                'file_no' => $svc->fileNo($app->academic_year),
+                'record_no' => $svc->recordNo(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
+
+        // Receipts issued at payment time, before the student existed.
+        DB::table('fee_receipts')
+            ->where('admission_id', $admissionId)
+            ->whereNull('student_id')
+            ->update(['student_id' => $studentId, 'updated_at' => now()]);
 
         $studentUpdate = [
             'is_confirmed' => true,
@@ -969,15 +1380,15 @@ class ApplicationController extends Controller
         ];
 
         // Assign the permanent Student ID once, on first confirmation only.
-        if ($student && empty($student->student_code) && $program) {
+        if ($student && empty($student->student_uid) && $program) {
             try {
-                $studentUpdate['student_code'] = $svc->studentId($app->academic_year, $program, $student->category);
+                $studentUpdate['student_uid'] = $svc->studentId($app->academic_year, $program, $student->category);
             } catch (\Throwable $e) {
-                Log::warning("student_code generation failed for student {$studentId}: " . $e->getMessage());
+                Log::warning("student_uid generation failed for student {$studentId}: " . $e->getMessage());
             }
         }
 
-        DB::table('students')->where('id', $studentId)->update($studentUpdate);
+        Student::groupedUpdate($studentId, $studentUpdate);
     }
 
     /**
@@ -1068,7 +1479,7 @@ class ApplicationController extends Controller
             return null;
         }
 
-        return DB::table('students')->insertGetId([
+        return DB::table('students')->insertGetId(Student::pack([
             'organization_id' => $app->organization_id,
             'user_id' => $app->user_id,
             'first_name' => $first,
@@ -1092,7 +1503,7 @@ class ApplicationController extends Controller
             'is_confirmed' => false, // flipped true right after this returns
             'created_at' => now(),
             'updated_at' => now(),
-        ]);
+        ] + Student::certificateFieldsFrom($part1)));
     }
 
     public function show(Request $req, $id)
@@ -1186,7 +1597,27 @@ class ApplicationController extends Controller
             'mig_reason',
             // Part 5 — Bank Details
             'account_type',
+            'has_bank_account',
+            // Part 1 — selects in the certificate / voter / passport groups
+            ...Student::CERTIFICATE_CHOICE_FIELDS,
         ];
+    }
+
+    /**
+     * Part 1's certificate / voter / passport fields: dates must be dates,
+     * Yes/No must be Yes/No, text has a length limit. Returns a 422 response
+     * when something is wrong, null when the payload is fine.
+     */
+    private function invalidPart1(Request $req): ?JsonResponse
+    {
+        $v = Validator::make($req->all(), Student::certificateRules());
+        if ($v->fails()) {
+            return response()->json([
+                'message' => $v->errors()->first(),
+                'errors' => $v->errors(),
+            ], 422);
+        }
+        return null;
     }
 
     /**
@@ -1208,13 +1639,33 @@ class ApplicationController extends Controller
         if (!$app)
             return response()->json(['message' => 'Application not found.'], 404);
 
+        if ($partNo === 1 && ($invalid = $this->invalidPart1($req))) {
+            return $invalid;
+        }
+
         $col = 'part_' . $partNo;
         $key = 'part' . $partNo;
         $prog = json_decode($app->form_progress ?? '{}', true);
         $prog[$key] = true;
 
+        $clean = TextNormalizer::upper($req->all(), $this->selectDrivenApplicationFields());
+
+        // P.G. / B.Ed. Part 6: the office may pick any row, but every paper
+        // id must be a real paper of the right type for this course,
+        // semester and session, within the slot limits (the student path
+        // enforces this by re-deriving; the office path validates instead
+        // because it is allowed to override compulsory papers/the subject).
+        if ($partNo === 6) {
+            $program = DB::table('programs')->where('id', $app->program_id)->first();
+            [$validated, $error] = Part6Rules::validateOffice($app, $program, $clean);
+            if ($error) {
+                return response()->json(['message' => $error], 422);
+            }
+            $clean = $validated;
+        }
+
         DB::table('student_applications')->where('id', $id)->update([
-            $col => json_encode(TextNormalizer::upper($req->all(), $this->selectDrivenApplicationFields())),
+            $col => json_encode($clean),
             'form_progress' => json_encode($prog),
             'updated_at' => now(),
         ]);
@@ -1246,7 +1697,7 @@ class ApplicationController extends Controller
             ->orderByDesc('id')
             ->first();
 
-        $student = DB::table('students')->where('id', $sa->student_id)->first();
+        $student = Student::flat(DB::table('students')->where('id', $sa->student_id)->first());
         $program = DB::table('programs')->where('id', $sa->program_id)->first();
         $org = DB::table('organizations')->where('id', $sa->organization_id)->first();
 
@@ -1309,7 +1760,7 @@ class ApplicationController extends Controller
         $papersBySubject = $subjectIds
             ? DB::table('subject_papers')
                 ->whereIn('subject_id', $subjectIds)
-                ->where('semester_no', $sa->semester_no)
+                ->where('semester_no', (string) $sa->semester_no) // varchar column
                 ->get()
                 ->groupBy('subject_id')
             : collect();
@@ -1347,6 +1798,38 @@ class ApplicationController extends Controller
                     'paper_code' => $p->paper_code ?? '—',
                     'paper_title' => $p->paper_name ?? '—',
                 ];
+            }
+        }
+
+        // P.G. / B.Ed. Part 6 stores paper ids (Compulsory / Optional /
+        // Teaching Subject) rather than the U.G. major/minor keys above.
+        $part6Form = strtoupper((string) ($part6['form_type'] ?? ''));
+        if (in_array($part6Form, ['PG', 'BED'], true)) {
+            $groups = [
+                'Compulsory Paper' => $part6['compulsory_paper_ids'] ?? [],
+                'Optional Paper' => $part6['optional_paper_ids'] ?? [],
+                'Teaching Subject' => $part6['teaching_paper_ids'] ?? [],
+            ];
+            $paperIds = collect($groups)->flatten()->filter()->map(fn($v) => (int) $v)->all();
+            $paperRows = $paperIds
+                ? DB::table('subject_papers as sp')
+                    ->leftJoin('subjects as s', 's.id', 'sp.subject_id')
+                    ->whereIn('sp.id', $paperIds)
+                    ->get(['sp.id', 'sp.paper_code', 'sp.paper_name', 's.name as subject_name'])
+                    ->keyBy('id')
+                : collect();
+            $subjectRows = [];
+            foreach ($groups as $label => $list) {
+                foreach (array_values(array_filter((array) $list)) as $i => $pid) {
+                    $p = $paperRows->get((int) $pid);
+                    if (!$p) continue;
+                    $subjectRows[] = [
+                        'label' => $label . ' -' . ($i + 1),
+                        'subject' => $p->subject_name ?? '—',
+                        'paper_code' => $p->paper_code ?: '—',
+                        'paper_title' => $p->paper_name ?: '—',
+                    ];
+                }
             }
         }
 
@@ -1471,9 +1954,9 @@ class ApplicationController extends Controller
                 'ra.released_at',
                 'decider.name as decided_by_name',
                 'releaser.name as released_by_name',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 DB::raw('COALESCE(dr.name, drc.name) as name'),
                 DB::raw('COALESCE(dr.father_name, drc.father_name) as father_name'),
                 DB::raw('COALESCE(s.mobile, drc.mobile) as mobile'),
@@ -1661,7 +2144,7 @@ class ApplicationController extends Controller
     private function computeBackPaperFee(object $sa, \Illuminate\Support\Collection $paperRows): array
     {
         $feeHeadIds = $paperRows->pluck('fee_head_id')->filter()->unique()->values()->all();
-        [$gender, $category] = $this->feeGenderCategory($sa->student_id);
+        [$gender, $category] = $this->feeGenderCategory($sa->student_id, $sa);
 
         $result = \App\Models\FeeStructure::breakdownFor(
             $sa->program_id,
@@ -1699,7 +2182,7 @@ class ApplicationController extends Controller
     private function computeApplicationFee(object $sa): array
     {
         $admissionType = 'regular';
-        [$gender, $category] = $this->feeGenderCategory($sa->student_id);
+        [$gender, $category] = $this->feeGenderCategory($sa->student_id, $sa);
 
         $result = \App\Models\FeeStructure::breakdownFor(
             $sa->program_id,
@@ -1710,23 +2193,109 @@ class ApplicationController extends Controller
             $category
         );
 
+        // Practical-subject fee: added on top of the fee heads, according
+        // to how many of the applicant's chosen subjects have a practical
+        // paper this semester (Fee Structure → "Fee If 01/02/03 Practical
+        // Sub."). Three or more subjects use the "03" amount.
+        $breakdown = $result['breakdown'];
+        $total = (float) $result['total'];
+        $practicalCount = $total > 0 ? $this->practicalSubjectCount($sa) : 0;
+        if ($practicalCount > 0) {
+            $pf = DB::table('fee_structure_practical_fees')
+                ->where('program_id', $sa->program_id)
+                ->where('academic_year', $sa->academic_year)
+                ->where('semester_no', (int) $sa->semester_no)
+                ->where('admission_type', $admissionType)
+                ->orderBy('id')
+                ->first();
+            $amount = $pf ? (float) ($pf->{'fee_' . min($practicalCount, 3)} ?? 0) : 0.0;
+            if ($amount > 0) {
+                $breakdown[] = [
+                    'fee_head_id' => null,
+                    'label' => "Practical Subject Fee ({$practicalCount} subject" . ($practicalCount === 1 ? '' : 's') . ')',
+                    'amount' => $amount,
+                ];
+                $total += $amount;
+            }
+        }
+
         return [
-            'base_amount' => $result['total'],
-            'total' => $result['total'],
-            'breakdown' => $result['breakdown'],
+            'base_amount' => $total,
+            'total' => $total,
+            'breakdown' => $breakdown,
+            'practical_subject_count' => $practicalCount,
             'missing_structure' => $result['total'] <= 0,
         ];
     }
 
-    private function feeGenderCategory(?int $studentId): array
+    /**
+     * How many of the applicant's chosen subjects (Part 6) have a practical
+     * paper in the semester applied for. U.G.: major + minor subjects.
+     * P.G. / B.Ed.: the subjects of the papers actually selected.
+     */
+    private function practicalSubjectCount(object $sa): int
     {
-        $student = $studentId ? DB::table('students')->where('id', $studentId)->first() : null;
+        $part6 = is_array($sa->part_6 ?? null) ? $sa->part_6 : (json_decode($sa->part_6 ?? '{}', true) ?: []);
 
-        $gender = strtolower((string) ($student->gender ?? 'male'));
-        $gender = $gender === 'other' ? 'transgender' : $gender;
+        $formType = strtoupper((string) ($part6['form_type'] ?? ''));
+        if (in_array($formType, ['PG', 'BED'], true)) {
+            $paperIds = collect([
+                $part6['compulsory_paper_ids'] ?? [],
+                $part6['optional_paper_ids'] ?? [],
+                $part6['teaching_paper_ids'] ?? [],
+            ])->flatten()->filter()->map(fn($v) => (int) $v)->unique()->all();
+            if (!$paperIds) {
+                return 0;
+            }
+            return DB::table('subject_papers')
+                ->whereIn('id', $paperIds)
+                ->whereRaw("LOWER(paper_type) = 'practical'")
+                ->distinct()
+                ->count('subject_id');
+        }
 
-        $category = strtolower((string) ($student->category ?? 'general'));
-        $category = $category === 'general' ? 'gen' : $category;
+        $subjectIds = array_values(array_unique(array_filter([
+            $part6['major_subject_1'] ?? null,
+            $part6['major_subject_2'] ?? null,
+            $part6['major_subject_3'] ?? null,
+            $part6['minor_subject_1'] ?? null,
+        ])));
+        if (!$subjectIds) {
+            return 0;
+        }
+        return DB::table('subject_papers')
+            ->whereIn('subject_id', $subjectIds)
+            ->where('semester_no', (string) $sa->semester_no) // varchar column
+            ->whereRaw("LOWER(paper_type) = 'practical'")
+            ->distinct()
+            ->count('subject_id');
+    }
+
+    /**
+     * Gender + category in the form the fee structure is keyed by. Before
+     * admission there is no students row, so the applicant's own form /
+     * registration is the source — otherwise every new applicant would be
+     * priced as male / general.
+     */
+    private function feeGenderCategory(?int $studentId, ?object $app = null): array
+    {
+        $student = $studentId ? Student::flat(DB::table('students')->where('id', $studentId)->first()) : null;
+
+        $gender = $student->gender ?? null;
+        $category = $student->category ?? null;
+
+        if ($app && (!$gender || !$category)) {
+            $part1 = is_array($app->part_1 ?? null) ? $app->part_1 : (json_decode($app->part_1 ?? '{}', true) ?: []);
+            $reg = $this->registrationForApp($app);
+            $gender = $gender ?: ($part1['gender'] ?? ($reg->gender ?? null));
+            $category = $category ?: ($part1['social_category'] ?? ($reg->category ?? null));
+        }
+
+        $gender = strtolower(trim((string) ($gender ?: 'male')));
+        $gender = in_array($gender, ['other', 'trans', 'transgender'], true) ? 'transgender' : $gender;
+
+        $category = strtolower(trim((string) ($category ?: 'general')));
+        $category = in_array($category, ['general', 'gen', 'ur', 'unreserved'], true) ? 'gen' : $category;
 
         return [$gender, $category];
     }
@@ -1773,7 +2342,7 @@ class ApplicationController extends Controller
         return $this->doApplicationPayInitiate($sa);
     }
 
-    private function doApplicationPayInitiate(object $sa)
+    private function doApplicationPayInitiate(object $sa, bool $allowPending = false)
     {
         if ($sa->application_type === 'back_paper') {
             return response()->json(['message' => 'Use the back-paper payment endpoint for this application.'], 422);
@@ -1783,8 +2352,11 @@ class ApplicationController extends Controller
         }
         // Payment unlocks only after office approval (approve()) — not
         // at 'submitted'/'under_review' as before.
-        if ($sa->status !== 'approved') {
-            return response()->json(['message' => 'The application must be approved by the college before the education fee can be paid.'], 422);
+        $payable = $allowPending ? ['submitted', 'under_review', 'approved'] : ['approved'];
+        if (!in_array($sa->status, $payable, true)) {
+            return response()->json(['message' => $allowPending
+                ? "The education fee cannot be collected while the application is {$sa->status}."
+                : 'The application must be approved by the college before the education fee can be paid.'], 422);
         }
         // Subject selection lives on part_6 only — the old top-level
         // selected_subjects column was always null for real student-
@@ -1808,8 +2380,12 @@ class ApplicationController extends Controller
             return response()->json(['message' => 'Payment gateway not configured. Contact the office.'], 503);
         }
 
-        $student = DB::table('students')->where('id', $sa->student_id)->first();
+        $student = Student::flat(DB::table('students')->where('id', $sa->student_id)->first());
         $name = $student ? trim(implode(' ', array_filter([$student->first_name ?? null, $student->middle_name ?? null, $student->last_name ?? null]))) : '';
+        // A first-time applicant has no students row yet — prefill the
+        // checkout from the registration instead.
+        $who = $this->applicantSnapshot($sa);
+        $name = $name !== '' ? $name : ($who['name'] ?? '');
 
         try {
             $resp = Http::withBasicAuth($key, $secret)
@@ -1850,8 +2426,8 @@ class ApplicationController extends Controller
             'currency' => 'INR',
             'key' => $key,
             'name' => $name,
-            'email' => $student->email ?? '',
-            'mobile' => $student->mobile ?? '',
+            'email' => $student->email ?? ($who['email'] ?? ''),
+            'mobile' => $student->mobile ?? ($who['mobile'] ?? ''),
             'application_id' => $sa->id,
         ]);
     }
@@ -1876,7 +2452,7 @@ class ApplicationController extends Controller
         return $this->doApplicationPayVerify($sa, $req);
     }
 
-    private function doApplicationPayVerify(object $sa, Request $req)
+    private function doApplicationPayVerify(object $sa, Request $req, bool $allowPending = false)
     {
         $req->validate([
             'razorpay_order_id' => 'required|string',
@@ -1894,8 +2470,9 @@ class ApplicationController extends Controller
         // Defense in depth — doApplicationPayInitiate() already gates on
         // this, but verify is a separate request and must not trust that
         // nothing changed (rejected/put on hold) in between.
-        if ($sa->status !== 'approved') {
-            return response()->json(['message' => 'This application is no longer approved for payment.'], 422);
+        $payable = $allowPending ? ['submitted', 'under_review', 'approved'] : ['approved'];
+        if (!in_array($sa->status, $payable, true)) {
+            return response()->json(['message' => 'This application is no longer open for payment.'], 422);
         }
         if ($sa->fee_paid) {
             return response()->json(['message' => 'Education fee already paid.'], 409);
@@ -1907,14 +2484,27 @@ class ApplicationController extends Controller
         $feeHeadNames = DB::table('fee_heads')->whereIn('id', collect($fee['breakdown'])->pluck('fee_head_id')->filter()->all() ?: [0])->pluck('name', 'id');
         $breakdown = collect($fee['breakdown'])->map(fn($b) => [
             'fee_head_id' => $b['fee_head_id'],
-            'fee_head_name' => $feeHeadNames[$b['fee_head_id']] ?? 'Fee',
+            'fee_head_name' => $b['label'] ?? ($feeHeadNames[$b['fee_head_id']] ?? 'Fee'),
             'amount' => $b['amount'],
         ])->values()->all();
 
         $feeRefId = null;
         $receipt = DB::transaction(function () use ($sa, $fee, $breakdown, $isSelfFinance, $req, &$feeRefId) {
-            $this->confirmStudentAndCreateAdmission($sa, (int) $sa->approved_by);
-            $admissionId = DB::table('admissions')->where('application_id', $sa->id)->value('id');
+            // The admissions row exists since submit; make sure of it.
+            $admissionId = $this->syncAdmissionForApplication((int) $sa->id);
+
+            // Someone who is already a student (semester / year upgrade) is
+            // confirmed on payment as before. A first-time applicant has no
+            // students row yet and does not get one here — that happens when
+            // college staff verify this receipt (finalizeAdmissionAfterReceipt()).
+            $knownStudentId = $sa->student_id
+                ?: ($sa->user_id ? DB::table('students')->where('user_id', $sa->user_id)->value('id') : null);
+            // …and only once approved: a fee collected by the office before
+            // approval must not admit anyone. approve() finishes the job.
+            if ($knownStudentId && $sa->status === 'approved') {
+                $this->confirmStudentAndCreateAdmission($sa, (int) $sa->approved_by);
+                $admissionId = DB::table('admissions')->where('application_id', $sa->id)->orderByDesc('id')->value('id');
+            }
 
             $r = FeeReceipt::create([
                 'organization_id' => $sa->organization_id,
@@ -1937,9 +2527,29 @@ class ApplicationController extends Controller
             ]);
 
             $program = DB::table('programs')->where('id', $sa->program_id)->first();
-            $student = DB::table('students')->where('id', $sa->student_id)->first();
+            $student = $sa->student_id
+                ? Student::flat(DB::table('students')->where('id', $sa->student_id)->first())
+                : null;
+            $applicant = $this->applicantSnapshot($sa);
             $feeRefId = app(\App\Services\AdmissionNumberService::class)
-                ->feeRefId('student_applications', 'fee_ref_id', $program, $student->category ?? null, $student->gender ?? null);
+                ->feeRefId(
+                    'student_applications',
+                    'fee_ref_id',
+                    $program,
+                    $student->category ?? ($applicant['category'] ?? null),
+                    $student->gender ?? ($applicant['gender'] ?? null)
+                );
+
+            if ($admissionId) {
+                DB::table('admissions')->where('id', $admissionId)->update([
+                    'payment_status' => 'paid',
+                    'fee_status' => 'Paid',
+                    'razorpay_order_id' => $req->razorpay_order_id,
+                    'razorpay_payment_id' => $req->razorpay_payment_id,
+                    'paid_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            }
 
             DB::table('student_applications')->where('id', $sa->id)->update([
                 'fee_paid' => true,
@@ -1958,7 +2568,12 @@ class ApplicationController extends Controller
         GenerateFeeReceiptPdf::dispatch($receipt->id);
 
         return response()->json([
-            'message' => 'Education fee paid successfully. Your admission is confirmed.',
+            'message' => $sa->status !== 'approved'
+                ? 'Education fee paid successfully. The application can now be approved.'
+                : ($sa->student_id
+                    ? 'Education fee paid successfully. Your admission is confirmed.'
+                    : 'Education fee paid successfully. Your admission will be confirmed once the college verifies the receipt.'),
+            'admission_confirmed' => $sa->status === 'approved' && (bool) $sa->student_id,
             'application_id' => $sa->id,
             'receipt_no' => $receipt->receipt_no,
             'fee_receipt_id' => $receipt->id,
@@ -2123,7 +2738,7 @@ class ApplicationController extends Controller
             return response()->json(['message' => 'Payment gateway not configured. Contact the office.'], 503);
         }
 
-        $student = DB::table('students')->where('id', $sa->student_id)->first();
+        $student = Student::flat(DB::table('students')->where('id', $sa->student_id)->first());
 
         try {
             $resp = Http::withBasicAuth($key, $secret)
@@ -2320,7 +2935,7 @@ class ApplicationController extends Controller
             return response()->json(['message' => 'Print is available only after the fee is paid.'], 422);
         }
 
-        $student = DB::table('students')->where('id', $sa->student_id)->first();
+        $student = Student::flat(DB::table('students')->where('id', $sa->student_id)->first());
         $program = DB::table('programs')->where('id', $sa->program_id)->first();
         $org = DB::table('organizations')->where('id', $sa->organization_id)->first();
         $admission = DB::table('admissions')
@@ -2373,7 +2988,7 @@ class ApplicationController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $student = DB::table('students')->where('user_id', $req->user()->id)->first();
+        $student = Student::flat(DB::table('students')->where('user_id', $req->user()->id)->first());
         if (!$student)
             return response()->json(['message' => 'Student profile not found.'], 404);
 
@@ -2538,7 +3153,7 @@ class ApplicationController extends Controller
             ->orderByDesc('id')
             ->first();
 
-        $existingStudent = DB::table('students')->where('user_id', $userId)->first();
+        $existingStudent = Student::flat(DB::table('students')->where('user_id', $userId)->first());
 
         $id = DB::table('student_applications')->insertGetId([
             'organization_id' => $req->user()->organization_id,
@@ -2571,6 +3186,77 @@ class ApplicationController extends Controller
      * PUT /student/applications/{id}/part/{part}
      * Student saves one part. Blocked if submitted or approved.
      */
+    /** 'BED' | 'PG' | null — which Part 6 form the course uses (null = U.G. form). */
+    private function part6FormType($program): ?string
+    {
+        return Part6Rules::formType($program);
+    }
+
+    private const PART6_OPTIONAL_SLOTS = Part6Rules::OPTIONAL_SLOTS;
+    private const PART6_TEACHING_SLOTS = Part6Rules::TEACHING_SLOTS;
+    private const PART6_TEACHING_FROM_SEMESTER = Part6Rules::TEACHING_FROM_SEMESTER;
+
+    /**
+     * Student save of Part 6 for a P.G. / B.Ed. course. Returns $data
+     * untouched for every other course (U.G. form is not affected).
+     */
+    private function lockPart6ForPgBedStudent(object $app, array $data): array
+    {
+        $program = DB::table('programs')->where('id', $app->program_id)->first();
+        $formType = $this->part6FormType($program);
+        if (!$formType) {
+            return $data;
+        }
+
+        $reg = !empty($app->direct_registration_id)
+            ? DB::table('direct_registrations')->where('id', $app->direct_registration_id)->first()
+            : null;
+
+        // P.G.: the subject is the one taken at registration.
+        $subjectId = null;
+        if ($formType === 'PG') {
+            $subjectId = $reg->subject_id ?? $reg->major_subject_1 ?? ($data['subject_id'] ?? null);
+            $subjectId = $subjectId ? (int) $subjectId : null;
+        }
+
+        $papers = DB::table('subject_papers')
+            ->where('program_id', $app->program_id)
+            ->where('semester_no', (string) $app->semester_no)
+            ->when(!empty($app->academic_year), fn($q) => $q->where('session_year', $app->academic_year))
+            ->when($formType === 'PG', fn($q) => $q->where('subject_id', $subjectId ?? 0))
+            ->orderBy('id')
+            ->get(['id', 'subject_id', 'selection_type']);
+
+        $idsOf = fn(string $type) => $papers->where('selection_type', $type)->pluck('id')->map(fn($v) => (int) $v)->values()->all();
+        $pick = function ($submitted, array $allowed, int $max): array {
+            $submitted = is_array($submitted) ? array_map('intval', $submitted) : [];
+            return array_slice(array_values(array_unique(array_intersect($submitted, $allowed))), 0, $max);
+        };
+
+        $compulsory = $idsOf('Compulsory');
+        $optional = $pick($data['optional_paper_ids'] ?? [], $idsOf('Optional'), self::PART6_OPTIONAL_SLOTS[$formType]);
+        $teachingAllowed = $formType === 'BED' && (int) $app->semester_no >= self::PART6_TEACHING_FROM_SEMESTER;
+        $teaching = $teachingAllowed
+            ? $pick($data['teaching_paper_ids'] ?? [], $idsOf('Teaching Subject'), self::PART6_TEACHING_SLOTS)
+            : [];
+
+        $all = array_values(array_merge($compulsory, $optional, $teaching));
+        $selectedSubjects = $formType === 'PG'
+            ? ($subjectId ? [$subjectId] : [])
+            : $papers->whereIn('id', $all)->pluck('subject_id')->unique()->map(fn($v) => (int) $v)->values()->all();
+
+        return [
+            'form_type' => $formType,
+            'subject_id' => $subjectId,
+            'stream' => $formType === 'BED' ? ($reg->stream ?? ($data['stream'] ?? null)) : null,
+            'compulsory_paper_ids' => $compulsory,
+            'optional_paper_ids' => $optional,
+            'teaching_paper_ids' => $teaching,
+            'selected_papers' => $all,
+            'selected_subjects' => $selectedSubjects,
+        ];
+    }
+
     public function updatePart(Request $req, $id, $part)
     {
         $partNo = (int) $part;
@@ -2595,8 +3281,20 @@ class ApplicationController extends Controller
         $prog = json_decode($app->form_progress ?? '{}', true);
         $prog[$key] = true;
 
+        if ($partNo === 1 && ($invalid = $this->invalidPart1($req))) {
+            return $invalid;
+        }
+
         $clean = $this->stripLockedIdentity($req->all(), $req->user()->id);
         $clean = TextNormalizer::upper($clean, $this->selectDrivenApplicationFields());
+
+        // P.G. / B.Ed. Part 6: the student may only choose Optional and
+        // Teaching Subject papers. Compulsory papers and the subject are
+        // re-derived here, so a hand-edited request can't change them.
+        // (updatePartOffice() does not call this — the office edits freely.)
+        if ($partNo === 6) {
+            $clean = $this->lockPart6ForPgBedStudent($app, $clean);
+        }
 
         DB::table('student_applications')->where('id', $id)->update([
             $col => json_encode($clean),
@@ -2616,7 +3314,7 @@ class ApplicationController extends Controller
 
     private function studentForContactChange(Request $req, $id): ?object
     {
-        $student = DB::table('students')->where('user_id', $req->user()->id)->first();
+        $student = Student::flat(DB::table('students')->where('user_id', $req->user()->id)->first());
         if (!$student)
             return null;
 
@@ -2824,6 +3522,9 @@ class ApplicationController extends Controller
             'updated_at' => now(),
         ]);
 
+        // Hand the form over to the office: pending admission from here on.
+        $this->syncAdmissionForApplication((int) $id);
+
         return response()->json([
             'message' => 'Application submitted successfully.',
             'application_no' => $app->application_no,
@@ -2875,6 +3576,9 @@ class ApplicationController extends Controller
             'updated_at' => now(),
         ]);
 
+        // Hand the form over to the office: pending admission from here on.
+        $this->syncAdmissionForApplication((int) $id);
+
         return response()->json([
             'message' => 'Application submitted successfully.',
             'application_no' => $app->application_no,
@@ -2892,7 +3596,7 @@ class ApplicationController extends Controller
     private function missingPriorParts(object $app): array
     {
         $missing = [];
-        $labels = [1 => 'Personal Detail', 2 => 'Address & Communication', 3 => 'Educational Detail', 4 => 'TC & Migration Detail', 6 => 'Subject & Paper Selection'];
+        $labels = [1 => 'Personal Detail', 2 => 'Address & Communication', 3 => 'Educational Detail', 4 => 'TC & Migration Detail'];
         foreach ($labels as $n => $label) {
             $col = "part_{$n}";
             if (empty($app->$col)) {
@@ -2900,9 +3604,19 @@ class ApplicationController extends Controller
             }
         }
 
+        // Part 6 must be genuinely complete, not merely saved — same rule
+        // parseApp() exposes as part6_complete.
+        $p6 = is_array($app->part_6 ?? null) ? $app->part_6 : ($app->part_6 ? json_decode($app->part_6, true) : []);
+        $program = DB::table('programs')->where('id', $app->program_id)->first();
+        if (!Part6Rules::isComplete($app, $program, is_array($p6) ? $p6 : [])) {
+            $missing[] = 'Subject & Paper Selection';
+        }
+
         $p5 = is_array($app->part_5 ?? null) ? $app->part_5 : ($app->part_5 ? json_decode($app->part_5, true) : []);
-        $bankComplete = ($p5['has_bank_account'] ?? null) === 'no'
-            || (($p5['has_bank_account'] ?? null) === 'yes'
+        // Case-insensitive, same as parseApp() — older saves are upper-cased.
+        $hasBank = strtolower((string) ($p5['has_bank_account'] ?? ''));
+        $bankComplete = $hasBank === 'no'
+            || ($hasBank === 'yes'
                 && trim((string) ($p5['name_in_account'] ?? '')) !== ''
                 && trim((string) ($p5['bank_name'] ?? '')) !== ''
                 && trim((string) ($p5['bank_branch'] ?? '')) !== ''
@@ -3261,7 +3975,7 @@ class ApplicationController extends Controller
      */
     public function upgradeSelf(Request $req)
     {
-        $student = DB::table('students')->where('user_id', $req->user()->id)->first();
+        $student = Student::flat(DB::table('students')->where('user_id', $req->user()->id)->first());
         if (!$student)
             return response()->json(['message' => 'Student profile not found.'], 404);
 
@@ -3272,9 +3986,9 @@ class ApplicationController extends Controller
             ->select(
                 'a.*',
                 's.mobile',
-                's.gender',
-                's.date_of_birth',
-                's.category',
+                's.personal_info->gender as gender',
+                's.personal_info->date_of_birth as date_of_birth',
+                's.personal_info->category as category',
                 's.aadhar_no',
                 's.abc_id',
                 's.ddurn',

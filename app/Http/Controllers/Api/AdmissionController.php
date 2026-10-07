@@ -31,20 +31,100 @@ class AdmissionController extends Controller
             $query->where('is_verified', $request->boolean('is_verified'));
         if ($request->filled('search')) {
             $q = $request->search;
-            $query->whereHas(
-                'student',
-                fn($w) =>
-                    $w->where('first_name', 'ilike', "%{$q}%")
-                        ->orWhere('last_name', 'ilike', "%{$q}%")
-                        ->orWhere('enrollment_no', 'ilike', "%{$q}%")
-                        ->orWhere('mobile', 'like', "%{$q}%")
-            )->orWhere('admission_no', 'ilike', "%{$q}%");
+            // Grouped, so the OR branches stay inside this college's rows.
+            // applicant_info covers pending admissions, which have no
+            // students row to search yet.
+            $query->where(function ($outer) use ($q) {
+                $outer->whereHas(
+                    'student',
+                    fn($w) =>
+                        $w->where('personal_info->first_name', 'ilike', "%{$q}%")
+                            ->orWhere('personal_info->last_name', 'ilike', "%{$q}%")
+                            ->orWhere('enrollment_no', 'ilike', "%{$q}%")
+                            ->orWhere('mobile', 'like', "%{$q}%")
+                )
+                    ->orWhere('admission_no', 'ilike', "%{$q}%")
+                    ->orWhere('applicant_info->name', 'ilike', "%{$q}%")
+                    ->orWhere('applicant_info->mobile', 'like', "%{$q}%")
+                    ->orWhere('applicant_info->application_no', 'ilike', "%{$q}%");
+            });
         }
 
-        return response()->json(
-            $query->orderBy('admission_date', 'desc')
-                ->paginate($request->get('per_page', 20))
-        );
+        $page = $query->orderBy('admission_date', 'desc')
+            ->orderBy('id', 'desc')
+            ->paginate($request->get('per_page', 20));
+
+        // The application view/edit pages need the registration's unique
+        // code in the URL (ApplicationController::rejectIfCodeInvalid()).
+        $regIds = $page->getCollection()
+            ->map(fn($a) => $a->direct_registration_id ?: ($a->application->direct_registration_id ?? null))
+            ->filter()->unique()->values()->all();
+        $codes = $regIds
+            ? DB::table('direct_registrations')->whereIn('id', $regIds)->pluck('unique_code', 'id')
+            : collect();
+        $page->getCollection()->each(function ($a) use ($codes) {
+            $regId = $a->direct_registration_id ?: ($a->application->direct_registration_id ?? null);
+            $a->setAttribute('code', $regId ? ($codes[$regId] ?? null) : null);
+        });
+
+        return response()->json($page);
+    }
+
+    /**
+     * GET /admissions/pipeline-summary
+     * The six admission-pipeline counters shown above the Manage Admission
+     * list. Follows the Session / Program / Semester filters only — not
+     * Status or Search, so the counters describe the whole pipeline.
+     *
+     * Definitions match Registration Status (RegistrationController):
+     *   registration          direct_registrations.status = 'registered'
+     *   complete_fill         application submitted (any status except draft)
+     *   approved_application  application status = 'approved'
+     *   paid_fee              admission payment_status = 'paid'
+     *   student_id_generated  admitted students that have a student_uid
+     *   admission_cancel      admission status = 'cancelled'
+     * Semester does not apply to registrations (a registration has none).
+     */
+    public function pipelineSummary(Request $request): JsonResponse
+    {
+        $orgId = $request->user()->organization_id;
+        $year = $request->input('academic_year');
+        $programId = $request->input('program_id');
+        $semester = $request->input('semester_no');
+
+        $registration = DB::table('direct_registrations')
+            ->whereNull('deleted_at')
+            ->where('status', 'registered')
+            ->when($year, fn($q) => $q->where('session_year', $year))
+            ->when($programId, fn($q) => $q->where('program_id', $programId))
+            ->count();
+
+        $applications = fn() => DB::table('student_applications')
+            ->whereNull('deleted_at')
+            ->where('organization_id', $orgId)
+            ->when($year, fn($q) => $q->where('academic_year', $year))
+            ->when($programId, fn($q) => $q->where('program_id', $programId))
+            ->when($semester, fn($q) => $q->where('semester_no', $semester));
+
+        $admissions = fn() => DB::table('admissions as a')
+            ->where('a.organization_id', $orgId)
+            ->when($year, fn($q) => $q->where('a.academic_year', $year))
+            ->when($programId, fn($q) => $q->where('a.program_id', $programId))
+            ->when($semester, fn($q) => $q->where('a.semester_no', $semester));
+
+        return response()->json([
+            'registration' => $registration,
+            'complete_fill' => $applications()->where('status', '!=', 'draft')->count(),
+            'approved_application' => $applications()->where('status', 'approved')->count(),
+            'paid_fee' => $admissions()->where('a.payment_status', 'paid')->count(),
+            'student_id_generated' => $admissions()
+                ->join('students as s', 's.id', 'a.student_id')
+                ->whereNotNull('s.student_uid')
+                ->where('s.student_uid', '!=', '')
+                ->distinct()
+                ->count('a.student_id'),
+            'admission_cancel' => $admissions()->where('a.status', 'cancelled')->count(),
+        ]);
     }
 
     public function show(Admission $admission): JsonResponse
@@ -65,6 +145,11 @@ class AdmissionController extends Controller
 
         if ($admission->is_verified) {
             return response()->json(['message' => 'Admission is already verified.'], 422);
+        }
+        if (!$admission->student_id) {
+            return response()->json([
+                'message' => 'This admission has no student record yet. It is confirmed when the fee receipt is verified.',
+            ], 422);
         }
 
         $admission->update([
@@ -106,7 +191,7 @@ class AdmissionController extends Controller
         ]);
 
         // Update student status
-        $admission->student->update(['status' => 'cancelled']);
+        $admission->student?->update(['status' => 'cancelled']);
 
         return response()->json(['message' => 'Admission cancelled.']);
     }
@@ -184,7 +269,7 @@ class AdmissionController extends Controller
             $q = $request->search;
             $query->where(
                 fn($w) =>
-                    $w->where('first_name', 'ilike', "%{$q}%")
+                    $w->where('personal_info->first_name', 'ilike', "%{$q}%")
                         ->orWhere('enrollment_no', 'ilike', "%{$q}%")
                         ->orWhere('mobile', 'like', "%{$q}%")
             );
@@ -193,9 +278,7 @@ class AdmissionController extends Controller
         return response()->json($query->select([
             'id',
             'enrollment_no',
-            'first_name',
-            'middle_name',
-            'last_name',
+            'personal_info', // first/middle/last name — flattened by Student::toArray()
             'mobile',
             'photo_path',
             'biometric_id',

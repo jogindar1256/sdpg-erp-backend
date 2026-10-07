@@ -35,9 +35,9 @@ class FinancialController extends Controller
             ->select(
                 'a.id as admission_id', 'a.student_id', 'a.admission_no',
                 'a.academic_year as session', 'a.semester_no', 'a.program_id', 'a.admission_type',
-                's.first_name', 's.middle_name', 's.last_name',
+                's.personal_info->first_name as first_name', 's.personal_info->middle_name as middle_name', 's.personal_info->last_name as last_name',
                 'dr.name as reg_name', 'dr.father_name', 'dr.mother_name',
-                's.gender', 's.category', 's.mobile', 's.aadhar_no', 's.abc_id',
+                's.personal_info->gender as gender', 's.personal_info->category as category', 's.mobile', 's.aadhar_no', 's.abc_id',
                 'p.short_name as class_name', 'p.full_name as program_name'
             )
             ->where(function ($q) use ($key) {

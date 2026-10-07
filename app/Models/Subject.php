@@ -16,6 +16,8 @@ class Subject extends Model
         'paper_type', 'max_marks', 'min_marks', 'internal_marks',
         'credits', 'is_active', 'has_practical', 'practical_fee',
         'additional_fee_applicable', 'additional_fee',
+        // 'subject' | 'stream' — internal marker (B.Ed rows are streams).
+        'entry_type',
     ];
 
     protected $casts = [

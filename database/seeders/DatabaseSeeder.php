@@ -24,11 +24,6 @@ class DatabaseSeeder extends Seeder
             'manage-exams', 'generate-certificates', 'manage-settings',
             'view-reports', 'manage-users', 'block-students',
             'verify-fee-receipts', 'cancel-admissions',
-            // Gates the "Highly Respected Objection" hold-release action on
-            // /college/applications/hold-reject-applications — Principal/
-            // Proctor only, never the staff who placed the hold. The
-            // "General Instruction Objection" release path reuses the
-            // existing verify-admissions permission instead of a new one.
             'release-highly-respected-objection',
         ];
 

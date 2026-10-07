@@ -25,8 +25,8 @@ class StudentController extends Controller
         if ($request->filled('search')) {
             $q = $request->search;
             $query->where(function ($w) use ($q) {
-                $w->where('first_name', 'ilike', "%{$q}%")
-                  ->orWhere('last_name', 'ilike', "%{$q}%")
+                $w->where('personal_info->first_name', 'ilike', "%{$q}%")
+                  ->orWhere('personal_info->last_name', 'ilike', "%{$q}%")
                   ->orWhere('enrollment_no', 'ilike', "%{$q}%")
                   ->orWhere('mobile', 'like', "%{$q}%");
             });
@@ -72,7 +72,7 @@ class StudentController extends Controller
      */
     public function myProfile(Request $request): JsonResponse
     {
-        $student = DB::table('students')->where('user_id', $request->user()->id)->first();
+        $student = Student::flat(DB::table('students')->where('user_id', $request->user()->id)->first());
         if (!$student) {
             return response()->json(['message' => 'Student profile not found.'], 404);
         }
@@ -121,7 +121,7 @@ class StudentController extends Controller
             'permanent_state'     => $student->permanent_state,
             'permanent_pin'       => $student->permanent_pin,
             'enrollment_no'       => $student->enrollment_no,
-            'student_code'        => $student->student_code,
+            'student_uid'        => $student->student_uid,
             'photo_path'          => $student->photo_path,
             'has_registration_snapshot' => (bool) $registration,
         ]]);
@@ -136,7 +136,7 @@ class StudentController extends Controller
      */
     public function updateProfile(Request $request): JsonResponse
     {
-        $student = DB::table('students')->where('user_id', $request->user()->id)->first();
+        $student = Student::flat(DB::table('students')->where('user_id', $request->user()->id)->first());
         if (!$student) {
             return response()->json(['message' => 'Student profile not found.'], 404);
         }
@@ -154,7 +154,7 @@ class StudentController extends Controller
         }
 
         $allowed['updated_at'] = now();
-        DB::table('students')->where('id', $student->id)->update($allowed);
+        Student::groupedUpdate($student->id, $allowed);
 
         return response()->json(['message' => 'Profile updated.']);
     }
@@ -294,12 +294,12 @@ class StudentController extends Controller
             'active'      => Student::where('organization_id', $orgId)->where('status', 'active')->count(),
             'blocked'     => Student::where('organization_id', $orgId)->where('is_blocked', true)->count(),
             'by_category' => Student::where('organization_id', $orgId)
-                                ->selectRaw('category, count(*) as count')
-                                ->groupBy('category')
+                                ->selectRaw("personal_info->>'category' as category, count(*) as count")
+                                ->groupBy(DB::raw("personal_info->>'category'"))
                                 ->pluck('count', 'category'),
             'by_gender'   => Student::where('organization_id', $orgId)
-                                ->selectRaw('gender, count(*) as count')
-                                ->groupBy('gender')
+                                ->selectRaw("personal_info->>'gender' as gender, count(*) as count")
+                                ->groupBy(DB::raw("personal_info->>'gender'"))
                                 ->pluck('count', 'gender'),
         ];
 

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Support\TextNormalizer;
 use Illuminate\Http\Request;
@@ -50,8 +51,8 @@ class AmendmentController extends Controller
             ->leftJoinSub($latestApp, 'la', 'la.student_id', 's.id')
             ->leftJoin('student_applications as sa', 'sa.id', 'la.app_id')
             ->where(function ($q) use ($key) {
-                $q->where('a.roll_no', $key)
-                    ->orWhere('a.enrollment_no', $key)
+                $q->where('s.university_roll_no', $key)
+                    ->orWhere('s.enrollment_no', $key)
                     ->orWhere('a.account_no', $key)
                     ->orWhere('s.mobile', $key)
                     ->orWhere('s.aadhar_no', $key)
@@ -61,28 +62,28 @@ class AmendmentController extends Controller
             })
             ->select(
                 'a.id as admission_id',
-                'a.roll_no',
-                'a.enrollment_no',
+                's.university_roll_no as roll_no',
+                's.enrollment_no',
                 'a.account_no',
                 'a.semester_no',
                 'a.academic_year',
                 'a.admission_date',
                 'a.status as admission_status',
                 's.id as student_id',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name',
                 'dr.mother_name',
                 'dr.dob',
                 's.mobile',
-                's.gender',
-                's.category',
+                's.personal_info->gender as gender',
+                's.personal_info->category as category',
                 's.aadhar_no',
                 's.abc_id',
                 's.ddurn',
-                's.permanent_address as address',
+                's.address_info->permanent_address as address',
                 'p.short_name as course',
                 'p.full_name',
                 'p.level',
@@ -133,35 +134,35 @@ class AmendmentController extends Controller
             })
             ->leftJoin('fee_receipts as fr', 'fr.admission_id', 'a.id')
             ->where(function ($q) use ($k) {
-                $q->where('a.roll_no', 'ilike', "%{$k}%")
+                $q->where('s.university_roll_no', 'ilike', "%{$k}%")
                     ->orWhere('dr.name', 'ilike', "%{$k}%")
                     ->orWhere('dr.father_name', 'ilike', "%{$k}%")
                     ->orWhere('dr.mother_name', 'ilike', "%{$k}%")
-                    ->orWhere('s.first_name', 'ilike', "%{$k}%")
-                    ->orWhere('s.last_name', 'ilike', "%{$k}%")
+                    ->orWhere('s.personal_info->first_name', 'ilike', "%{$k}%")
+                    ->orWhere('s.personal_info->last_name', 'ilike', "%{$k}%")
                     ->orWhere('s.mobile', 'ilike', "%{$k}%")
                     ->orWhere('s.aadhar_no', 'ilike', "%{$k}%")
-                    ->orWhere('a.enrollment_no', 'ilike', "%{$k}%")
+                    ->orWhere('s.enrollment_no', 'ilike', "%{$k}%")
                     ->orWhere('sa.application_no', 'ilike', "%{$k}%")
                     ->orWhere('dr.registration_no', 'ilike', "%{$k}%");
             })
             ->select(
                 'a.id as admission_id',
-                'a.roll_no',
-                'a.enrollment_no',
+                's.university_roll_no as roll_no',
+                's.enrollment_no',
                 'a.account_no',
                 'a.semester_no',
                 'a.status as admission_status',
                 's.id as student_id',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name',
                 'dr.mother_name',
                 's.mobile',
-                's.gender',
-                's.category',
+                's.personal_info->gender as gender',
+                's.personal_info->category as category',
                 's.aadhar_no',
                 's.abc_id',
                 's.ddurn',
@@ -176,21 +177,21 @@ class AmendmentController extends Controller
             )
             ->groupBy(
                 'a.id',
-                'a.roll_no',
-                'a.enrollment_no',
+                's.university_roll_no',
+                's.enrollment_no',
                 'a.account_no',
                 'a.semester_no',
                 'a.status',
                 's.id',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name',
+                's.personal_info->middle_name',
+                's.personal_info->last_name',
                 'dr.name',
                 'dr.father_name',
                 'dr.mother_name',
                 's.mobile',
-                's.gender',
-                's.category',
+                's.personal_info->gender',
+                's.personal_info->category',
                 's.aadhar_no',
                 's.abc_id',
                 's.ddurn',
@@ -236,7 +237,7 @@ class AmendmentController extends Controller
 
         // Return full student profile + the registration snapshot (name/
         // father_name/mother_name/dob/caste_cert_* live there, not on students).
-        $full = DB::table('students')->find($student->student_id);
+        $full = Student::flat(DB::table('students')->find($student->student_id));
         $reg = $full ? DB::table('direct_registrations')
             ->where('user_id', $full->user_id)
             ->whereNull('deleted_at')
@@ -271,7 +272,7 @@ class AmendmentController extends Controller
             'district' => 'permanent_district',
             'state' => 'permanent_state',
             'address' => 'permanent_address',
-        ];
+        ] + array_combine(Student::CERTIFICATE_FIELDS, Student::CERTIFICATE_FIELDS);
         // → direct_registrations columns
         $regFieldMap = [
             'name' => 'name',
@@ -282,10 +283,15 @@ class AmendmentController extends Controller
             'caste_cert_date' => 'caste_cert_date',
         ];
 
+        $v = Validator::make($req->all(), Student::certificateRules());
+        if ($v->fails())
+            return response()->json(['message' => $v->errors()->first(), 'errors' => $v->errors()], 422);
+
         // Backstop: uppercase free text server-side too (frontend already
         // does this live as staff type). None of the mapped fields below are
         // email/password, so it's safe to normalize the whole payload.
-        $in = TextNormalizer::upper($req->all());
+        // (Yes/No and category choices keep their exact spelling.)
+        $in = TextNormalizer::upper($req->all(), Student::CERTIFICATE_CHOICE_FIELDS);
         $studentData = [];
         foreach ($studentFieldMap as $in_key => $col) {
             if (array_key_exists($in_key, $in) && $in[$in_key] !== null)
@@ -303,11 +309,11 @@ class AmendmentController extends Controller
 
         if (!empty($studentData)) {
             $studentData['updated_at'] = now();
-            DB::table('students')->where('id', $req->student_id)->update($studentData);
+            Student::groupedUpdate($req->student_id, $studentData);
         }
 
         if (!empty($regData)) {
-            $student = DB::table('students')->find($req->student_id);
+            $student = Student::flat(DB::table('students')->find($req->student_id));
             $reg = $student ? DB::table('direct_registrations')
                 ->where('user_id', $student->user_id)
                 ->whereNull('deleted_at')
@@ -720,15 +726,15 @@ class AmendmentController extends Controller
             ->where('a.semester_no', $req->semester_no)
             ->select(
                 'a.id as admission_id',
-                'a.roll_no',
-                'a.enrollment_no',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.university_roll_no as roll_no',
+                's.enrollment_no',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name'
             )
-            ->orderBy('a.roll_no')
+            ->orderBy('s.university_roll_no')
             ->get();
 
         $students->transform(function ($row) {
@@ -793,18 +799,18 @@ class AmendmentController extends Controller
             )
             ->select(
                 'a.id as admission_id',
-                'a.roll_no',
+                's.university_roll_no as roll_no',
                 'a.account_no',
                 'a.semester_no',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 's.mobile',
                 'sa.application_no',
                 'p.short_name as course'
             )
-            ->orderBy('a.roll_no')
+            ->orderBy('s.university_roll_no')
             ->get();
 
         $students->transform(function ($row) {
@@ -832,16 +838,16 @@ class AmendmentController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
         $fieldMap = [
-            'Registration No' => 'a.roll_no',
+            'Registration No' => 's.university_roll_no',
             'Application No' => 'sa.application_no',
-            'University Roll No' => 'a.enrollment_no',
+            'University Roll No' => 's.enrollment_no',
             'Enrolment No' => 'a.account_no',
             'Student Name English' => 'dr.name',
             'Father Name English' => 'dr.father_name',
             'Mother Name English' => 'dr.mother_name',
             'Date of Birth' => 'dr.dob',
-            'Category' => 's.category',
-            'Gander' => 's.gender',
+            'Category' => "s.personal_info->>'category'",
+            'Gander' => "s.personal_info->>'gender'",
         ];
 
         $selects = [];
@@ -868,7 +874,7 @@ class AmendmentController extends Controller
             ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('a.semester_no', $req->semester_no))
             ->selectRaw(implode(', ', $selects))
-            ->orderBy('a.roll_no')
+            ->orderBy('s.university_roll_no')
             ->get();
 
         return response()->json($data);
@@ -1041,9 +1047,9 @@ class AmendmentController extends Controller
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->select(
                 'sr.*',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name',
                 's.mobile',
@@ -1248,9 +1254,9 @@ class AmendmentController extends Controller
             }))
             ->select(
                 'ap.*',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name',
                 's.mobile',
@@ -1308,9 +1314,9 @@ class AmendmentController extends Controller
             ->when($req->status, fn($q) => $q->where('al.status', $req->status))
             ->select(
                 'al.*',
-                's.first_name',
-                's.middle_name',
-                's.last_name',
+                's.personal_info->first_name as first_name',
+                's.personal_info->middle_name as middle_name',
+                's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name',
                 's.mobile'

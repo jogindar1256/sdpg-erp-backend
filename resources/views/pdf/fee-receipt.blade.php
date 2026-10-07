@@ -297,7 +297,7 @@
         <tr>
             <td>
                 <h4>Admission Detail</h4>
-                <div>Student ID :- {{ $val($student->student_code ?? null) }}</div>
+                <div>Student ID :- {{ $val($student->student_uid ?? null) }}</div>
                 <div>Final Receipt No. :- {{ $val($receipt->receipt_no ?? null) }}</div>
                 <div>Class A/C No. :- —</div>
                 <div class="sign-line">Date :- &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Emp. Sign.</div>

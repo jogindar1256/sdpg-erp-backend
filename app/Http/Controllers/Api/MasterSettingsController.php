@@ -331,7 +331,21 @@ class MasterSettingsController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $fh = FeeHead::create($req->only(['name', 'in_favor_of']));
+        // fee_heads.code is NOT NULL + unique and the form doesn't ask for
+        // one, so derive it from the name: "Common Room" → COMMON_ROOM,
+        // then COMMON_ROOM_2 … if that is taken.
+        $base = strtoupper(trim(preg_replace('/[^A-Za-z0-9]+/', '_', (string) $req->name), '_'));
+        $base = substr($base !== '' ? $base : 'FEE', 0, 24);
+        $code = $base;
+        for ($n = 2; DB::table('fee_heads')->where('code', $code)->exists(); $n++) {
+            $code = $base . '_' . $n;
+        }
+
+        $fh = FeeHead::create($req->only(['name', 'in_favor_of']) + [
+            'organization_id' => $req->user()->organization_id,
+            'code' => $code,
+            'category' => 'miscellaneous',
+        ]);
         return response()->json($fh, 201);
     }
 
@@ -377,8 +391,20 @@ class MasterSettingsController extends Controller
             ->when($req->has('ddu_affiliated'), fn($q) => $q->where('fs.ddu_affiliated', $req->boolean('ddu_affiliated')))
             ->get();
 
+        // Practical-subject fee: [if 1, if 2, if 3 practical subjects] — one
+        // row per configuration, independent of gender and category.
+        $pf = DB::table('fee_structure_practical_fees')
+            ->where('program_id', $req->program_id)
+            ->where('academic_year', $req->session_year)
+            ->where('semester_no', $req->semester_no)
+            ->where('admission_type', $admissionType)
+            ->where('sdpgc_student', $req->boolean('sdpgc_student'))
+            ->where('ddu_affiliated', $req->boolean('ddu_affiliated'))
+            ->first();
+        $practical = [(float) ($pf->fee_1 ?? 0), (float) ($pf->fee_2 ?? 0), (float) ($pf->fee_3 ?? 0)];
+
         if ($rows->isEmpty()) {
-            return response()->json(['rows' => [], 'category_refs' => (object) []]);
+            return response()->json(['rows' => [], 'category_refs' => (object) [], 'practical' => $practical]);
         }
 
         $feeHeadNames = DB::table('fee_heads')->pluck('name', 'id');
@@ -417,7 +443,56 @@ class MasterSettingsController extends Controller
             ];
         }
 
-        return response()->json(['rows' => $out, 'category_refs' => $categoryRefs]);
+        return response()->json([
+            'rows' => $out,
+            'category_refs' => $categoryRefs,
+            'practical' => $practical,
+        ]);
+    }
+
+    /**
+     * POST /settings/admission/fee-structure/practical
+     * Saves the three "Fee If 01/02/03 Practical Sub." amounts for the
+     * course + session + semester + exam mode the grid is showing.
+     * Body: practical = [500, 900, 1300]
+     */
+    public function feeStructurePracticalStore(Request $req)
+    {
+        $v = Validator::make($req->all(), [
+            'program_id' => 'required|exists:programs,id',
+            'session_year' => 'required|string',
+            'semester_no' => 'required|string',
+            'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
+            'sdpgc_student' => 'nullable|boolean',
+            'ddu_affiliated' => 'nullable|boolean',
+            'practical' => 'required|array|size:3',
+            'practical.*' => 'nullable|numeric|min:0',
+        ]);
+        if ($v->fails())
+            return response()->json(['message' => $v->errors()->first(), 'errors' => $v->errors()], 422);
+
+        $values = array_values($req->practical);
+        $program = DB::table('programs')->where('id', $req->program_id)->first();
+
+        DB::table('fee_structure_practical_fees')->updateOrInsert(
+            [
+                'program_id' => $req->program_id,
+                'academic_year' => $req->session_year,
+                'semester_no' => (int) $req->semester_no,
+                'admission_type' => self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? 'regular',
+                'sdpgc_student' => $req->boolean('sdpgc_student'),
+                'ddu_affiliated' => $req->boolean('ddu_affiliated'),
+            ],
+            [
+                'organization_id' => $program->organization_id ?? null,
+                'fee_1' => (float) ($values[0] ?? 0),
+                'fee_2' => (float) ($values[1] ?? 0),
+                'fee_3' => (float) ($values[2] ?? 0),
+                'updated_at' => now(),
+            ]
+        );
+
+        return response()->json(['message' => 'Practical subject fees saved.']);
     }
 
     public function feeStructureStore(Request $req)
@@ -583,6 +658,33 @@ class MasterSettingsController extends Controller
                 DB::table('fee_structures')->where('id', $row->id)->update(['fee_ref_id' => $feeRefId]);
             }
             $copied++;
+        }
+
+        // Carry the practical-subject fees forward too.
+        $practicalRows = DB::table('fee_structure_practical_fees')
+            ->where('academic_year', $req->from_year)
+            ->where('program_id', $req->program_id)
+            ->where('semester_no', $req->semester_no)
+            ->where('admission_type', $admissionType)
+            ->get();
+        foreach ($practicalRows as $pr) {
+            DB::table('fee_structure_practical_fees')->updateOrInsert(
+                [
+                    'program_id' => $pr->program_id,
+                    'academic_year' => $req->to_year,
+                    'semester_no' => $pr->semester_no,
+                    'admission_type' => $pr->admission_type,
+                    'sdpgc_student' => $pr->sdpgc_student,
+                    'ddu_affiliated' => $pr->ddu_affiliated,
+                ],
+                [
+                    'organization_id' => $pr->organization_id,
+                    'fee_1' => $pr->fee_1,
+                    'fee_2' => $pr->fee_2,
+                    'fee_3' => $pr->fee_3,
+                    'updated_at' => now(),
+                ]
+            );
         }
 
         return response()->json(['message' => "Copied {$copied} fee structure(s), {$req->from_year} → {$req->to_year}."]);
@@ -910,6 +1012,13 @@ class MasterSettingsController extends Controller
         );
     }
 
+    /** 'stream' for rows under a B.Ed course, 'subject' otherwise. Derived
+     * from the course — never taken from the client, never shown in the UI. */
+    private function subjectEntryType($programId): string
+    {
+        return $this->programIsBed(DB::table('programs')->find($programId)) ? 'stream' : 'subject';
+    }
+
     public function subjectMasterStore(Request $req)
     {
         $v = Validator::make($req->all(), [
@@ -931,6 +1040,7 @@ class MasterSettingsController extends Controller
             'name' => $req->name,
             'semester_no' => 1,           // not part of this screen — see comment above
             'type' => 'compulsory',       // not part of this screen — see comment above
+            'entry_type' => $this->subjectEntryType($req->program_id),
             'paper_type' => $req->permission_type === 'Self Finance' ? 'self_finance' : 'regular',
             'is_active' => filter_var($req->is_active ?? true, FILTER_VALIDATE_BOOLEAN),
             'has_practical' => filter_var($req->has_practical ?? false, FILTER_VALIDATE_BOOLEAN),
@@ -958,6 +1068,7 @@ class MasterSettingsController extends Controller
 
         Subject::findOrFail($id)->update([
             'program_id' => $req->program_id,
+            'entry_type' => $this->subjectEntryType($req->program_id),
             'name' => $req->name,
             'paper_type' => $req->permission_type === 'Self Finance' ? 'self_finance' : 'regular',
             'is_active' => filter_var($req->is_active ?? true, FILTER_VALIDATE_BOOLEAN),
@@ -1040,10 +1151,24 @@ class MasterSettingsController extends Controller
     // subject_papers real columns: program_id, subject_id, session_year,
     // semester_no, paper_type, paper_name, group_no, max_marks, min_marks,
     // plus paper_code
-    // paper_type is Theory / Practical, set per paper row. The request-level
-    // paper_type (Configuration panel) is only the default for rows that
-    // don't carry their own.
+    // paper_type is Theory / Practical, set per paper row only (there is no
+    // request-level paper_type any more; listings always return every type).
     private const PAPER_TYPES = ['Theory', 'Practical'];
+
+    // selection_type applies to PG and B.Ed courses only. "Teaching Subject"
+    // is B.Ed only. NULL for every other course.
+    private const SELECTION_TYPES = \App\Support\Part6Rules::SELECTION_TYPES;
+
+    private function programIsBed($program): bool
+    {
+        return \App\Support\Part6Rules::isBed($program);
+    }
+
+    /** Selection types this course may use — empty array = not applicable. */
+    private function allowedSelectionTypes($program): array
+    {
+        return \App\Support\Part6Rules::allowedSelectionTypes($program);
+    }
 
     private function programIsBsc($program): bool
     {
@@ -1065,7 +1190,6 @@ class MasterSettingsController extends Controller
                 ->when($req->program_id, fn($q) => $q->where('sp.program_id', $req->program_id))
                 ->when($req->semester_no, fn($q) => $q->where('sp.semester_no', $req->semester_no))
                 ->when($req->session_year, fn($q) => $q->where('sp.session_year', $req->session_year))
-                ->when($req->paper_type, fn($q) => $q->where('sp.paper_type', $req->paper_type))
                 ->when($req->subject_id, fn($q) => $q->where('sp.subject_id', $req->subject_id))
                 ->orderBy('sp.group_label')
                 ->orderBy('sp.id')
@@ -1080,12 +1204,12 @@ class MasterSettingsController extends Controller
             'subject_id' => 'required|exists:subjects,id',
             'session_year' => 'required|string',
             'semester_no' => 'required|string',
-            'paper_type' => ['nullable', Rule::in(self::PAPER_TYPES)],
             'group_label' => 'nullable|string|max:50',
             'papers' => 'required|array|min:1',
             'papers.*.paper_code' => 'nullable|string|max:50',
             'papers.*.paper_name' => 'required|string',
             'papers.*.paper_type' => ['nullable', Rule::in(self::PAPER_TYPES)],
+            'papers.*.selection_type' => ['nullable', Rule::in(self::SELECTION_TYPES)],
             'papers.*.max_marks' => 'nullable|integer|min:1',
             'papers.*.min_marks' => 'nullable|integer|min:0',
         ]);
@@ -1100,6 +1224,17 @@ class MasterSettingsController extends Controller
         }
         $groupLabel = $isBsc ? trim($req->group_label) : null;
 
+        // Selection Type: PG / B.Ed only; "Teaching Subject" B.Ed only.
+        $allowedSelection = $this->allowedSelectionTypes($program);
+        foreach ($req->papers as $i => $p) {
+            $sel = $p['selection_type'] ?? null;
+            if ($sel && $allowedSelection && !in_array($sel, $allowedSelection, true)) {
+                return response()->json(['errors' => [
+                    "papers.{$i}.selection_type" => ["Selection Type \"{$sel}\" is not available for this course."],
+                ]], 422);
+            }
+        }
+
         $rows = [];
         foreach ($req->papers as $p) {
             $rows[] = [
@@ -1107,7 +1242,8 @@ class MasterSettingsController extends Controller
                 'subject_id' => $req->subject_id,
                 'session_year' => $req->session_year,
                 'semester_no' => $req->semester_no,
-                'paper_type' => ($p['paper_type'] ?? null) ?: ($req->paper_type ?: 'Theory'),
+                'paper_type' => ($p['paper_type'] ?? null) ?: 'Theory',
+                'selection_type' => $allowedSelection ? (($p['selection_type'] ?? null) ?: 'Compulsory') : null,
                 'paper_code' => $p['paper_code'] ?? null,
                 'paper_name' => $p['paper_name'],
                 'group_no' => null,
@@ -1130,6 +1266,7 @@ class MasterSettingsController extends Controller
             'paper_code' => 'nullable|string|max:50',
             'paper_name' => 'required|string',
             'paper_type' => ['nullable', Rule::in(self::PAPER_TYPES)],
+            'selection_type' => ['nullable', Rule::in(self::SELECTION_TYPES)],
             'group_label' => 'nullable|string|max:50',
             'max_marks' => 'nullable|integer|min:1',
             'min_marks' => 'nullable|integer|min:0',
@@ -1137,13 +1274,30 @@ class MasterSettingsController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
+        $paper = DB::table('subject_papers')->where('id', $id)->first();
+        if (!$paper)
+            return response()->json(['message' => 'Paper not found.'], 404);
+
         $update = [
             'paper_code' => $req->paper_code,
             'paper_name' => $req->paper_name,
-            'max_marks' => $req->max_marks ?? 100,
-            'min_marks' => $req->min_marks ?? 33,
             'updated_at' => now(),
         ];
+        // Marks are only touched when sent. This used to reset them to
+        // 100/33 on every edit, because the edit grid never sends marks.
+        if ($req->filled('max_marks')) $update['max_marks'] = $req->max_marks;
+        if ($req->filled('min_marks')) $update['min_marks'] = $req->min_marks;
+
+        if ($req->has('selection_type')) {
+            $allowedSelection = $this->allowedSelectionTypes(DB::table('programs')->find($paper->program_id));
+            $sel = $req->selection_type ?: null;
+            if ($sel && !in_array($sel, $allowedSelection, true)) {
+                return response()->json(['errors' => [
+                    'selection_type' => ["Selection Type \"{$sel}\" is not available for this course."],
+                ]], 422);
+            }
+            $update['selection_type'] = $allowedSelection ? $sel : null;
+        }
         if ($req->has('group_label')) {
             $update['group_label'] = $req->group_label ?: null;
         }
@@ -1207,6 +1361,7 @@ class MasterSettingsController extends Controller
                 'sessionYear' => $req->session_year,
                 'groups' => $groups,
                 'showGroups' => $isBsc,
+                'showSelection' => !empty($this->allowedSelectionTypes($program)),
             ])->setPaper('a4');
 
             return response()->streamDownload(
