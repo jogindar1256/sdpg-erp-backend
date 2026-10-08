@@ -386,7 +386,7 @@
         <thead>
             <tr>
                 <th>Course</th><th>Board/University</th><th>Institute</th><th>Year</th><th>Roll No.</th>
-                <th>Cert./Mark Sheet Sr.</th><th>Full Marks</th><th>Obtain</th><th>Obtain %</th><th>Subject/Group</th>
+                <th>Cert./Mark Sheet Sr.</th><th>Full Marks</th><th>Obtain</th><th>Obtain %</th><th>Division</th><th>Subject/Group</th>
             </tr>
         </thead>
         <tbody>
@@ -401,10 +401,11 @@
                     <td>{{ $val($r['full_marks'] ?? null) }}</td>
                     <td>{{ $val($r['obtain_mark'] ?? null) }}</td>
                     <td>{{ $val($r['obtain_percent'] ?? null) }}{{ !empty($r['obtain_percent']) ? '%' : '' }}</td>
+                    <td>{{ $val($r['division'] ?? null) }}</td>
                     <td>{{ implode(', ', array_filter(array_merge([$r['group'] ?? null], $r['subjects'] ?? []))) }}</td>
                 </tr>
             @empty
-                <tr><td colspan="10" style="text-align:center;color:#999;">No educational records.</td></tr>
+                <tr><td colspan="11" style="text-align:center;color:#999;">No educational records.</td></tr>
             @endforelse
         </tbody>
     </table>

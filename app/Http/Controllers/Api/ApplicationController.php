@@ -1590,6 +1590,10 @@ class ApplicationController extends Controller
             'number_system',
             'group',
             'drop_subject',
+            'subjects',   // picked from fixed dropdown lists
+            'division',
+            // Part 6 — U.G. research paper (a subject id)
+            'research_subject',
             // Part 4 — TC & Migration Details
             'tc_condition',
             'tc_behavior',
@@ -1649,6 +1653,9 @@ class ApplicationController extends Controller
         $prog[$key] = true;
 
         $clean = TextNormalizer::upper($req->all(), $this->selectDrivenApplicationFields());
+        if ($partNo === 6) {
+            $clean = $this->cleanResearchSubject($clean); // U.G. Research Paper ⊂ Major 1/2, Minor 1
+        }
 
         // P.G. / B.Ed. Part 6: the office may pick any row, but every paper
         // id must be a real paper of the right type for this course,
@@ -1753,6 +1760,7 @@ class ApplicationController extends Controller
             $part6['major_subject_2'] ?? null,
             $part6['major_subject_3'] ?? null,
             $part6['minor_subject_1'] ?? null,
+            $part6['research_subject'] ?? null,
         ]);
         $subjectsById = $subjectIds
             ? DB::table('subjects')->whereIn('id', $subjectIds)->get()->keyBy('id')
@@ -1774,6 +1782,7 @@ class ApplicationController extends Controller
             ['key' => 'major_subject_1', 'label' => 'Major Subject -1', 'kind' => 'subject'],
             ['key' => 'major_subject_2', 'label' => 'Major Subject -2', 'kind' => 'subject'],
             ['key' => 'minor_subject_1', 'label' => 'Minor Subject -1', 'kind' => 'subject'],
+            ['key' => 'research_subject', 'label' => 'Research Paper', 'kind' => 'research'],
             ['key' => 'aec_subject', 'label' => 'Ability Enhancement Course', 'kind' => 'vocational'],
             ['key' => 'sec_subject', 'label' => 'Skill Enhancement Course', 'kind' => 'vocational'],
         ];
@@ -1781,7 +1790,14 @@ class ApplicationController extends Controller
             $id = $part6[$def['key']] ?? null;
             if (!$id)
                 continue;
-            if ($def['kind'] === 'subject') {
+            if ($def['kind'] === 'research') {
+                $subjectRows[] = [
+                    'label' => $def['label'],
+                    'subject' => $subjectsById->get($id)->name ?? '—',
+                    'paper_code' => '—',
+                    'paper_title' => '—',
+                ];
+            } elseif ($def['kind'] === 'subject') {
                 $subj = $subjectsById->get($id);
                 $papers = $papersBySubject->get($id, collect());
                 $subjectRows[] = [
@@ -3187,6 +3203,25 @@ class ApplicationController extends Controller
      * Student saves one part. Blocked if submitted or approved.
      */
     /** 'BED' | 'PG' | null — which Part 6 form the course uses (null = U.G. form). */
+    /**
+     * U.G. Part 6 "Research Paper": must be one of the subjects already
+     * chosen as Major 1, Major 2 or Minor 1 — anything else is dropped.
+     */
+    private function cleanResearchSubject(array $part6): array
+    {
+        if (!array_key_exists('research_subject', $part6)) {
+            return $part6;
+        }
+        $allowed = array_map('intval', array_filter([
+            $part6['major_subject_1'] ?? null,
+            $part6['major_subject_2'] ?? null,
+            $part6['minor_subject_1'] ?? null,
+        ]));
+        $pick = (int) ($part6['research_subject'] ?? 0);
+        $part6['research_subject'] = in_array($pick, $allowed, true) ? $pick : null;
+        return $part6;
+    }
+
     private function part6FormType($program): ?string
     {
         return Part6Rules::formType($program);
@@ -3294,6 +3329,7 @@ class ApplicationController extends Controller
         // (updatePartOffice() does not call this — the office edits freely.)
         if ($partNo === 6) {
             $clean = $this->lockPart6ForPgBedStudent($app, $clean);
+            $clean = $this->cleanResearchSubject($clean);
         }
 
         DB::table('student_applications')->where('id', $id)->update([
@@ -3757,7 +3793,7 @@ class ApplicationController extends Controller
     public function uploadStudentDocument(Request $req, $id)
     {
         $req->validate([
-            'file' => 'required|file|max:2048|mimes:jpg,jpeg,png,pdf',
+            'file' => 'required|file|max:15360|mimes:jpg,jpeg,png,pdf', // 15 MiB (max: is in KiB)
             'document_type' => 'required|string|max:60',
         ]);
 
@@ -3803,7 +3839,7 @@ class ApplicationController extends Controller
     public function uploadStudentDocumentOffice(Request $req, $id)
     {
         $req->validate([
-            'file' => 'required|file|max:2048|mimes:jpg,jpeg,png,pdf',
+            'file' => 'required|file|max:15360|mimes:jpg,jpeg,png,pdf', // 15 MiB (max: is in KiB)
             'document_type' => 'required|string|max:60',
         ]);
 

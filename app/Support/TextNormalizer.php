@@ -58,6 +58,12 @@ class TextNormalizer
         $out = [];
 
         foreach ($data as $key => $value) {
+            // An excluded key that holds a list (e.g. Part 3's `subjects`)
+            // is left as-is, values included.
+            if (is_array($value) && in_array(strtolower((string) $key), $extraExcludedKeys, true)) {
+                $out[$key] = $value;
+                continue;
+            }
             if (is_array($value)) {
                 $out[$key] = self::upper($value, $extraExcludedKeys);
                 continue;

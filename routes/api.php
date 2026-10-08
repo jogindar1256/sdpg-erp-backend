@@ -69,32 +69,93 @@ Route::prefix('student/register')->group(function () {
 });
 
 
+// Bank branch search for Part 5 (Bank Detail). `by` picks ONE field so a
+// search means what the user typed it for:
+//   ifsc    — IFSC code, prefix match         (SBIN0, SBIN0001234)
+//   bank    — bank name, word match           (baroda, state bank)
+//   city    — city only, exact then prefix    ("lar" → LAR, LARKANA… never CLARKS)
+//   pincode — 6-digit PIN: branches whose address carries it, else branches
+//             in that PIN's post offices / district
+// Without `by` it falls back to the old search across every field.
 Route::get('bank/search', function (Request $request) {
-    $q = trim($request->query('q', ''));
+    $q = trim((string) $request->query('q', ''));
+    $by = (string) $request->query('by', '');
+    $upper = strtoupper($q);
+    $cols = ['id', 'ifsc_code', 'bank_name', 'branch_name', 'city', 'district', 'state', 'micr_code', 'address'];
 
     if (strlen($q) < 2) {
         return response()->json([]);
     }
 
-    $like = '%' . strtoupper($q) . '%';
-    $upper = strtoupper($q);
+    $base = DB::table('bank_branches')->select($cols);
 
-    $branches = DB::table('bank_branches')
-        ->where(function ($query) use ($like) {
-            $query->whereRaw('UPPER(ifsc_code)   LIKE ?', [$like])
-                ->orWhereRaw('UPPER(branch_name) LIKE ?', [$like])
-                ->orWhereRaw('UPPER(city)        LIKE ?', [$like])
-                ->orWhereRaw('UPPER(district)    LIKE ?', [$like])
-                ->orWhereRaw('UPPER(bank_name)   LIKE ?', [$like]);
-        })
-        ->select('id', 'ifsc_code', 'bank_name', 'branch_name', 'city', 'district', 'state', 'micr_code', 'address')
-        ->orderByRaw('CASE WHEN UPPER(ifsc_code) = ? THEN 0 ELSE 1 END', [$upper])
-        ->orderBy('bank_name')
-        ->orderBy('branch_name')
-        ->limit(20)
-        ->get();
+    switch ($by) {
+        case 'ifsc':
+            $rows = $base->whereRaw('UPPER(ifsc_code) LIKE ?', [$upper . '%'])
+                ->orderByRaw('CASE WHEN UPPER(ifsc_code) = ? THEN 0 ELSE 1 END', [$upper])
+                ->orderBy('ifsc_code')
+                ->limit(20)->get();
+            break;
 
-    return response()->json($branches);
+        case 'bank':
+            // Every typed word must start a word of the bank name.
+            foreach (preg_split('/\s+/', $upper) as $word) {
+                $base->whereRaw("(' ' || UPPER(bank_name)) LIKE ?", ['% ' . $word . '%']);
+            }
+            $rows = $base->orderBy('bank_name')->orderBy('city')->orderBy('branch_name')
+                ->limit(30)->get();
+            break;
+
+        case 'city':
+            $rows = $base->whereRaw('UPPER(city) LIKE ?', [$upper . '%'])
+                ->orderByRaw('CASE WHEN UPPER(city) = ? THEN 0 ELSE 1 END', [$upper])
+                ->orderBy('city')->orderBy('bank_name')->orderBy('branch_name')
+                ->limit(50)->get();
+            break;
+
+        case 'pincode':
+            if (!preg_match('/^\d{6}$/', $q)) {
+                return response()->json([]);
+            }
+            $rows = (clone $base)->where('address', 'like', '%' . $q . '%')
+                ->orderBy('bank_name')->limit(50)->get();
+            if ($rows->isEmpty()) {
+                $pin = \App\Models\Pincode::resolve($q);
+                if ($pin) {
+                    $offices = collect($pin['post_offices'] ?? [])
+                        ->map(fn($o) => strtoupper(trim(preg_replace('/\s+(B\.?O|S\.?O|H\.?O)\.?$/i', '', (string) $o))))
+                        ->filter()->unique()->values()->all();
+                    $inDistrict = (clone $base)->whereRaw('UPPER(district) = ?', [strtoupper((string) $pin['district'])]);
+                    $rows = $offices
+                        ? (clone $inDistrict)->where(function ($w) use ($offices) {
+                            $w->whereIn(DB::raw('UPPER(city)'), $offices)
+                              ->orWhereIn(DB::raw('UPPER(branch_name)'), $offices);
+                        })->orderBy('bank_name')->limit(50)->get()
+                        : collect();
+                    if ($rows->isEmpty()) {
+                        $rows = $inDistrict->orderBy('city')->orderBy('bank_name')->limit(50)->get();
+                    }
+                }
+            }
+            break;
+
+        default:
+            $like = '%' . $upper . '%';
+            $rows = $base->where(function ($query) use ($like) {
+                $query->whereRaw('UPPER(ifsc_code)   LIKE ?', [$like])
+                    ->orWhereRaw('UPPER(branch_name) LIKE ?', [$like])
+                    ->orWhereRaw('UPPER(city)        LIKE ?', [$like])
+                    ->orWhereRaw('UPPER(district)    LIKE ?', [$like])
+                    ->orWhereRaw('UPPER(bank_name)   LIKE ?', [$like]);
+            })
+                ->orderByRaw('CASE WHEN UPPER(ifsc_code) = ? THEN 0 ELSE 1 END', [$upper])
+                ->orderBy('bank_name')
+                ->orderBy('branch_name')
+                ->limit(20)
+                ->get();
+    }
+
+    return response()->json($rows);
 });
 
 

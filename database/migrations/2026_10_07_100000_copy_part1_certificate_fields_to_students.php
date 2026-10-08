@@ -5,18 +5,6 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
-/**
- * Data-only migration — no schema change.
- *
- * Part 1 of the application form now collects certificate / voter / passport
- * particulars (Student::CERTIFICATE_FIELDS). They are stored in
- * student_applications.part_1 and copied into students.personal_info when the
- * student row is created. This brings students who were admitted BEFORE that
- * copy existed up to date, from the application they were confirmed on.
- *
- * Values already present on the student win, so a later amendment is never
- * overwritten by re-running this.
- */
 return new class extends Migration
 {
     public function up(): void
