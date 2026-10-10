@@ -381,7 +381,7 @@ class MasterSettingsController extends Controller
                 'fs.id', 'fs.fee_ref_id', 'fs.organization_id', 'fs.program_id', 'fs.semester_no',
                 'fs.academic_year', 'fs.admission_type', 'fs.category', 'fs.amount_json', 'fs.term',
                 'fs.sdpgc_student', 'fs.ddu_affiliated', 'fs.late_fine_per_day', 'fs.due_date',
-                'fs.is_active'
+                'fs.is_active', 'fs.updated_at'
             )
             ->where('fs.program_id', $req->program_id)
             ->where('fs.academic_year', $req->session_year)
@@ -414,8 +414,10 @@ class MasterSettingsController extends Controller
         // every category-row's gender-nested amount_json.
         $flat = [];
         $categoryRefs = [];
+        $categoryUpdated = [];
         foreach ($rows as $row) {
             $categoryRefs[$row->category] = $row->fee_ref_id;
+            $categoryUpdated[$row->category] = max($categoryUpdated[$row->category] ?? '', (string) $row->updated_at);
             $amountJson = $row->amount_json ? json_decode($row->amount_json, true) : [];
             foreach ((array) $amountJson as $gender => $heads) {
                 foreach ((array) $heads as $feeHeadId => $amount) {
@@ -445,6 +447,7 @@ class MasterSettingsController extends Controller
         return response()->json([
             'rows' => $out,
             'category_refs' => $categoryRefs,
+            'category_updated' => $categoryUpdated, // category → last saved at
             'practical' => $practical,
         ]);
     }
@@ -583,107 +586,6 @@ class MasterSettingsController extends Controller
         }
 
         return response()->json(['message' => "Fee structure saved ({$saved} category row" . ($saved === 1 ? '' : 's') . ")."]);
-    }
-
-    // Copies exactly the configuration currently loaded on the fee-structure
-    // page (one program plus semester plus exam mode) from one academic
-    // year forward into a later one.
-    public function feeStructureCopyYear(Request $req)
-    {
-        $v = Validator::make($req->all(), [
-            'from_year' => 'required|string',
-            'to_year' => 'required|string',
-            'program_id' => 'required|exists:programs,id',
-            'semester_no' => 'required|integer',
-            'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
-        ]);
-        if ($v->fails())
-            return response()->json(['errors' => $v->errors()], 422);
-
-        // Academic years are stored "YYYY-YYYY" — compare the leading year
-        // number so a copy can only move forward in time.
-        $fromStartYear = (int) substr($req->from_year, 0, 4);
-        $toStartYear = (int) substr($req->to_year, 0, 4);
-        if ($toStartYear <= $fromStartYear) {
-            return response()->json(['message' => 'Copy target must be a later academic year than the source year — pick the next year, not the same one or an earlier one.'], 422);
-        }
-
-        $admissionType = self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? $req->exam_mode;
-
-        $rows = DB::table('fee_structures')
-            ->where('academic_year', $req->from_year)
-            ->where('program_id', $req->program_id)
-            ->where('semester_no', $req->semester_no)
-            ->where('admission_type', $admissionType)
-            ->get();
-
-        if ($rows->isEmpty()) {
-            return response()->json(['message' => 'No fee structure found for that class, semester and exam mode in the source year.'], 422);
-        }
-
-        $program = DB::table('programs')->where('id', $req->program_id)->first();
-        $copied = 0;
-
-        foreach ($rows as $r) {
-            $key = [
-                'program_id' => $r->program_id,
-                'academic_year' => $req->to_year,
-                'semester_no' => $r->semester_no,
-                'admission_type' => $r->admission_type,
-                'category' => $r->category,
-                'sdpgc_student' => $r->sdpgc_student,
-                'ddu_affiliated' => $r->ddu_affiliated,
-            ];
-
-            DB::table('fee_structures')->updateOrInsert(
-                $key,
-                [
-                    'organization_id' => $r->organization_id,
-                    'term' => $r->term,
-                    'amount_json' => $r->amount_json,
-                    'updated_at' => now(),
-                ]
-            );
-
-            // Fresh fee_ref_id for the new year's row — copying doesn't
-            // reuse last year's reference number.
-            $row = DB::table('fee_structures')->where($key)->first();
-            if ($row && !$row->fee_ref_id) {
-                $feeRefId = app(\App\Services\AdmissionNumberService::class)
-                    ->feeRefId('fee_structures', 'fee_ref_id', $program, $r->category);
-                DB::table('fee_structures')->where('id', $row->id)->update(['fee_ref_id' => $feeRefId]);
-            }
-            $copied++;
-        }
-
-        // Carry the practical-subject fees forward too.
-        $practicalRows = DB::table('fee_structure_practical_fees')
-            ->where('academic_year', $req->from_year)
-            ->where('program_id', $req->program_id)
-            ->where('semester_no', $req->semester_no)
-            ->where('admission_type', $admissionType)
-            ->get();
-        foreach ($practicalRows as $pr) {
-            DB::table('fee_structure_practical_fees')->updateOrInsert(
-                [
-                    'program_id' => $pr->program_id,
-                    'academic_year' => $req->to_year,
-                    'semester_no' => $pr->semester_no,
-                    'admission_type' => $pr->admission_type,
-                    'sdpgc_student' => $pr->sdpgc_student,
-                    'ddu_affiliated' => $pr->ddu_affiliated,
-                ],
-                [
-                    'organization_id' => $pr->organization_id,
-                    'fee_1' => $pr->fee_1,
-                    'fee_2' => $pr->fee_2,
-                    'fee_3' => $pr->fee_3,
-                    'updated_at' => now(),
-                ]
-            );
-        }
-
-        return response()->json(['message' => "Copied {$copied} fee structure(s), {$req->from_year} → {$req->to_year}."]);
     }
 
     public function registrationFeeCopyYear(Request $req)

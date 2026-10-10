@@ -672,7 +672,6 @@ Route::middleware('auth:sanctum')->group(function () {
             // Fee Structure
             Route::get('fee-structure', [MasterSettingsController::class, 'feeStructureIndex']);
             Route::post('fee-structure', [MasterSettingsController::class, 'feeStructureStore']);
-            Route::post('fee-structure/copy', [MasterSettingsController::class, 'feeStructureCopyYear']);
             Route::post('fee-structure/practical', [MasterSettingsController::class, 'feeStructurePracticalStore']);
             Route::post('reg-fee/copy', [MasterSettingsController::class, 'registrationFeeCopyYear']);
 
