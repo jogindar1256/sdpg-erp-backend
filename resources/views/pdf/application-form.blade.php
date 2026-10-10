@@ -425,17 +425,34 @@
 
     <div class="sec-title blue">Paper Name</div>
     <table class="grid">
-        <thead><tr><th>Definition</th><th>Subject</th><th>Paper Code</th><th>Paper Name</th></tr></thead>
+        <thead><tr><th>Definition</th><th>Subject</th><th>Paper Code</th><th>Paper Name</th><th>Credit</th></tr></thead>
         <tbody>
             @forelse($subjectRows as $row)
-                <tr>
-                    <td>{{ $row['label'] }}</td>
-                    <td>{{ $row['subject'] }}</td>
-                    <td>{{ $row['paper_code'] }}</td>
-                    <td>{{ $row['paper_title'] }}</td>
-                </tr>
+                {{-- One table row per paper; Definition/Subject span them. --}}
+                @php $pl = $row['papers'] ?? []; $n = max(count($pl), 1); @endphp
+                @if(count($pl))
+                    @foreach($pl as $pi => $pp)
+                        <tr>
+                            @if($pi === 0)
+                                <td rowspan="{{ $n }}">{{ $row['label'] }}</td>
+                                <td rowspan="{{ $n }}">{{ $row['subject'] }}</td>
+                            @endif
+                            <td>{{ $pp['code'] }}</td>
+                            <td>{{ $pp['name'] }}</td>
+                            <td>{{ $pp['credits'] ?? '—' }}</td>
+                        </tr>
+                    @endforeach
+                @else
+                    <tr>
+                        <td>{{ $row['label'] }}</td>
+                        <td>{{ $row['subject'] }}</td>
+                        <td>{{ $row['paper_code'] }}</td>
+                        <td>{{ $row['paper_title'] }}</td>
+                        <td>—</td>
+                    </tr>
+                @endif
             @empty
-                <tr><td colspan="4" style="text-align:center;color:#999;">No subjects selected.</td></tr>
+                <tr><td colspan="5" style="text-align:center;color:#999;">No subjects selected.</td></tr>
             @endforelse
         </tbody>
     </table>

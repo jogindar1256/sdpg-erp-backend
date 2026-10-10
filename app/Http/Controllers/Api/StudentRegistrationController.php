@@ -100,6 +100,16 @@ class StudentRegistrationController extends Controller
 
         $regType = strtoupper($req->reg_type);
 
+        // Registration only for a course whose admission schedule is open —
+        // same rule as publicCourses?open_only=1 (current session), also
+        // accepting the session the form submits.
+        if (!$req->program_id) {
+            return response()->json(['errors' => ['program_id' => ['Please select a program/course.']]], 422);
+        }
+        if (!self::openScheduleQuery(array_unique([self::currentSessionYear(), (string) $req->session]))->where('program_id', $req->program_id)->exists()) {
+            return response()->json(['errors' => ['program_id' => ['Admission is not open for this course right now.']]], 422);
+        }
+
         // Was missing 'email' here — direct_registrations_email_unique_active
         // is now a live, enforced constraint on (email, session_year,
         // reg_type), but this final pre-insert check only ever tested
@@ -1128,6 +1138,11 @@ class StudentRegistrationController extends Controller
             ->whereNull('deleted_at')
             ->when($org, fn($q) => $q->where('organization_id', $org->id))
             ->when($dbLevel, fn($q) => $q->where('level', $dbLevel))
+            // ?open_only=1 — registration forms list only courses whose
+            // admission schedule is open right now.
+            ->when($req->boolean('open_only'), fn($q) => $q->whereIn('id',
+                self::openScheduleQuery((string) $req->query('session', self::currentSessionYear()))->select('program_id')
+            ))
             ->orderBy('name')
             ->get(['id', 'name', 'short_name', 'samarth_code', 'code', 'level', 'total_semesters']);
 
@@ -1144,6 +1159,24 @@ class StudentRegistrationController extends Controller
         ]);
 
         return response()->json($data->values());
+    }
+
+    /** Current academic session "YYYY-YYYY", session starts in June (same rule as frontend yearSystem.tsx). */
+    private static function currentSessionYear(): string
+    {
+        return \App\Support\AcademicSession::current();
+    }
+
+    /** Open Regular semester-1 admission schedules for a session (now within start..close). */
+    private static function openScheduleQuery(string|array $session)
+    {
+        $now = Carbon::now();
+        return DB::table('application_schedules')
+            ->whereIn('session_year', (array) $session)
+            ->where('exam_mode', 'Regular')
+            ->where('semester_no', '1')
+            ->where('start_admission', '<=', $now)
+            ->where('close_admission', '>=', $now);
     }
 
     public function publicSubjects(Request $req, $programId): JsonResponse
@@ -1654,9 +1687,8 @@ class StudentRegistrationController extends Controller
                 ->value('session_year');
         }
         if (!$session) {
-            $now = Carbon::now();
-            $startYear = $now->month >= 4 ? $now->year : $now->year - 1;
-            $session = $startYear . '-' . ($startYear + 1);
+            // Same June rule as everywhere else (was April here).
+            $session = \App\Support\AcademicSession::current();
         }
 
         $fee = $this->resolveRegistrationFee($programId, $session, $req->gender, $req->category, $regType);

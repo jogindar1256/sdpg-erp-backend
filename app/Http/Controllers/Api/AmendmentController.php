@@ -130,7 +130,7 @@ class AmendmentController extends Controller
             ->leftJoin('student_applications as sa', 'sa.id', 'la.app_id')
             ->leftJoin('semester_registrations as sr', function ($j) use ($req) {
                 $j->on('sr.admission_id', 'a.id')
-                    ->where('sr.session_year', $req->session_year ?? date('Y') . '-' . (date('Y') + 1));
+                    ->where('sr.session_year', $req->session_year ?? \App\Support\AcademicSession::current());
             })
             ->leftJoin('fee_receipts as fr', 'fr.admission_id', 'a.id')
             ->where(function ($q) use ($k) {

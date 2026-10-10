@@ -108,7 +108,7 @@ public function subjectPapers(Request $request, $programId)
         ->when($sessionYear, fn($q) => $q->where('session_year', $sessionYear))
         ->orderBy('subject_id')
         ->orderBy('paper_code')
-        ->get(['id', 'subject_id', 'paper_code', 'paper_name', 'paper_type', 'selection_type', 'session_year', 'semester_no', 'group_label', 'max_marks', 'min_marks']);
+        ->get(['id', 'subject_id', 'paper_code', 'paper_name', 'credits', 'paper_type', 'selection_type', 'session_year', 'semester_no', 'group_label', 'max_marks', 'min_marks']);
 
     $bySubject = $papers->groupBy('subject_id')->map(fn ($rows) => $rows->values());
 

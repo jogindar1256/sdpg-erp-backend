@@ -1106,6 +1106,8 @@ class ApplicationController extends Controller
         if ($majorIds || $minorIds) {
             $practicalIds = DB::table('subject_papers')
                 ->whereIn('subject_id', array_merge($majorIds, $minorIds))
+                ->where('program_id', $app->program_id)
+                ->when(!empty($app->academic_year), fn($q) => $q->where('session_year', $app->academic_year))
                 ->where('semester_no', (string) $app->semester_no) // varchar column
                 ->whereRaw("LOWER(paper_type) = 'practical'")
                 ->pluck('subject_id')->unique()->all();
@@ -1768,7 +1770,12 @@ class ApplicationController extends Controller
         $papersBySubject = $subjectIds
             ? DB::table('subject_papers')
                 ->whereIn('subject_id', $subjectIds)
+                // This course + session only: the same subject has papers in
+                // other courses / sessions too, which used to print here.
+                ->where('program_id', $sa->program_id)
                 ->where('semester_no', (string) $sa->semester_no) // varchar column
+                ->when(!empty($sa->academic_year), fn($q) => $q->where('session_year', $sa->academic_year))
+                ->orderBy('id')
                 ->get()
                 ->groupBy('subject_id')
             : collect();
@@ -1796,6 +1803,7 @@ class ApplicationController extends Controller
                     'subject' => $subjectsById->get($id)->name ?? '—',
                     'paper_code' => '—',
                     'paper_title' => '—',
+                    'papers' => [],
                 ];
             } elseif ($def['kind'] === 'subject') {
                 $subj = $subjectsById->get($id);
@@ -1805,6 +1813,12 @@ class ApplicationController extends Controller
                     'subject' => $subj->name ?? '—',
                     'paper_code' => $papers->pluck('paper_code')->filter()->implode(', ') ?: '—',
                     'paper_title' => $papers->pluck('paper_name')->filter()->implode(', ') ?: '—',
+                    // One entry per paper, printed row by row.
+                    'papers' => $papers->map(fn($pp) => [
+                        'code' => $pp->paper_code ?: '—',
+                        'name' => $pp->paper_name ?: '—',
+                        'credits' => $pp->credits ?? null,
+                    ])->values()->all(),
                 ];
             } else {
                 $p = $vocById->get($id);
@@ -1813,6 +1827,7 @@ class ApplicationController extends Controller
                     'subject' => $p->group_name ?? '—',
                     'paper_code' => $p->paper_code ?? '—',
                     'paper_title' => $p->paper_name ?? '—',
+                    'papers' => $p ? [['code' => $p->paper_code ?: '—', 'name' => $p->paper_name ?: '—', 'credits' => null]] : [],
                 ];
             }
         }
@@ -1831,7 +1846,7 @@ class ApplicationController extends Controller
                 ? DB::table('subject_papers as sp')
                     ->leftJoin('subjects as s', 's.id', 'sp.subject_id')
                     ->whereIn('sp.id', $paperIds)
-                    ->get(['sp.id', 'sp.paper_code', 'sp.paper_name', 's.name as subject_name'])
+                    ->get(['sp.id', 'sp.paper_code', 'sp.paper_name', 'sp.credits', 's.name as subject_name'])
                     ->keyBy('id')
                 : collect();
             $subjectRows = [];
@@ -1844,6 +1859,7 @@ class ApplicationController extends Controller
                         'subject' => $p->subject_name ?? '—',
                         'paper_code' => $p->paper_code ?: '—',
                         'paper_title' => $p->paper_name ?: '—',
+                        'papers' => [['code' => $p->paper_code ?: '—', 'name' => $p->paper_name ?: '—', 'credits' => $p->credits]],
                     ];
                 }
             }
@@ -2281,7 +2297,9 @@ class ApplicationController extends Controller
         }
         return DB::table('subject_papers')
             ->whereIn('subject_id', $subjectIds)
+            ->where('program_id', $sa->program_id)
             ->where('semester_no', (string) $sa->semester_no) // varchar column
+            ->when(!empty($sa->academic_year), fn($q) => $q->where('session_year', $sa->academic_year))
             ->whereRaw("LOWER(paper_type) = 'practical'")
             ->distinct()
             ->count('subject_id');
@@ -3945,9 +3963,8 @@ class ApplicationController extends Controller
      */
     public function studentPrograms(Request $req)
     {
-        // Current session (July cutoff, matches the frontend).
-        $y = (int) date('Y');
-        $session = (int) date('n') >= 7 ? "{$y}-" . ($y + 1) : ($y - 1) . "-{$y}";
+        // Current session — June start, same rule as the frontend.
+        $session = \App\Support\AcademicSession::current();
 
         $user = $req->user();
         $type = $req->query('type', 'regular');

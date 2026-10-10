@@ -25,7 +25,7 @@ class MasterSettingsController extends Controller
     {
         $data = DB::table('application_schedules as s')
             ->join('programs as p', 'p.id', 's.program_id')
-            ->select('s.*', 'p.short_name as course', 'p.full_name')
+            ->select('s.*', 'p.short_name as course', 'p.short_name', 'p.full_name', 'p.samarth_code')
             ->when($req->session_year, fn($q) => $q->where('s.session_year', $req->session_year))
             ->orderBy('s.created_at', 'desc')
             ->paginate(20);
@@ -380,7 +380,7 @@ class MasterSettingsController extends Controller
             ->select(
                 'fs.id', 'fs.fee_ref_id', 'fs.organization_id', 'fs.program_id', 'fs.semester_no',
                 'fs.academic_year', 'fs.admission_type', 'fs.category', 'fs.amount_json', 'fs.term',
-                'fs.sdpgc_student', 'fs.ddu_affiliated', 'fs.in_favor_of', 'fs.late_fine_per_day', 'fs.due_date',
+                'fs.sdpgc_student', 'fs.ddu_affiliated', 'fs.late_fine_per_day', 'fs.due_date',
                 'fs.is_active'
             )
             ->where('fs.program_id', $req->program_id)
@@ -436,7 +436,6 @@ class MasterSettingsController extends Controller
                 'admission_type' => $first->admission_type,
                 'amounts'        => $amounts,
                 'term'           => $first->term,
-                'in_favor_of'    => $first->in_favor_of,
                 'sdpgc_student'  => $first->sdpgc_student,
                 'ddu_affiliated' => $first->ddu_affiliated,
                 'is_active'      => $first->is_active,
@@ -510,7 +509,6 @@ class MasterSettingsController extends Controller
             // flags_to_fee_structures.php
             'sdpgc_student' => 'nullable|boolean',
             'ddu_affiliated' => 'nullable|boolean',
-            'in_favor_of' => 'nullable|in:College,University,Government',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -567,7 +565,6 @@ class MasterSettingsController extends Controller
                     'organization_id' => $orgId,
                     'term' => $req->term,
                     'amount_json' => json_encode($amountJson),
-                    'in_favor_of' => $req->in_favor_of,
                     'updated_at' => now(),
                 ]
             );
@@ -644,7 +641,6 @@ class MasterSettingsController extends Controller
                     'organization_id' => $r->organization_id,
                     'term' => $r->term,
                     'amount_json' => $r->amount_json,
-                    'in_favor_of' => $r->in_favor_of,
                     'updated_at' => now(),
                 ]
             );
@@ -844,6 +840,14 @@ class MasterSettingsController extends Controller
         return response()->json(
             Program::query()
                 ->when(!$req->boolean('with_inactive'), fn($q) => $q->where('is_active', true))
+                // ?condition_type=Through Counselling[&session_year=] — only courses
+                // that have an admission condition of that type.
+                ->when($req->filled('condition_type'), fn($q) => $q->whereIn('id',
+                    DB::table('admission_conditions')
+                        ->where('condition_type', $req->condition_type)
+                        ->when($req->filled('session_year'), fn($c) => $c->where('session_year', $req->session_year))
+                        ->select('program_id')
+                ))
                 ->orderBy('short_name')->get()->map(function ($p) {
                     $p->status = $p->is_active ? 'Active' : 'Inactive';
                     return $p;
@@ -1212,6 +1216,7 @@ class MasterSettingsController extends Controller
             'papers.*.selection_type' => ['nullable', Rule::in(self::SELECTION_TYPES)],
             'papers.*.max_marks' => 'nullable|integer|min:1',
             'papers.*.min_marks' => 'nullable|integer|min:0',
+            'papers.*.credits' => 'nullable|integer|min:0|max:99',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -1246,6 +1251,7 @@ class MasterSettingsController extends Controller
                 'selection_type' => $allowedSelection ? (($p['selection_type'] ?? null) ?: 'Compulsory') : null,
                 'paper_code' => $p['paper_code'] ?? null,
                 'paper_name' => $p['paper_name'],
+                'credits' => isset($p['credits']) && $p['credits'] !== '' ? (int) $p['credits'] : null,
                 'group_no' => null,
                 'group_label' => $groupLabel,
                 'max_marks' => $p['max_marks'] ?? 100,
@@ -1270,6 +1276,7 @@ class MasterSettingsController extends Controller
             'group_label' => 'nullable|string|max:50',
             'max_marks' => 'nullable|integer|min:1',
             'min_marks' => 'nullable|integer|min:0',
+            'credits' => 'nullable|integer|min:0|max:99',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -1287,6 +1294,10 @@ class MasterSettingsController extends Controller
         // 100/33 on every edit, because the edit grid never sends marks.
         if ($req->filled('max_marks')) $update['max_marks'] = $req->max_marks;
         if ($req->filled('min_marks')) $update['min_marks'] = $req->min_marks;
+        // Credits only touched when sent; empty clears it.
+        if ($req->has('credits')) {
+            $update['credits'] = $req->filled('credits') ? (int) $req->credits : null;
+        }
 
         if ($req->has('selection_type')) {
             $allowedSelection = $this->allowedSelectionTypes(DB::table('programs')->find($paper->program_id));
@@ -1705,6 +1716,44 @@ class MasterSettingsController extends Controller
         return response()->json(['message' => 'Updated.']);
     }
 
+    /**
+     * PUT /settings/course/vocational-papers/group
+     * Rename a group / change its Max / Min Select — applied to every paper
+     * row of that group (they all carry the group's details). Paper ids are
+     * kept, so student selections stay valid.
+     */
+    public function vocationalPaperGroupUpdate(Request $req)
+    {
+        $v = Validator::make($req->all(), [
+            'program_id' => 'required|exists:programs,id',
+            'session_year' => 'required|string',
+            'semester_no' => 'required|string',
+            'group_no' => 'required|integer',
+            'group_name' => 'required|string|max:255',
+            'max_select' => 'required|integer|min:1',
+            'min_select' => 'required|integer|min:0|lte:max_select',
+        ]);
+        if ($v->fails())
+            return response()->json(['message' => $v->errors()->first(), 'errors' => $v->errors()], 422);
+
+        $updated = DB::table('vocational_papers')
+            ->where('program_id', $req->program_id)
+            ->where('session_year', $req->session_year)
+            ->where('semester_no', $req->semester_no)
+            ->where('group_no', $req->group_no)
+            ->update([
+                'group_name' => $req->group_name,
+                'max_select' => $req->max_select,
+                'min_select' => $req->min_select,
+                'updated_at' => now(),
+            ]);
+
+        if ($updated === 0)
+            return response()->json(['message' => 'Group not found.'], 404);
+
+        return response()->json(['message' => "Group {$req->group_no} updated."]);
+    }
+
     public function vocationalPaperDestroy($id)
     {
         DB::table('vocational_papers')->where('id', $id)->delete();
@@ -1861,9 +1910,10 @@ class MasterSettingsController extends Controller
         );
     }
 
-    public function counsellingStore(Request $req)
+    // Shared by counsellingStore and counsellingUpdate.
+    private function counsellingRules(): array
     {
-        $v = Validator::make($req->all(), [
+        return [
             'program_id' => 'required|exists:programs,id',
             'session_year' => 'required|string',
             'entrance_roll_no' => 'required|string|max:50',
@@ -1877,16 +1927,41 @@ class MasterSettingsController extends Controller
             'state_rank' => 'required|integer',
             'category_rank' => 'nullable|integer',
             'cut_off_mark' => 'nullable|numeric',
-        ]);
+            'spouse_name' => 'nullable|string|max:255',
+        ];
+    }
+
+    public function counsellingStore(Request $req)
+    {
+        $v = Validator::make($req->all(), $this->counsellingRules());
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('counselling_reports')->insertGetId(array_merge($req->all(), [
+        // Only the validated columns — extra fields in the request (e.g. UI
+        // state) used to go straight into the insert and fail it.
+        $id = DB::table('counselling_reports')->insertGetId(array_merge($req->only(array_keys($this->counsellingRules())), [
             'entry_date' => now()->toDateString(),
             'created_at' => now(),
             'updated_at' => now(),
         ]));
         return response()->json(['id' => $id, 'message' => 'Record saved successfully.'], 201);
+    }
+
+    public function counsellingUpdate(Request $req, $id)
+    {
+        $v = Validator::make($req->all(), $this->counsellingRules());
+        if ($v->fails())
+            return response()->json(['errors' => $v->errors()], 422);
+
+        if (!DB::table('counselling_reports')->where('id', $id)->exists())
+            return response()->json(['message' => 'Record not found.'], 404);
+
+        // Only real columns — entry_date stays as first recorded.
+        DB::table('counselling_reports')->where('id', $id)->update(
+            $req->only(array_keys($this->counsellingRules()))
+            + ['updated_at' => now()]
+        );
+        return response()->json(['message' => 'Record updated successfully.']);
     }
 
     public function counsellingDestroy($id)

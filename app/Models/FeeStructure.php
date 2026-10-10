@@ -36,7 +36,7 @@ class FeeStructure extends Model
     protected $fillable = [
         'organization_id', 'program_id', 'semester_no',
         'academic_year', 'admission_type', 'category', 'amount_json',
-        'term', 'sdpgc_student', 'ddu_affiliated', 'in_favor_of',
+        'term', 'sdpgc_student', 'ddu_affiliated',
         'late_fine_per_day', 'due_date', 'is_active', 'fee_ref_id',
     ];
 

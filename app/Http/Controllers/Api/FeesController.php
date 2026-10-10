@@ -292,7 +292,7 @@ class FeesController extends Controller
     // ─── Financial Summary: GET /fees/summary ────────────────────────────────────
     public function summaryIndex(Request $request): JsonResponse
     {
-        $session  = $request->session ?? date('Y') . '-' . (date('Y') + 1);
+        $session  = $request->session ?? \App\Support\AcademicSession::current();
         $progId   = $request->class_id; // frontend field name kept as class_id; means program_id now
 
         $admQuery = DB::table('admissions as adm')

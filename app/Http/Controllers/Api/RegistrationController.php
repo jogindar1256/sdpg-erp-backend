@@ -18,7 +18,7 @@ class RegistrationController extends Controller
     // ══════════════════════════════════════════════════════════════
     private function sessionYear(): string
     {
-        return request('session_year', date('Y') . '-' . (date('Y') + 1));
+        return request('session_year', \App\Support\AcademicSession::current());
     }
 
     // ══════════════════════════════════════════════════════════════

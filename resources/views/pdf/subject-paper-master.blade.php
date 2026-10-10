@@ -49,7 +49,8 @@
                 <tr>
                     <th style="width:20%">Subject</th>
                     <th style="width:15%">Paper Code</th>
-                    <th style="width:31%">Paper Name</th>
+                    <th style="width:25%">Paper Name</th>
+                    <th style="width:6%">Credit</th>
                     <th style="width:14%">Paper Type</th>
                     @if($showSelection ?? false)
                         <th style="width:16%">Selection Type</th>
@@ -64,6 +65,7 @@
                         <td>{{ $p->subject_name }}</td>
                         <td>{{ $p->paper_code ?? '-' }}</td>
                         <td>{{ $p->paper_name }}</td>
+                        <td>{{ $p->credits ?? '-' }}</td>
                         <td>{{ $p->paper_type }}</td>
                         @if($showSelection ?? false)
                             <td>{{ $p->selection_type ?? '-' }}</td>

@@ -34,8 +34,9 @@ Route::prefix('auth')->group(function () {
     Route::post('login', [AuthController::class, 'login']);
     Route::post('student/login', [AuthController::class, 'studentLogin']);
     Route::get('student/lookup', [StudentRegistrationController::class, 'loginLookup']);
-    Route::post('student/register', [StudentRegistrationController::class, 'register']);
-    Route::post('student/check-mobile', [StudentRegistrationController::class, 'checkMobile']);
+    // (removed: POST student/register and student/check-mobile pointed at
+    // controller methods that don't exist — registration goes through
+    // student/register/initiate.)
     Route::post('forgot-password', [AuthController::class, 'forgotPassword']);
     Route::post('reset-password', [AuthController::class, 'resetPassword']);
     Route::post('student/forgot-password', [AuthController::class, 'studentForgotPassword']);
@@ -729,7 +730,9 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('vocational-papers', [MasterSettingsController::class, 'vocationalPaperIndex']);
             Route::get('vocational-papers/print', [MasterSettingsController::class, 'vocationalPaperPrint']);
             Route::post('vocational-papers', [MasterSettingsController::class, 'vocationalPaperStore']);
-            Route::put('vocational-papers/{id}', [MasterSettingsController::class, 'vocationalPaperUpdate']);
+            // Literal path before {id} so "group" isn't taken as a paper id.
+            Route::put('vocational-papers/group', [MasterSettingsController::class, 'vocationalPaperGroupUpdate']);
+            Route::put('vocational-papers/{id}', [MasterSettingsController::class, 'vocationalPaperUpdate'])->whereNumber('id');
             Route::delete('vocational-papers/{id}', [MasterSettingsController::class, 'vocationalPaperDestroy']);
         });
 
@@ -748,6 +751,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
             Route::get('counselling', [MasterSettingsController::class, 'counsellingIndex']);
             Route::post('counselling', [MasterSettingsController::class, 'counsellingStore']);
+            Route::put('counselling/{id}', [MasterSettingsController::class, 'counsellingUpdate']);
             Route::delete('counselling/{id}', [MasterSettingsController::class, 'counsellingDestroy']);
         });
 

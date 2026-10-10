@@ -78,7 +78,7 @@ class PaymentLedgerController extends Controller
     // ── SUMMARY ───────────────────────────────────────────────────────────
     public function summary(Request $req): JsonResponse
     {
-        $session = $req->session_year ?? date('Y') . '-' . (date('Y') + 1);
+        $session = $req->session_year ?? \App\Support\AcademicSession::current();
 
         $base = DB::table('payment_ledger')
             ->whereNull('deleted_at')

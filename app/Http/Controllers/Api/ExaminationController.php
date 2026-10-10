@@ -27,7 +27,7 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     private function sessionYear(): string
     {
-        return request('session_year', date('Y') . '-' . (date('Y') + 1));
+        return request('session_year', \App\Support\AcademicSession::current());
     }
 
     /** Shared student-identity join, applied wherever 's.name'/'s.father_name' were used. */

@@ -9,7 +9,11 @@ class SubjectPaper extends Model
 {
     protected $fillable = [
         'program_id', 'subject_id', 'paper_code', 'session_year', 'semester_no',
-        'paper_type', 'paper_category', 'selection_type', 'paper_name', 'group_no', 'group_label', 'max_marks', 'min_marks',
+        'paper_type', 'paper_category', 'selection_type', 'paper_name', 'group_no', 'group_label', 'max_marks', 'min_marks', 'credits',
+    ];
+
+    protected $casts = [
+        'credits' => 'integer',
     ];
 
     public function program(): BelongsTo

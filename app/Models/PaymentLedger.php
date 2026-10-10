@@ -168,7 +168,7 @@ class PaymentLedger extends Model
      */
     public static function record(array $data): static
     {
-        $session = $data['session_year'] ?? date('Y') . '-' . (date('Y') + 1);
+        $session = $data['session_year'] ?? \App\Support\AcademicSession::current();
 
         // TXN-2526-000001
         $data['txn_no'] = $data['txn_no'] ?? static::generateTxnNo($session);
