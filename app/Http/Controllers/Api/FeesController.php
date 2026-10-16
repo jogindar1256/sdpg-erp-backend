@@ -60,7 +60,9 @@ class FeesController extends Controller
             ->leftJoin('programs as p', 'p.id', '=', 'adm.program_id')
             ->leftJoinSub($latestReg, 'lr', 'lr.user_id', '=', DB::raw('COALESCE(s.user_id, adm.user_id)'))
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
+            ->leftJoin('student_applications as sa', 'sa.id', '=', 'adm.application_id')
             ->select([
+                'sa.application_no', 'dr.category',
                 'fr.id', 'fr.receipt_no', 'fr.receipt_type as fee_type', 'fr.net_amount as amount',
                 'fr.transaction_id as utr_no', 'fr.bank_ref_no', 'fr.receipt_date as payment_date',
                 'fr.is_verified', 'fr.status', 'fr.created_at',
@@ -108,7 +110,11 @@ class FeesController extends Controller
     // ─── All Fee Receipts: GET /fees/receipts ────────────────────────────────────
     public function receiptsIndex(Request $request): JsonResponse
     {
-        $q = $this->baseReceiptQuery($request)->orderByDesc('fr.created_at');
+        $q = $this->baseReceiptQuery($request);
+        // ?pending_first=1 (Authorization → Fee Receipt): unverified first, oldest first.
+        $q = $request->boolean('pending_first')
+            ? $q->orderBy('fr.is_verified')->orderBy('fr.created_at')
+            : $q->orderByDesc('fr.created_at');
 
         $perPage = 20;
         $total   = $q->count();

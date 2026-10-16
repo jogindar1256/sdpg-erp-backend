@@ -47,6 +47,7 @@ Route::prefix('student/register')->group(function () {
     // Public catalog for the registration form (form is public — must not need auth)
     Route::get('courses', [StudentRegistrationController::class, 'publicCourses']);
     Route::get('programs/{program}/subjects', [StudentRegistrationController::class, 'publicSubjects']);
+    Route::get('programs/{program}/subject-papers', [ProgramController::class, 'subjectPapers']);
     Route::get('meta', [StudentRegistrationController::class, 'registrationMeta']);
     // Groupwise (A/B/C) subjects for the public registration form dropdowns
     Route::get('subject-groups', [MasterSettingsController::class, 'publicSubjectGroups']);
@@ -672,8 +673,6 @@ Route::middleware('auth:sanctum')->group(function () {
             // Fee Structure
             Route::get('fee-structure', [MasterSettingsController::class, 'feeStructureIndex']);
             Route::post('fee-structure', [MasterSettingsController::class, 'feeStructureStore']);
-            Route::post('fee-structure/practical', [MasterSettingsController::class, 'feeStructurePracticalStore']);
-            Route::post('reg-fee/copy', [MasterSettingsController::class, 'registrationFeeCopyYear']);
 
             // Registration Fee
             Route::get('reg-fee', [MasterSettingsController::class, 'registrationFeeIndex']);
@@ -698,6 +697,9 @@ Route::middleware('auth:sanctum')->group(function () {
             // Single source of truth for every semester dropdown in the app.
             // Write routes removed — change SemesterSeeder and reseed instead.
             Route::get('semesters', [MasterSettingsController::class, 'semesterMasterIndex']);
+            // Only the Academic Cycle is editable.
+            Route::patch('semesters/{id}/academic-cycle', [MasterSettingsController::class, 'semesterAcademicCycleUpdate'])->whereNumber('id');
+            Route::patch('semesters/{id}/research-paper', [MasterSettingsController::class, 'semesterResearchPaperUpdate'])->whereNumber('id');
 
             Route::get('subjects', [MasterSettingsController::class, 'subjectMasterIndex']);
             Route::post('subjects', [MasterSettingsController::class, 'subjectMasterStore']);

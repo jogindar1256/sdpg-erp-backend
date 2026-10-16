@@ -66,13 +66,11 @@
 
     $courseName = \App\Models\Program::label($program);
 
-    $majorSubjects = collect([
-        $p6['major_subject_1'] ?? null,
-        $p6['major_subject_2'] ?? null,
-        $p6['major_subject_3'] ?? null,
-    ])->filter()->map(fn ($id) => $subjectsById->get($id)->name ?? null)->filter()->values();
+    // U.G. Subject -1/-2/-3 (equal slots).
+    $chosenSubjects = collect(\App\Support\Part6Rules::subjectSlots($p6))
+        ->map(fn ($id) => $subjectsById->get($id)->name ?? null)->filter()->values();
 
-    $minorSubject = isset($p6['minor_subject_1']) ? ($subjectsById->get($p6['minor_subject_1'])->name ?? null) : null;
+    $researchSubject = !empty($p6['research_subject']) ? ($subjectsById->get($p6['research_subject'])->name ?? null) : null;
 @endphp
 <!DOCTYPE html>
 <html>
@@ -250,15 +248,14 @@
         <tr>
             <td style="width: 60%;">
                 <strong>Selected Subject</strong>
-                @forelse($majorSubjects as $i => $name)
+                @forelse($chosenSubjects as $i => $name)
                     <div>{{ $i + 1 }}- {{ $name }}</div>
                 @empty
                     <div>—</div>
                 @endforelse
             </td>
             <td style="width: 40%;">
-                <div><strong>Minor Subject</strong> :- {{ $val($minorSubject) }}</div>
-                <div style="margin-top: 4px;"><strong>Research Subject</strong> :- —</div>
+                <div><strong>Research Subject</strong> :- {{ $val($researchSubject) }}</div>
                 <div style="margin-top: 4px;"><strong>Drop Subject</strong> :- —</div>
             </td>
         </tr>

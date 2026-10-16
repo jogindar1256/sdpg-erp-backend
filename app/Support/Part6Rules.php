@@ -18,9 +18,70 @@ use Illuminate\Support\Facades\DB;
 class Part6Rules
 {
     public const SELECTION_TYPES = ['Compulsory', 'Optional', 'Teaching Subject'];
-    public const OPTIONAL_SLOTS = ['PG' => 1, 'BED' => 2];
+    /** Optional Paper -1 / -2: one pick from each subject_papers.optional_group (1, 2). */
+    public const OPTIONAL_SLOTS = ['PG' => 2, 'BED' => 2];
+    public const OPTIONAL_GROUPS = [1, 2];
     public const TEACHING_SLOTS = 2;
     public const TEACHING_FROM_SEMESTER = 3;
+
+    /** U.G. subject slots (Part 6 and direct_registrations): three equal picks from the course's subjects. */
+    public const UG_SUBJECT_KEYS = ['subject_1', 'subject_2', 'subject_3'];
+
+    /** Pre-rename names — read fallback only, for rows the rename migration has not reached. Never write these. */
+    private const UG_LEGACY_KEYS = ['subject_1' => 'major_subject_1', 'subject_2' => 'major_subject_2', 'subject_3' => 'minor_subject_1'];
+
+    /** Subject id in U.G. slot $n (1-3) of a Part 6 array or a registration row; null when empty. */
+    public static function subjectSlot($src, int $n): ?int
+    {
+        $arr = is_array($src) ? $src : (array) $src;
+        $key = 'subject_' . $n;
+        $v = $arr[$key] ?? $arr[self::UG_LEGACY_KEYS[$key] ?? ''] ?? null;
+        return $v ? (int) $v : null;
+    }
+
+    /** The chosen U.G. subject ids in slot order, empty slots left out. */
+    public static function subjectSlots($src): array
+    {
+        return array_values(array_filter([self::subjectSlot($src, 1), self::subjectSlot($src, 2), self::subjectSlot($src, 3)]));
+    }
+
+    /**
+     * U.G. Part 6 save (student and office). Writes only subject_1..3, drops
+     * old key names, refuses the same subject twice and subjects of another
+     * course. $lockToRegistration (student, regular application): the three
+     * subjects are copied from the registration when it has any.
+     * Returns [data, null] or [null, errorMessage]. P.G./B.Ed. pass through.
+     */
+    public static function normalizeUg(object $app, $program, array $data, ?object $reg, bool $lockToRegistration): array
+    {
+        if (self::formType($program)) return [$data, null];
+
+        foreach (['major_subject_1', 'major_subject_2', 'major_subject_3', 'minor_subject_1'] as $old) {
+            unset($data[$old]);
+        }
+
+        $locked = $lockToRegistration && ($app->application_type ?? 'regular') === 'regular'
+            && $reg && self::subjectSlots($reg);
+        foreach (self::UG_SUBJECT_KEYS as $i => $key) {
+            if ($locked) {
+                $data[$key] = self::subjectSlot($reg, $i + 1);
+            } elseif (array_key_exists($key, $data)) {
+                $data[$key] = !empty($data[$key]) ? (int) $data[$key] : null;
+            }
+        }
+
+        $ids = self::subjectSlots($data);
+        if (count($ids) !== count(array_unique($ids))) {
+            return [null, 'The same subject cannot be selected twice.'];
+        }
+        if (!$locked && $ids) {
+            $found = DB::table('subjects')->whereIn('id', $ids)->where('program_id', $app->program_id)->count();
+            if ($found !== count($ids)) {
+                return [null, 'A selected subject does not belong to this course.'];
+            }
+        }
+        return [$data, null];
+    }
 
     public static function isBed($program): bool
     {
@@ -57,7 +118,7 @@ class Part6Rules
     }
 
     /** Papers on offer for this application (PG: only the chosen subject's). */
-    private static function papersFor(object $app, ?string $formType, ?int $subjectId)
+    public static function papersFor(object $app, ?string $formType, ?int $subjectId)
     {
         return DB::table('subject_papers')
             ->where('program_id', $app->program_id)
@@ -65,7 +126,30 @@ class Part6Rules
             ->when(!empty($app->academic_year), fn($q) => $q->where('session_year', $app->academic_year))
             ->when($formType === 'PG', fn($q) => $q->where('subject_id', $subjectId ?? 0))
             ->orderBy('id')
-            ->get(['id', 'subject_id', 'selection_type']);
+            ->get();
+    }
+
+    /** Optional papers of one group. Ungrouped Optional papers are on no list. */
+    public static function optionalOfGroup($papers, int $group): array
+    {
+        return $papers->filter(fn($p) => ($p->selection_type ?? null) === 'Optional' && (int) ($p->optional_group ?? 0) === $group)
+            ->pluck('id')->map(fn($v) => (int) $v)->values()->all();
+    }
+
+    /**
+     * The student's Optional picks, one per group, in group order (Optional
+     * Paper -1 first). Ids that are not an Optional paper of group 1/2 are
+     * dropped; a second pick from the same group is dropped.
+     */
+    public static function pickOptional($submitted, $papers): array
+    {
+        $submitted = self::ids($submitted);
+        $out = [];
+        foreach (self::OPTIONAL_GROUPS as $g) {
+            $hit = array_values(array_intersect($submitted, self::optionalOfGroup($papers, $g)));
+            if ($hit) $out[] = $hit[0];
+        }
+        return $out;
     }
 
     private static function ids($v): array
@@ -93,9 +177,7 @@ class Part6Rules
         $formType = self::formType($program);
 
         if ($formType === null) {
-            return !empty($part6['major_subject_1'])
-                && !empty($part6['major_subject_2'])
-                && !empty($part6['minor_subject_1']);
+            return self::subjectSlot($part6, 1) && self::subjectSlot($part6, 2) && self::subjectSlot($part6, 3);
         }
 
         $subjectId = null;
@@ -110,9 +192,12 @@ class Part6Rules
         $compulsory = $idsOf('Compulsory');
         if (count(array_diff($compulsory, self::ids($part6['compulsory_paper_ids'] ?? []))) > 0) return false;
 
-        $optional = $idsOf('Optional');
-        $needOptional = min(self::OPTIONAL_SLOTS[$formType], count($optional));
-        if (count(array_intersect(self::ids($part6['optional_paper_ids'] ?? []), $optional)) < $needOptional) return false;
+        // One Optional pick per group that has papers configured.
+        $pickedOptional = self::ids($part6['optional_paper_ids'] ?? []);
+        foreach (self::OPTIONAL_GROUPS as $g) {
+            $groupIds = self::optionalOfGroup($papers, $g);
+            if ($groupIds && !array_intersect($pickedOptional, $groupIds)) return false;
+        }
 
         if (self::teachingAllowed($formType, $app->semester_no)) {
             $teaching = $idsOf('Teaching Subject');
@@ -141,7 +226,7 @@ class Part6Rules
 
         $subjectId = null;
         if ($formType === 'PG') {
-            $subjectId = $data['subject_id'] ?? ($reg->subject_id ?? $reg->major_subject_1 ?? null);
+            $subjectId = $data['subject_id'] ?? ($reg->subject_id ?? self::subjectSlot($reg, 1));
             $subjectId = $subjectId ? (int) $subjectId : null;
             if (!empty($data['subject_id']) && !DB::table('subjects')->where('id', $subjectId)->where('program_id', $app->program_id)->exists()) {
                 return [null, 'The selected subject does not belong to this course.'];
@@ -171,6 +256,13 @@ class Part6Rules
                     : "At most {$max} {$label} paper(s) can be selected."];
             }
             $clean[$key] = $submitted;
+        }
+
+        // Optional: at most one per group, never an ungrouped paper; stored in group order.
+        $submittedOptional = $clean['optional_paper_ids'];
+        $clean['optional_paper_ids'] = self::pickOptional($submittedOptional, $papers);
+        if (count($clean['optional_paper_ids']) !== count($submittedOptional)) {
+            return [null, 'Select at most one Optional paper from each Optional Group (1 and 2); papers without a group cannot be selected.'];
         }
 
         $all = array_values(array_merge($clean['compulsory_paper_ids'], $clean['optional_paper_ids'], $clean['teaching_paper_ids']));

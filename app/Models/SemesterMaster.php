@@ -12,9 +12,15 @@ use Illuminate\Database\Eloquent\Model;
  */
 class SemesterMaster extends Model
 {
-    protected $fillable = ['semester_num', 'semester_name', 'status'];
+    protected $fillable = ['semester_num', 'semester_name', 'academic_cycle', 'research_paper', 'status'];
 
-    protected $casts = ['semester_num' => 'integer'];
+    /** academic_cycle values and their labels. */
+    public const ACADEMIC_CYCLES = [
+        'JUL_DEC' => 'July-December (ODD)',
+        'JAN_JUN' => 'January-June (EVEN)',
+    ];
+
+    protected $casts = ['semester_num' => 'integer', 'research_paper' => 'boolean'];
 
     protected $appends = ['label'];
 
@@ -37,6 +43,12 @@ class SemesterMaster extends Model
     /**
      * Active semesters, ordered. Used by the settings API and every dropdown.
      */
+    /** Does U.G. Part 6 offer a Research Paper in this semester? */
+    public static function researchAllowed($semesterNo): bool
+    {
+        return (bool) self::where('semester_num', (int) $semesterNo)->value('research_paper');
+    }
+
     public static function active()
     {
         return self::where('status', 'Active')->orderBy('semester_num')->get();

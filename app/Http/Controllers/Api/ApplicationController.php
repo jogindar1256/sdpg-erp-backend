@@ -115,14 +115,11 @@ class ApplicationController extends Controller
         if ($sa->application_type !== 'back_paper') {
             $feePreview = $this->computeApplicationFee($sa);
             $sa->computed_fee_amount = $feePreview['missing_structure'] ? null : $feePreview['total'];
-            // How much of that is the practical-subject fee, and for how many subjects.
-            $sa->practical_subject_count = $feePreview['practical_subject_count'] ?? 0;
-            $sa->computed_practical_fee = (float) collect($feePreview['breakdown'])
-                ->whereNull('fee_head_id')->sum('amount');
+            // Particulars collected at the college counter (not in the online amount).
+            $sa->computed_college_fee = (float) $feePreview['college_total'];
         } else {
             $sa->computed_fee_amount = null;
-            $sa->practical_subject_count = 0;
-            $sa->computed_practical_fee = 0.0;
+            $sa->computed_college_fee = 0.0;
         }
 
         $sa->documents = DB::table('student_application_documents')
@@ -1092,20 +1089,15 @@ class ApplicationController extends Controller
             return $out;
         }
 
-        $majorIds = array_values(array_filter([
-            $part6['major_subject_1'] ?? null,
-            $part6['major_subject_2'] ?? null,
-            $part6['major_subject_3'] ?? null,
-        ]));
-        $minorIds = array_values(array_filter([$part6['minor_subject_1'] ?? null]));
-        $all = $names(array_merge($majorIds, $minorIds));
+        // U.G.: Subject -1/-2/-3 are equal; basic_subject is no longer used.
+        $slotIds = Part6Rules::subjectSlots($part6);
+        $all = $names($slotIds);
 
-        $out['subject'] = collect($majorIds)->map(fn($id) => $all[$id] ?? null)->filter()->implode(', ') ?: null;
-        $out['basic_subject'] = collect($minorIds)->map(fn($id) => $all[$id] ?? null)->filter()->implode(', ') ?: null;
+        $out['subject'] = collect($slotIds)->map(fn($id) => $all[$id] ?? null)->filter()->implode(', ') ?: null;
 
-        if ($majorIds || $minorIds) {
+        if ($slotIds) {
             $practicalIds = DB::table('subject_papers')
-                ->whereIn('subject_id', array_merge($majorIds, $minorIds))
+                ->whereIn('subject_id', $slotIds)
                 ->where('program_id', $app->program_id)
                 ->when(!empty($app->academic_year), fn($q) => $q->where('session_year', $app->academic_year))
                 ->where('semester_no', (string) $app->semester_no) // varchar column
@@ -1196,7 +1188,13 @@ class ApplicationController extends Controller
             'required_fee' => $required,
             'pending_fee' => $required === null ? null : max(0, $required - $paid),
             'fine_amount' => (float) ($receipt->late_fine ?? 0),
-            'practical_subject_count' => $fee['practical_subject_count'] ?? 0,
+            // Pay-in-college particulars: collected at the counter, not online.
+            'college_fee' => (float) $fee['college_total'],
+            'college_fee_breakdown' => collect($fee['college_breakdown'])->map(fn($b) => [
+                'fee_head' => $headNames[$b['fee_head_id']] ?? 'Fee',
+                'amount' => (float) $b['amount'],
+            ])->values()->all(),
+            'pass_out' => $fee['pass_out'],
             'fee_breakdown' => collect($fee['breakdown'])->map(fn($b) => [
                 'fee_head' => $b['label'] ?? ($headNames[$b['fee_head_id']] ?? 'Fee'),
                 'amount' => (float) $b['amount'],
@@ -1566,6 +1564,7 @@ class ApplicationController extends Controller
     {
         return [
             // Part 1 — Course Selection / Personal Details
+            'eligibility_class',
             'gender',
             'marital_status',
             'social_category',
@@ -1614,9 +1613,13 @@ class ApplicationController extends Controller
      * Yes/No must be Yes/No, text has a length limit. Returns a 422 response
      * when something is wrong, null when the payload is fine.
      */
-    private function invalidPart1(Request $req): ?JsonResponse
+    private function invalidPart1(Request $req, object $app): ?JsonResponse
     {
-        $v = Validator::make($req->all(), Student::certificateRules());
+        $program = DB::table('programs')->where('id', $app->program_id)->first();
+        $allowed = StudentRegistrationController::eligibilityFor(StudentRegistrationController::eligibilityLevelOf($program));
+        $v = Validator::make($req->all(), Student::certificateRules() + [
+            'eligibility_class' => 'nullable|in:' . implode(',', $allowed),
+        ]);
         if ($v->fails()) {
             return response()->json([
                 'message' => $v->errors()->first(),
@@ -1645,7 +1648,7 @@ class ApplicationController extends Controller
         if (!$app)
             return response()->json(['message' => 'Application not found.'], 404);
 
-        if ($partNo === 1 && ($invalid = $this->invalidPart1($req))) {
+        if ($partNo === 1 && ($invalid = $this->invalidPart1($req, $app))) {
             return $invalid;
         }
 
@@ -1656,7 +1659,12 @@ class ApplicationController extends Controller
 
         $clean = TextNormalizer::upper($req->all(), $this->selectDrivenApplicationFields());
         if ($partNo === 6) {
-            $clean = $this->cleanResearchSubject($clean); // U.G. Research Paper ⊂ Major 1/2, Minor 1
+            $ugProgram = DB::table('programs')->where('id', $app->program_id)->first();
+            [$clean, $error] = Part6Rules::normalizeUg($app, $ugProgram, $clean, null, false);
+            if ($error) {
+                return response()->json(['message' => $error], 422);
+            }
+            $clean = $this->cleanResearchSubject($clean, $app); // U.G. Research Paper ⊂ Subject -1/-2/-3
         }
 
         // P.G. / B.Ed. Part 6: the office may pick any row, but every paper
@@ -1758,10 +1766,7 @@ class ApplicationController extends Controller
 
         $part6 = $parts[6] ?? [];
         $subjectIds = array_filter([
-            $part6['major_subject_1'] ?? null,
-            $part6['major_subject_2'] ?? null,
-            $part6['major_subject_3'] ?? null,
-            $part6['minor_subject_1'] ?? null,
+            ...Part6Rules::subjectSlots($part6),
             $part6['research_subject'] ?? null,
         ]);
         $subjectsById = $subjectIds
@@ -1786,15 +1791,15 @@ class ApplicationController extends Controller
 
         $subjectRows = [];
         $rowDefs = [
-            ['key' => 'major_subject_1', 'label' => 'Major Subject -1', 'kind' => 'subject'],
-            ['key' => 'major_subject_2', 'label' => 'Major Subject -2', 'kind' => 'subject'],
-            ['key' => 'minor_subject_1', 'label' => 'Minor Subject -1', 'kind' => 'subject'],
+            ['slot' => 1, 'label' => 'Subject -1', 'kind' => 'subject'],
+            ['slot' => 2, 'label' => 'Subject -2', 'kind' => 'subject'],
+            ['slot' => 3, 'label' => 'Subject -3', 'kind' => 'subject'],
             ['key' => 'research_subject', 'label' => 'Research Paper', 'kind' => 'research'],
             ['key' => 'aec_subject', 'label' => 'Ability Enhancement Course', 'kind' => 'vocational'],
             ['key' => 'sec_subject', 'label' => 'Skill Enhancement Course', 'kind' => 'vocational'],
         ];
         foreach ($rowDefs as $def) {
-            $id = $part6[$def['key']] ?? null;
+            $id = isset($def['slot']) ? Part6Rules::subjectSlot($part6, $def['slot']) : ($part6[$def['key']] ?? null);
             if (!$id)
                 continue;
             if ($def['kind'] === 'research') {
@@ -1833,7 +1838,7 @@ class ApplicationController extends Controller
         }
 
         // P.G. / B.Ed. Part 6 stores paper ids (Compulsory / Optional /
-        // Teaching Subject) rather than the U.G. major/minor keys above.
+        // Teaching Subject) rather than the U.G. subject slots above.
         $part6Form = strtoupper((string) ($part6['form_type'] ?? ''));
         if (in_array($part6Form, ['PG', 'BED'], true)) {
             $groups = [
@@ -2215,94 +2220,47 @@ class ApplicationController extends Controller
     {
         $admissionType = 'regular';
         [$gender, $category] = $this->feeGenderCategory($sa->student_id, $sa);
+        $semesterNos = array_unique([0, (int) $sa->semester_no]);
 
         $result = \App\Models\FeeStructure::breakdownFor(
             $sa->program_id,
             $sa->academic_year,
-            array_unique([0, (int) $sa->semester_no]),
+            $semesterNos,
             $admissionType,
             $gender,
             $category
         );
 
-        // Practical-subject fee: added on top of the fee heads, according
-        // to how many of the applicant's chosen subjects have a practical
-        // paper this semester (Fee Structure → "Fee If 01/02/03 Practical
-        // Sub."). Three or more subjects use the "03" amount.
-        $breakdown = $result['breakdown'];
-        $total = (float) $result['total'];
-        $practicalCount = $total > 0 ? $this->practicalSubjectCount($sa) : 0;
-        if ($practicalCount > 0) {
-            $pf = DB::table('fee_structure_practical_fees')
-                ->where('program_id', $sa->program_id)
-                ->where('academic_year', $sa->academic_year)
-                ->where('semester_no', (int) $sa->semester_no)
-                ->where('admission_type', $admissionType)
-                ->orderBy('id')
-                ->first();
-            $amount = $pf ? (float) ($pf->{'fee_' . min($practicalCount, 3)} ?? 0) : 0.0;
-            if ($amount > 0) {
-                $breakdown[] = [
-                    'fee_head_id' => null,
-                    'label' => "Practical Subject Fee ({$practicalCount} subject" . ($practicalCount === 1 ? '' : 's') . ')',
-                    'amount' => $amount,
-                ];
-                $total += $amount;
+        // Per-particular rules (Fee Structure → SDPGC Student / DDU-Affiliated
+        // College / Pay in College): exempt particulars are dropped, counter
+        // particulars are split out of the online amount.
+        $settings = \App\Support\FeeHeadSettings::forConfig((int) $sa->program_id, (string) $sa->academic_year, $semesterNos, $admissionType);
+        $who = \App\Support\FeeHeadSettings::passOutStatus($sa);
+        $online = [];
+        $college = [];
+        $exempt = [];
+        foreach ($result['breakdown'] as $b) {
+            $setting = $settings[(int) $b['fee_head_id']] ?? null;
+            if (\App\Support\FeeHeadSettings::isExempt($setting, $who)) {
+                $exempt[] = $b;
+            } elseif ($setting && $setting->pay_in_college) {
+                $college[] = $b;
+            } else {
+                $online[] = $b;
             }
         }
+        $total = (float) collect($online)->sum('amount');
 
         return [
             'base_amount' => $total,
-            'total' => $total,
-            'breakdown' => $breakdown,
-            'practical_subject_count' => $practicalCount,
+            'total' => $total,                 // online (Razorpay) amount
+            'breakdown' => $online,
+            'college_total' => (float) collect($college)->sum('amount'),
+            'college_breakdown' => $college,   // pay at the college counter
+            'exempt_breakdown' => $exempt,     // waived (SDPGC / DDU pass-out)
+            'pass_out' => $who,
             'missing_structure' => $result['total'] <= 0,
         ];
-    }
-
-    /**
-     * How many of the applicant's chosen subjects (Part 6) have a practical
-     * paper in the semester applied for. U.G.: major + minor subjects.
-     * P.G. / B.Ed.: the subjects of the papers actually selected.
-     */
-    private function practicalSubjectCount(object $sa): int
-    {
-        $part6 = is_array($sa->part_6 ?? null) ? $sa->part_6 : (json_decode($sa->part_6 ?? '{}', true) ?: []);
-
-        $formType = strtoupper((string) ($part6['form_type'] ?? ''));
-        if (in_array($formType, ['PG', 'BED'], true)) {
-            $paperIds = collect([
-                $part6['compulsory_paper_ids'] ?? [],
-                $part6['optional_paper_ids'] ?? [],
-                $part6['teaching_paper_ids'] ?? [],
-            ])->flatten()->filter()->map(fn($v) => (int) $v)->unique()->all();
-            if (!$paperIds) {
-                return 0;
-            }
-            return DB::table('subject_papers')
-                ->whereIn('id', $paperIds)
-                ->whereRaw("LOWER(paper_type) = 'practical'")
-                ->distinct()
-                ->count('subject_id');
-        }
-
-        $subjectIds = array_values(array_unique(array_filter([
-            $part6['major_subject_1'] ?? null,
-            $part6['major_subject_2'] ?? null,
-            $part6['major_subject_3'] ?? null,
-            $part6['minor_subject_1'] ?? null,
-        ])));
-        if (!$subjectIds) {
-            return 0;
-        }
-        return DB::table('subject_papers')
-            ->whereIn('subject_id', $subjectIds)
-            ->where('program_id', $sa->program_id)
-            ->where('semester_no', (string) $sa->semester_no) // varchar column
-            ->when(!empty($sa->academic_year), fn($q) => $q->where('session_year', $sa->academic_year))
-            ->whereRaw("LOWER(paper_type) = 'practical'")
-            ->distinct()
-            ->count('subject_id');
     }
 
     /**
@@ -2406,6 +2364,9 @@ class ApplicationController extends Controller
         }
 
         $rupees = (int) round($fee['total']);
+        if ($rupees <= 0) {
+            return response()->json(['message' => 'Nothing to pay online — the fee for this application is collected at the college counter.'], 422);
+        }
         $amount = $rupees * 100; // paise
 
         $key = config('services.razorpay.key');
@@ -3092,6 +3053,7 @@ class ApplicationController extends Controller
             ->leftJoin('direct_registrations as dr', 'dr.id', 'sa.direct_registration_id')
             ->leftJoinSub($latestDecisionIds, 'ld', 'ld.student_application_id', 'sa.id')
             ->leftJoin('rejected_applications as ra', 'ra.id', 'ld.decision_id')
+            ->leftJoin('fee_receipts as fr', 'fr.id', 'sa.fee_receipt_id')
             ->where(function ($q) use ($userId) {
                 $q->where('sa.user_id', $userId)
                     ->orWhere('dr.user_id', $userId);
@@ -3113,7 +3075,12 @@ class ApplicationController extends Controller
                 'p.name as program_name',
                 'p.short_name',
                 'p.level',
+                'p.samarth_code',
                 'dr.unique_code as code',
+                'dr.registration_no',
+                'fr.receipt_no as fee_receipt_no',
+                'sa.fee_paid',
+                'sa.paid_at',
             ])
             ->orderByDesc('sa.created_at')
             ->get()
@@ -3176,6 +3143,12 @@ class ApplicationController extends Controller
             ], 409);
         }
 
+        // Back paper: Back Paper Form Schedule "Years Allowed" — only students
+        // admitted to this course + semester in one of those sessions.
+        if ($req->application_type === 'back_paper' && ($blocked = $this->backPaperSessionBlock($req, $userId))) {
+            return $blocked;
+        }
+
         $seq = DB::table('student_applications')->count() + 1;
         $appNo = 'SA-' . date('Y') . '-' . str_pad($seq, 6, '0', STR_PAD_LEFT);
 
@@ -3217,24 +3190,64 @@ class ApplicationController extends Controller
     }
 
     /**
+     * Back Paper Form Schedule "Years Allowed" check. Null = allowed (no
+     * schedule, or no session restriction on it). NOTE: the system holds no
+     * exam results, so "failed in that session" can't be checked — this
+     * allows any student with an approved admission application for this
+     * course + semester in one of the allowed sessions.
+     */
+    private function backPaperSessionBlock(Request $req, int $userId): ?\Illuminate\Http\JsonResponse
+    {
+        $semester = (string) (int) $req->semester_no;
+        $schedule = DB::table('back_paper_schedules')
+            ->where('program_id', $req->program_id)
+            ->where('semester', $semester)
+            ->where('session_year', $req->academic_year)
+            ->orderByDesc('id')
+            ->first();
+        $allowed = $schedule && !empty($schedule->allowed_sessions)
+            ? (json_decode($schedule->allowed_sessions, true) ?: [])
+            : [];
+        if (!$allowed) {
+            return null;
+        }
+
+        $studentId = DB::table('students')->where('user_id', $userId)->value('id');
+        $ok = DB::table('student_applications')
+            ->where(fn($q) => $q->where('user_id', $userId)->when($studentId, fn($w) => $w->orWhere('student_id', $studentId)))
+            ->where('program_id', $req->program_id)
+            ->where('semester_no', (int) $semester)
+            ->whereIn('application_type', ['regular', 'semester_upgrade'])
+            ->whereIn('academic_year', $allowed)
+            ->where('status', 'approved')
+            ->whereNull('deleted_at')
+            ->exists();
+
+        return $ok ? null : response()->json([
+            'message' => 'The back paper form for this course and semester is open only to students of session(s) ' . implode(', ', $allowed) . '.',
+        ], 422);
+    }
+
+    /**
      * PUT /student/applications/{id}/part/{part}
      * Student saves one part. Blocked if submitted or approved.
      */
     /** 'BED' | 'PG' | null — which Part 6 form the course uses (null = U.G. form). */
     /**
      * U.G. Part 6 "Research Paper": must be one of the subjects already
-     * chosen as Major 1, Major 2 or Minor 1 — anything else is dropped.
+     * chosen as Subject -1, -2 or -3 — anything else is dropped. Also
+     * dropped when Semester Master says this semester has no Research Paper.
      */
-    private function cleanResearchSubject(array $part6): array
+    private function cleanResearchSubject(array $part6, object $app): array
     {
         if (!array_key_exists('research_subject', $part6)) {
             return $part6;
         }
-        $allowed = array_map('intval', array_filter([
-            $part6['major_subject_1'] ?? null,
-            $part6['major_subject_2'] ?? null,
-            $part6['minor_subject_1'] ?? null,
-        ]));
+        if (!\App\Models\SemesterMaster::researchAllowed($app->semester_no)) {
+            $part6['research_subject'] = null;
+            return $part6;
+        }
+        $allowed = Part6Rules::subjectSlots($part6);
         $pick = (int) ($part6['research_subject'] ?? 0);
         $part6['research_subject'] = in_array($pick, $allowed, true) ? $pick : null;
         return $part6;
@@ -3268,17 +3281,11 @@ class ApplicationController extends Controller
         // P.G.: the subject is the one taken at registration.
         $subjectId = null;
         if ($formType === 'PG') {
-            $subjectId = $reg->subject_id ?? $reg->major_subject_1 ?? ($data['subject_id'] ?? null);
+            $subjectId = $reg->subject_id ?? Part6Rules::subjectSlot($reg, 1) ?? ($data['subject_id'] ?? null);
             $subjectId = $subjectId ? (int) $subjectId : null;
         }
 
-        $papers = DB::table('subject_papers')
-            ->where('program_id', $app->program_id)
-            ->where('semester_no', (string) $app->semester_no)
-            ->when(!empty($app->academic_year), fn($q) => $q->where('session_year', $app->academic_year))
-            ->when($formType === 'PG', fn($q) => $q->where('subject_id', $subjectId ?? 0))
-            ->orderBy('id')
-            ->get(['id', 'subject_id', 'selection_type']);
+        $papers = Part6Rules::papersFor($app, $formType, $subjectId);
 
         $idsOf = fn(string $type) => $papers->where('selection_type', $type)->pluck('id')->map(fn($v) => (int) $v)->values()->all();
         $pick = function ($submitted, array $allowed, int $max): array {
@@ -3287,7 +3294,8 @@ class ApplicationController extends Controller
         };
 
         $compulsory = $idsOf('Compulsory');
-        $optional = $pick($data['optional_paper_ids'] ?? [], $idsOf('Optional'), self::PART6_OPTIONAL_SLOTS[$formType]);
+        // One per Optional Group (1, 2), in group order; ungrouped papers never count.
+        $optional = Part6Rules::pickOptional($data['optional_paper_ids'] ?? [], $papers);
         $teachingAllowed = $formType === 'BED' && (int) $app->semester_no >= self::PART6_TEACHING_FROM_SEMESTER;
         $teaching = $teachingAllowed
             ? $pick($data['teaching_paper_ids'] ?? [], $idsOf('Teaching Subject'), self::PART6_TEACHING_SLOTS)
@@ -3334,11 +3342,18 @@ class ApplicationController extends Controller
         $prog = json_decode($app->form_progress ?? '{}', true);
         $prog[$key] = true;
 
-        if ($partNo === 1 && ($invalid = $this->invalidPart1($req))) {
+        if ($partNo === 1 && ($invalid = $this->invalidPart1($req, $app))) {
             return $invalid;
         }
 
         $clean = $this->stripLockedIdentity($req->all(), $req->user()->id);
+        // Part 5 "Name In Account" / "Father" describe the bank-account
+        // holder, not the student's identity — the student may edit them.
+        if ($partNo === 5) {
+            foreach (['name_in_account', 'father_name'] as $f) {
+                if ($req->has($f)) $clean[$f] = $req->input($f);
+            }
+        }
         $clean = TextNormalizer::upper($clean, $this->selectDrivenApplicationFields());
 
         // P.G. / B.Ed. Part 6: the student may only choose Optional and
@@ -3347,7 +3362,16 @@ class ApplicationController extends Controller
         // (updatePartOffice() does not call this — the office edits freely.)
         if ($partNo === 6) {
             $clean = $this->lockPart6ForPgBedStudent($app, $clean);
-            $clean = $this->cleanResearchSubject($clean);
+            // U.G.: subjects come from the registration; no repeats, own course only.
+            $ugProgram = DB::table('programs')->where('id', $app->program_id)->first();
+            $ugReg = !empty($app->direct_registration_id)
+                ? DB::table('direct_registrations')->where('id', $app->direct_registration_id)->first()
+                : null;
+            [$clean, $error] = Part6Rules::normalizeUg($app, $ugProgram, $clean, $ugReg, true);
+            if ($error) {
+                return response()->json(['message' => $error], 422);
+            }
+            $clean = $this->cleanResearchSubject($clean, $app);
         }
 
         DB::table('student_applications')->where('id', $id)->update([

@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Support\Part6Rules;
 use App\Support\RegistrationInputGuard;
 use App\Support\TextNormalizer;
 use Barryvdh\DomPDF\Facade\Pdf;
@@ -24,6 +25,28 @@ use Illuminate\Support\Str;
 
 class StudentRegistrationController extends Controller
 {
+    /** Eligibility / qualifying course — the only allowed values (frontend: src/lib/eligibility.ts). */
+    public const ELIGIBILITY_COURSES = ['Intermediate/Equivalent', 'Graduation', 'Post Graduation'];
+
+    /** Allowed per level: U.G. Intermediate; P.G. Graduation; B.Ed. Graduation or Post Graduation. */
+    public const ELIGIBILITY_BY_LEVEL = [
+        'UG' => ['Intermediate/Equivalent'],
+        'PG' => ['Graduation'],
+        'BED' => ['Graduation', 'Post Graduation'],
+    ];
+
+    /** List for a level (UG / PG / BED); unknown level → the full list. */
+    public static function eligibilityFor(?string $level): array
+    {
+        return self::ELIGIBILITY_BY_LEVEL[strtoupper((string) $level)] ?? self::ELIGIBILITY_COURSES;
+    }
+
+    /** Level key for a programs row: BED / PG / UG. */
+    public static function eligibilityLevelOf($program): string
+    {
+        return \App\Support\Part6Rules::formType($program) ?? 'UG';
+    }
+
     /** Registration fee by level, in rupees. */
     private const FEES = ['UG' => 300, 'PG' => 500, 'BED' => 600];
 
@@ -46,6 +69,7 @@ class StudentRegistrationController extends Controller
             'ddurn_no' => 'required|string|max:50',
             'abc_id' => 'required|string|max:50',
             'family_id' => 'nullable|string|max:50', // optional — not every applicant has one issued yet
+            'eligibility_class' => 'nullable|in:' . implode(',', self::eligibilityFor($req->reg_type)),
         ]);
 
         if ($v->fails()) {
@@ -73,11 +97,15 @@ class StudentRegistrationController extends Controller
         if ($msg = RegistrationInputGuard::familyIdError((string) $req->family_id)) {
             $guardErrors['family_id'] = [$msg];
         }
+        if ($e = $this->repeatedSubjectError([$req->subject_1, $req->subject_2, $req->subject_3])) {
+            $guardErrors += $e;
+        }
         if ($guardErrors) {
             return response()->json(['errors' => $guardErrors], 422);
         }
 
         $req->merge(TextNormalizer::upper($req->all(), [
+            'eligibility_class',
             'gender',
             'category',
             'admission_category',
@@ -183,10 +211,9 @@ class StudentRegistrationController extends Controller
                 'abc_id' => $req->abc_id,
                 'family_id' => $req->family_id ?: null,
 
-                'major_subject_1' => $req->major_subject_1 ?: null,
-                'major_subject_2' => $req->major_subject_2 ?: null,
-                'major_subject_3' => $req->major_subject_3 ?: null,
-                'minor_subject_1' => $req->minor_subject_1 ?: null,
+                'subject_1' => $req->subject_1 ?: null,
+                'subject_2' => $req->subject_2 ?: null,
+                'subject_3' => $req->subject_3 ?: null,
                 'subject_id' => $req->subject_id ?: null,
                 'course_group' => $req->course_group,
 
@@ -198,6 +225,8 @@ class StudentRegistrationController extends Controller
                 'father_name_hindi' => $req->father_name_hindi,
                 'mother_name' => $req->mother_name,
                 'mother_name_hindi' => $req->mother_name_hindi,
+                'spouse_name_english' => $req->spouse_name_english,
+                'spouse_name_hindi' => $req->spouse_name_hindi,
                 'dob' => $req->dob,
                 'gender' => $req->gender,
                 'domestic_state' => $req->domestic_state,
@@ -584,10 +613,13 @@ class StudentRegistrationController extends Controller
             'father_name_hindi',
             'mother_name',
             'mother_name_hindi',
+            'spouse_name_english',
+            'spouse_name_hindi',
             'dob',
             'gender',
             'id_proof_type',
             'id_proof_no',
+            'email',
             'aadhar_no',
             'abc_id',
             'ddurn_no',
@@ -605,10 +637,9 @@ class StudentRegistrationController extends Controller
             'eligibility_class',
             'eligibility_roll_no',
             'course_group',
-            'major_subject_1',
-            'major_subject_2',
-            'major_subject_3',
-            'minor_subject_1',
+            'subject_1',
+            'subject_2',
+            'subject_3',
             'subject_id',
             'ug_university',
             'ug_institute',
@@ -622,6 +653,7 @@ class StudentRegistrationController extends Controller
             'cut_off',
         ];
         $selectDrivenFields = [
+            'eligibility_class',
             'gender',
             'category',
             'admission_category',
@@ -655,6 +687,39 @@ class StudentRegistrationController extends Controller
         if ($req->has('family_id') && ($msg = RegistrationInputGuard::familyIdError((string) $req->input('family_id')))) {
             $guardErrors['family_id'] = [$msg];
         }
+        // Only a changed value is checked, so an old free-text value can still be re-saved untouched.
+        $regRow = DB::table('direct_registrations')->where('id', $id)->first(['reg_type', 'eligibility_class', 'email', 'session_year']);
+        $allowedElig = self::eligibilityFor($regRow->reg_type ?? null);
+        if ($req->filled('eligibility_class') && !in_array($req->input('eligibility_class'), $allowedElig, true)
+            && $req->input('eligibility_class') !== ($regRow->eligibility_class ?? null)) {
+            $guardErrors['eligibility_class'] = ['Eligibility Course must be one of: ' . implode(', ', $allowedElig) . '.'];
+        }
+        if ($req->has('email')) {
+            $email = trim((string) $req->input('email'));
+            if (strlen($email) > 100 || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $guardErrors['email'] = ['Enter a valid email address.'];
+            } elseif ($email !== (string) ($regRow->email ?? '')) {
+                $duplicateEmail = DB::table('direct_registrations')
+                    ->where('email', $email)
+                    ->where('session_year', $regRow->session_year)
+                    ->where('reg_type', $regRow->reg_type)
+                    ->where('id', '!=', $id)
+                    ->where('status', '!=', 'cancelled')
+                    ->whereNull('deleted_at')
+                    ->exists();
+                if ($duplicateEmail) {
+                    $guardErrors['email'] = ['This email is already used by an active registration for this session and registration type.'];
+                }
+            }
+        }
+        $cur = DB::table('direct_registrations')->where('id', $id)->first();
+        $slotIds = [];
+        foreach ([1, 2, 3] as $n) {
+            $slotIds[] = $req->has("subject_{$n}") ? $req->input("subject_{$n}") : Part6Rules::subjectSlot($cur, $n);
+        }
+        if ($e = $this->repeatedSubjectError($slotIds)) {
+            $guardErrors += $e;
+        }
         if ($guardErrors) {
             return response()->json(['errors' => $guardErrors], 422);
         }
@@ -663,9 +728,11 @@ class StudentRegistrationController extends Controller
         foreach ($fields as $f) {
             if (!$req->has($f))
                 continue;
-            $update[$f] = in_array($f, $selectDrivenFields, true)
-                ? ($req->input($f) ?: null)
-                : (TextNormalizer::upperValue($req->input($f)) ?: null);
+            $update[$f] = $f === 'email'
+                ? (trim((string) $req->input($f)) ?: null)
+                : (in_array($f, $selectDrivenFields, true)
+                    ? ($req->input($f) ?: null)
+                    : (TextNormalizer::upperValue($req->input($f)) ?: null));
         }
         $update['updated_at'] = now();
 
@@ -1170,7 +1237,10 @@ class StudentRegistrationController extends Controller
     /** Open Regular semester-1 admission schedules for a session (now within start..close). */
     private static function openScheduleQuery(string|array $session)
     {
-        $now = Carbon::now();
+        // start/close are stored as the office typed them (India wall-clock,
+        // no zone), while the app runs in UTC — compare in IST, or every
+        // window opens and closes 5h30m late.
+        $now = Carbon::now('Asia/Kolkata')->format('Y-m-d H:i:s');
         return DB::table('application_schedules')
             ->whereIn('session_year', (array) $session)
             ->where('exam_mode', 'Regular')
@@ -1314,6 +1384,11 @@ class StudentRegistrationController extends Controller
                 'mother_name' => $row->mother_name,
                 'gender' => $row->gender,
                 'category' => $row->social_category,
+                'entrance_session' => $row->session_year,
+                'entrance_roll_no' => $row->entrance_roll_no,
+                'state_rank' => $row->state_rank,
+                'category_rank' => $row->category_rank,
+                'cut_off' => $row->cut_off_mark,
             ],
         ]);
     }
@@ -1563,32 +1638,27 @@ class StudentRegistrationController extends Controller
         $program = $reg->program_id ? DB::table('programs')->find($reg->program_id) : null;
         $org = $reg->organization_id ? DB::table('organizations')->find($reg->organization_id) : null;
 
-        $subjIds = array_filter([
-            $reg->major_subject_1 ?? null,
-            $reg->major_subject_2 ?? null,
-            $reg->major_subject_3 ?? null,
-            $reg->minor_subject_1 ?? null,
-            $reg->subject_id ?? null,
-        ]);
+        $slot = fn(int $n) => Part6Rules::subjectSlot($reg, $n);
+        $subjIds = array_filter([$slot(1), $slot(2), $slot(3), $reg->subject_id ?? null]);
         $names = $subjIds ? DB::table('subjects')->whereIn('id', $subjIds)->pluck('name', 'id')->all() : [];
 
-        $minor = null;
-        if (!empty($reg->minor_subject_1)) {
-            $minor = $names[$reg->minor_subject_1] ?? null;
-            if (!$minor) {
-                $vp = DB::table('vocational_papers')->find($reg->minor_subject_1);
+        // Old registrations may hold a vocational paper id in slot 3.
+        $third = null;
+        if ($slot(3)) {
+            $third = $names[$slot(3)] ?? null;
+            if (!$third) {
+                $vp = DB::table('vocational_papers')->find($slot(3));
                 if ($vp) {
-                    $minor = trim($vp->paper_name . ($vp->paper_code ? " ({$vp->paper_code})" : ''));
+                    $third = trim($vp->paper_name . ($vp->paper_code ? " ({$vp->paper_code})" : ''));
                 }
             }
         }
 
         $subjects = array_filter([
-            'Major Subject 1' => $names[$reg->major_subject_1] ?? null,
-            'Major Subject 2' => $names[$reg->major_subject_2] ?? null,
-            'Major Subject 3' => $names[$reg->major_subject_3] ?? null,
-            'Minor Subject 1' => $minor,
-            'Subject' => $names[$reg->subject_id] ?? null,
+            'Subject -1' => $names[$slot(1)] ?? null,
+            'Subject -2' => $names[$slot(2)] ?? null,
+            'Subject -3' => $third,
+            'Subject' => $names[$reg->subject_id ?? 0] ?? null,
         ]);
 
         try {
@@ -1624,6 +1694,15 @@ class StudentRegistrationController extends Controller
     }
 
     // ── small utilities ────────────────────────────────────────────────────
+
+    /** U.G.: Subject -1/-2/-3 must be three different subjects. */
+    private function repeatedSubjectError(array $ids): ?array
+    {
+        $ids = array_values(array_filter(array_map('intval', $ids)));
+        return count($ids) !== count(array_unique($ids))
+            ? ['subject_2' => ['The same subject cannot be selected twice.']]
+            : null;
+    }
 
     private function regId(Request $req): ?int
     {

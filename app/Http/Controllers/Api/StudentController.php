@@ -72,57 +72,130 @@ class StudentController extends Controller
      */
     public function myProfile(Request $request): JsonResponse
     {
-        $student = Student::flat(DB::table('students')->where('user_id', $request->user()->id)->first());
-        if (!$student) {
-            return response()->json(['message' => 'Student profile not found.'], 404);
-        }
+        $userId = $request->user()->id;
+        // A first-time applicant has no students row until their fee
+        // receipt is verified — fall back to the registration and the
+        // latest application so the dashboard is never blank.
+        $student = Student::flat(DB::table('students')->where('user_id', $userId)->first());
 
+        $mobile = $student->mobile ?? $request->user()->mobile ?? null;
         $registration = DB::table('direct_registrations')
-            ->where(function ($q) use ($request, $student) {
-                $q->where('user_id', $request->user()->id);
-                if (!empty($student->mobile)) {
-                    $q->orWhereRaw('RIGHT(mobile, 10) = RIGHT(?, 10)', [$student->mobile]);
+            ->where(function ($q) use ($userId, $mobile) {
+                $q->where('user_id', $userId);
+                if (!empty($mobile)) {
+                    $q->orWhereRaw('RIGHT(mobile, 10) = RIGHT(?, 10)', [$mobile]);
                 }
             })
             ->whereNull('deleted_at')
             ->orderByDesc('id')
             ->first();
 
+        $app = DB::table('student_applications as sa')
+            ->leftJoin('direct_registrations as dr', 'dr.id', 'sa.direct_registration_id')
+            ->where(fn($q) => $q->where('sa.user_id', $userId)->orWhere('dr.user_id', $userId))
+            ->whereNull('sa.deleted_at')
+            ->orderByDesc('sa.created_at')
+            ->select('sa.*')
+            ->first();
+
+        if (!$student && !$registration && !$app) {
+            return response()->json(['message' => 'Student profile not found.'], 404);
+        }
+
+        $program = DB::table('programs')->where('id', $app->program_id ?? $registration->program_id ?? 0)->first();
+        $receipt = !empty($app->fee_receipt_id)
+            ? DB::table('fee_receipts')->where('id', $app->fee_receipt_id)->first()
+            : null;
+
+        // Photo: students table first, else the Part 7 upload.
+        $photoPath = $student->photo_path ?? null;
+        if (!$photoPath && $app) {
+            $photoPath = DB::table('student_application_documents')
+                ->where('application_id', $app->id)
+                ->where('document_type', 'photo')
+                ->orderByDesc('id')
+                ->value('path');
+        }
+        $photoUrl = null;
+        if ($photoPath) {
+            if (preg_match('#^https?://#', $photoPath)) {
+                $photoUrl = $photoPath;
+            } else {
+                try {
+                    $photoUrl = Storage::disk('supabase')->exists($photoPath)
+                        ? Storage::disk('supabase')->url($photoPath)
+                        : Storage::disk('public')->url($photoPath);
+                } catch (\Throwable $e) {
+                    $photoUrl = Storage::disk('public')->url($photoPath);
+                }
+            }
+        }
+
+        // Address: students table, else the application's Part 2 permanent address.
+        $join = fn(array $parts) => trim(implode(', ', array_filter(array_map(fn($v) => trim((string) $v), $parts))));
+        $address = $join([
+            $student->permanent_address ?? null, $student->permanent_city ?? null,
+            $student->permanent_district ?? null, $student->permanent_state ?? null,
+            $student->permanent_pin ?? null,
+        ]);
+        if ($address === '' && $app && !empty($app->part_2)) {
+            $p2 = is_string($app->part_2) ? (json_decode($app->part_2, true) ?: []) : (array) $app->part_2;
+            $address = $join([
+                $p2['perm_house_no'] ?? null, $p2['perm_mohalla'] ?? null, $p2['perm_post_office'] ?? null,
+                $p2['perm_district'] ?? null, $p2['perm_state'] ?? null, $p2['perm_pin_code'] ?? null,
+            ]);
+        }
+
         $fullName = trim(implode(' ', array_filter([
             $student->first_name ?? null,
             $student->middle_name ?? null,
             $student->last_name ?? null,
         ])));
+        $name = $registration->name ?? ($fullName !== '' ? $fullName : null);
 
         return response()->json(['data' => [
-            'id'                  => $student->id,
-            'full_name'           => $registration->name ?? $fullName,
-            'first_name'          => $student->first_name,
-            'middle_name'         => $student->middle_name,
-            'last_name'           => $student->last_name,
+            'id'                  => $student->id ?? null,
+            'name'                => $name,
+            'full_name'           => $name,
+            'first_name'          => $student->first_name ?? null,
+            'middle_name'         => $student->middle_name ?? null,
+            'last_name'           => $student->last_name ?? null,
             'father_name'         => $registration->father_name ?? null,
             'mother_name'         => $registration->mother_name ?? null,
-            'date_of_birth'       => $student->date_of_birth,
-            'gender'              => $student->gender,
-            'category'            => $student->category,
-            'religion'            => $student->religion,
-            'nationality'         => $student->nationality,
-            'aadhar_no'           => $student->aadhar_no,
-            'abc_id'              => $student->abc_id,
-            'ddurn'               => $student->ddurn,
-            'family_id'           => $student->family_id,
-            'mobile'              => $student->mobile,
-            'alternate_mobile'    => $student->alternate_mobile,
-            'email'               => $student->email,
-            'whatsapp_no'         => $student->whatsapp_no,
-            'permanent_address'   => $student->permanent_address,
-            'permanent_city'      => $student->permanent_city,
-            'permanent_district'  => $student->permanent_district,
-            'permanent_state'     => $student->permanent_state,
-            'permanent_pin'       => $student->permanent_pin,
-            'enrollment_no'       => $student->enrollment_no,
-            'student_uid'        => $student->student_uid,
-            'photo_path'          => $student->photo_path,
+            'date_of_birth'       => $student->date_of_birth ?? $registration->dob ?? null,
+            'gender'              => $student->gender ?? $registration->gender ?? null,
+            'category'            => $student->category ?? $registration->category ?? null,
+            'religion'            => $student->religion ?? $registration->religion ?? null,
+            'nationality'         => $student->nationality ?? $registration->nationality ?? null,
+            'aadhar_no'           => $student->aadhar_no ?? $registration->aadhar_no ?? null,
+            'abc_id'              => $student->abc_id ?? $registration->abc_id ?? null,
+            'ddurn'               => $student->ddurn ?? $registration->ddurn_no ?? null,
+            'family_id'           => $student->family_id ?? $registration->family_id ?? null,
+            'mobile'              => $student->mobile ?? $registration->mobile ?? null,
+            'alternate_mobile'    => $student->alternate_mobile ?? null,
+            'email'               => $student->email ?? $registration->email ?? null,
+            'whatsapp_no'         => $student->whatsapp_no ?? null,
+            'permanent_address'   => $student->permanent_address ?? null,
+            'permanent_city'      => $student->permanent_city ?? null,
+            'permanent_district'  => $student->permanent_district ?? null,
+            'permanent_state'     => $student->permanent_state ?? null,
+            'permanent_pin'       => $student->permanent_pin ?? null,
+            'enrollment_no'       => $student->enrollment_no ?? null,
+            'student_uid'         => $student->student_uid ?? null,
+            'photo_path'          => $student->photo_path ?? null,
+            'photo_url'           => $photoUrl,
+            'address'             => $address !== '' ? $address : null,
+            // Dashboard summary
+            'registration_no'     => $registration->registration_no ?? null,
+            'application_no'      => $app->application_no ?? null,
+            'application_status'  => $app->status ?? null,
+            'fee_receipt_no'      => $receipt->receipt_no ?? null,
+            'session'             => $app->academic_year ?? $registration->session_year ?? null,
+            'semester_no'         => $app->semester_no ?? null,
+            'program_name'        => $program->name ?? null,
+            'program_short_name'  => $program->short_name ?? null,
+            'samarth_code'        => $program->samarth_code ?? null,
+            'has_student_record'  => (bool) $student,
             'has_registration_snapshot' => (bool) $registration,
         ]]);
     }

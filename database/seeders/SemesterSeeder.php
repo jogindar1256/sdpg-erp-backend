@@ -28,6 +28,9 @@ class SemesterSeeder extends Seeder
             $rows[] = [
                 'semester_num'  => $n,
                 'semester_name' => $n % 2 === 1 ? 'ODD' : 'EVEN',
+                // Default only — not in the refresh list below, so an edit
+                // made on Semester Master survives a reseed.
+                'academic_cycle' => $n % 2 === 1 ? 'JUL_DEC' : 'JAN_JUN',
                 'status'        => 'Active',
                 'created_at'    => $now,
                 'updated_at'    => $now,

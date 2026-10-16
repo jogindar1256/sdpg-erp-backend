@@ -135,7 +135,13 @@ class MasterSettingsController extends Controller
             'program_id' => 'required|exists:programs,id',
             'session_year' => 'required|string',
             'semester_no' => 'required|string',
-            'qualifying_class' => 'required|string',
+            'qualifying_class' => ['required', function ($attr, $value, $fail) use ($req) {
+                $program = DB::table('programs')->where('id', $req->program_id)->first();
+                $allowed = StudentRegistrationController::eligibilityFor(StudentRegistrationController::eligibilityLevelOf($program));
+                if (!in_array($value, $allowed, true)) {
+                    $fail('Qualifying Course for this course must be: ' . implode(' / ', $allowed) . '.');
+                }
+            }],
             'condition_type' => 'required|in:Open Admission,Through Counselling,Cut Off Merit List,Out Of Merit List',
             'allotted_seat' => 'required|integer',
             'is_blocked' => 'nullable|boolean',
@@ -387,24 +393,26 @@ class MasterSettingsController extends Controller
             ->where('fs.academic_year', $req->session_year)
             ->where('fs.semester_no', $req->semester_no)
             ->where('fs.admission_type', $admissionType)
-            ->when($req->has('sdpgc_student'), fn($q) => $q->where('fs.sdpgc_student', $req->boolean('sdpgc_student')))
-            ->when($req->has('ddu_affiliated'), fn($q) => $q->where('fs.ddu_affiliated', $req->boolean('ddu_affiliated')))
+            // SDPGC / DDU are per-particular settings now, not separate structures.
+            ->where('fs.sdpgc_student', false)
+            ->where('fs.ddu_affiliated', false)
             ->get();
 
-        // Practical-subject fee: [if 1, if 2, if 3 practical subjects] — one
-        // row per configuration, independent of gender and category.
-        $pf = DB::table('fee_structure_practical_fees')
+        // fee_head_id -> { sdpgc_exempt, ddu_exempt, pay_in_college }
+        $headSettings = DB::table('fee_structure_head_settings')
             ->where('program_id', $req->program_id)
             ->where('academic_year', $req->session_year)
-            ->where('semester_no', $req->semester_no)
+            ->where('semester_no', (int) $req->semester_no)
             ->where('admission_type', $admissionType)
-            ->where('sdpgc_student', $req->boolean('sdpgc_student'))
-            ->where('ddu_affiliated', $req->boolean('ddu_affiliated'))
-            ->first();
-        $practical = [(float) ($pf->fee_1 ?? 0), (float) ($pf->fee_2 ?? 0), (float) ($pf->fee_3 ?? 0)];
+            ->get()
+            ->mapWithKeys(fn($r) => [(string) $r->fee_head_id => [
+                'sdpgc_exempt' => (bool) $r->sdpgc_exempt,
+                'ddu_exempt' => (bool) $r->ddu_exempt,
+                'pay_in_college' => (bool) $r->pay_in_college,
+            ]]);
 
         if ($rows->isEmpty()) {
-            return response()->json(['rows' => [], 'category_refs' => (object) [], 'practical' => $practical]);
+            return response()->json(['rows' => [], 'category_refs' => (object) [], 'head_settings' => (object) $headSettings->all()]);
         }
 
         $feeHeadNames = DB::table('fee_heads')->pluck('name', 'id');
@@ -448,53 +456,8 @@ class MasterSettingsController extends Controller
             'rows' => $out,
             'category_refs' => $categoryRefs,
             'category_updated' => $categoryUpdated, // category → last saved at
-            'practical' => $practical,
+            'head_settings' => (object) $headSettings->all(),
         ]);
-    }
-
-    /**
-     * POST /settings/admission/fee-structure/practical
-     * Saves the three "Fee If 01/02/03 Practical Sub." amounts for the
-     * course + session + semester + exam mode the grid is showing.
-     * Body: practical = [500, 900, 1300]
-     */
-    public function feeStructurePracticalStore(Request $req)
-    {
-        $v = Validator::make($req->all(), [
-            'program_id' => 'required|exists:programs,id',
-            'session_year' => 'required|string',
-            'semester_no' => 'required|string',
-            'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
-            'sdpgc_student' => 'nullable|boolean',
-            'ddu_affiliated' => 'nullable|boolean',
-            'practical' => 'required|array|size:3',
-            'practical.*' => 'nullable|numeric|min:0',
-        ]);
-        if ($v->fails())
-            return response()->json(['message' => $v->errors()->first(), 'errors' => $v->errors()], 422);
-
-        $values = array_values($req->practical);
-        $program = DB::table('programs')->where('id', $req->program_id)->first();
-
-        DB::table('fee_structure_practical_fees')->updateOrInsert(
-            [
-                'program_id' => $req->program_id,
-                'academic_year' => $req->session_year,
-                'semester_no' => (int) $req->semester_no,
-                'admission_type' => self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? 'regular',
-                'sdpgc_student' => $req->boolean('sdpgc_student'),
-                'ddu_affiliated' => $req->boolean('ddu_affiliated'),
-            ],
-            [
-                'organization_id' => $program->organization_id ?? null,
-                'fee_1' => (float) ($values[0] ?? 0),
-                'fee_2' => (float) ($values[1] ?? 0),
-                'fee_3' => (float) ($values[2] ?? 0),
-                'updated_at' => now(),
-            ]
-        );
-
-        return response()->json(['message' => 'Practical subject fees saved.']);
     }
 
     public function feeStructureStore(Request $req)
@@ -507,11 +470,12 @@ class MasterSettingsController extends Controller
             'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
             'term' => 'required|in:Admission,Semester Registration',
             'amounts' => 'required|array',
-            // PG/B.Ed.-only pass-out-source flags. Absent/false for every
-            // other program level — see 2026_08_15_090000_add_pass_out_
-            // flags_to_fee_structures.php
-            'sdpgc_student' => 'nullable|boolean',
-            'ddu_affiliated' => 'nullable|boolean',
+            // Per-particular rules (see FeeHeadSettings). SDPGC / DDU only
+            // mean anything for P.G. / B.Ed. and are stored false otherwise.
+            'settings' => 'nullable|array',
+            'settings.sdpgc_exempt' => 'nullable|boolean',
+            'settings.ddu_exempt' => 'nullable|boolean',
+            'settings.pay_in_college' => 'nullable|boolean',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -524,9 +488,29 @@ class MasterSettingsController extends Controller
             'academic_year' => $req->session_year,
             'semester_no' => $req->semester_no,
             'admission_type' => self::EXAM_MODE_TO_ADMISSION_TYPE[$req->exam_mode] ?? 'regular',
-            'sdpgc_student' => $req->boolean('sdpgc_student'),
-            'ddu_affiliated' => $req->boolean('ddu_affiliated'),
+            // Configuration-level flags retired — always the plain structure.
+            'sdpgc_student' => false,
+            'ddu_affiliated' => false,
         ];
+
+        if ($req->has('settings')) {
+            $passOut = (bool) \App\Support\Part6Rules::formType($program);
+            DB::table('fee_structure_head_settings')->updateOrInsert(
+                [
+                    'program_id' => $req->program_id,
+                    'academic_year' => $req->session_year,
+                    'semester_no' => (int) $req->semester_no,
+                    'admission_type' => $baseKey['admission_type'],
+                    'fee_head_id' => $req->fee_head_id,
+                ],
+                [
+                    'sdpgc_exempt' => $passOut && $req->boolean('settings.sdpgc_exempt'),
+                    'ddu_exempt' => $passOut && $req->boolean('settings.ddu_exempt'),
+                    'pay_in_college' => $req->boolean('settings.pay_in_college'),
+                    'updated_at' => now(),
+                ]
+            );
+        }
 
         // Normalize the incoming amounts (e.g. "Male_Gen" -> gender=male,
         // category=gen) and group by category — drop malformed keys rather
@@ -588,48 +572,6 @@ class MasterSettingsController extends Controller
         return response()->json(['message' => "Fee structure saved ({$saved} category row" . ($saved === 1 ? '' : 's') . ")."]);
     }
 
-    public function registrationFeeCopyYear(Request $req)
-    {
-        $v = Validator::make($req->all(), [
-            'from_year' => 'required|string',
-            'to_year' => 'required|string|different:from_year',
-            'program_id' => 'nullable|exists:programs,id',
-        ]);
-        if ($v->fails()) {
-            return response()->json(['errors' => $v->errors()], 422);
-        }
-
-        $rows = DB::table('registration_fees')
-            ->where('session_year', $req->from_year)
-            ->when($req->program_id, fn($q) => $q->where('program_id', $req->program_id))
-            ->get();
-
-        if ($rows->isEmpty()) {
-            return response()->json([
-                'message' => "No registration fees found for {$req->from_year}" .
-                    ($req->program_id ? ' for this class.' : '.'),
-            ], 404);
-        }
-
-        $count = 0;
-        foreach ($rows as $r) {
-            DB::table('registration_fees')->updateOrInsert(
-                [
-                    'program_id' => $r->program_id,
-                    'session_year' => $req->to_year,
-                    'semester_no' => $r->semester_no,
-                    'registration_mode' => $r->registration_mode,
-                ],
-                ['amounts' => $r->amounts, 'updated_at' => now()]
-            );
-            $count++;
-        }
-
-        return response()->json([
-            'message' => "Copied {$count} registration fee row(s): {$req->from_year} → {$req->to_year}.",
-        ]);
-    }
-
     // 6. Registration Fee ─────────────────────────────────────────────
     public function registrationFeeIndex(Request $req)
     {
@@ -641,8 +583,21 @@ class MasterSettingsController extends Controller
         );
     }
 
+    /** Registration modes (Private / Back Paper retired). */
+    private const REGISTRATION_MODES = ['Regular', 'Single Paper', 'Single Paper 3rd'];
+
     public function registrationFeeStore(Request $req)
     {
+        $v = Validator::make($req->all(), [
+            'program_id' => 'required|exists:programs,id',
+            'session_year' => 'required|string',
+            'semester_no' => 'required',
+            'registration_mode' => 'required|in:' . implode(',', self::REGISTRATION_MODES),
+            'amounts' => 'required',
+        ]);
+        if ($v->fails())
+            return response()->json(['message' => $v->errors()->first(), 'errors' => $v->errors()], 422);
+
         DB::table('registration_fees')->updateOrInsert(
             [
                 'program_id' => $req->program_id,
@@ -671,24 +626,51 @@ class MasterSettingsController extends Controller
                 ->when($req->session_year, fn($q) => $q->where('b.session_year', $req->session_year))
                 ->orderBy('b.created_at', 'desc')
                 ->get()
+                ->map(function ($r) {
+                    $r->allowed_sessions = !empty($r->allowed_sessions) ? (json_decode($r->allowed_sessions, true) ?: []) : [];
+                    return $r;
+                })
         );
+    }
+
+    /** Shared rules: semester is a semester number; allowed_sessions = "YYYY-YYYY" list. */
+    private function backPaperScheduleRules(bool $partial = false): array
+    {
+        $r = $partial ? 'sometimes|required|' : 'required|';
+        return [
+            'program_id' => $r . 'exists:programs,id',
+            'semester' => $r . 'integer|exists:semester_masters,semester_num',
+            'session_year' => $r . 'string',
+            'start_from' => $r . 'date',
+            'end_on' => $r . 'date|after:start_from',
+            'late_fee_applicable' => $r . 'boolean',
+            'late_fee' => 'nullable|numeric|min:0',
+            'allowed_sessions' => 'nullable|array',
+            'allowed_sessions.*' => ['string', 'regex:/^\d{4}-\d{4}$/'],
+        ];
+    }
+
+    private function backPaperScheduleRow(Request $req): array
+    {
+        $row = $req->only(['program_id', 'session_year', 'start_from', 'end_on', 'late_fee_applicable', 'late_fee']);
+        if ($req->has('semester')) {
+            $row['semester'] = (string) (int) $req->semester;
+        }
+        if ($req->has('allowed_sessions')) {
+            $list = array_values(array_unique(array_filter((array) $req->allowed_sessions)));
+            sort($list);
+            $row['allowed_sessions'] = $list ? json_encode($list) : null;
+        }
+        return $row;
     }
 
     public function backPaperScheduleStore(Request $req)
     {
-        $v = Validator::make($req->all(), [
-            'program_id' => 'required|exists:programs,id',
-            'semester' => 'required|string',
-            'session_year' => 'required|string',
-            'start_from' => 'required|date',
-            'end_on' => 'required|date|after:start_from',
-            'late_fee_applicable' => 'required|boolean',
-            'late_fee' => 'nullable|numeric|min:0',
-        ]);
+        $v = Validator::make($req->all(), $this->backPaperScheduleRules());
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('back_paper_schedules')->insertGetId(array_merge($req->all(), [
+        $id = DB::table('back_paper_schedules')->insertGetId(array_merge($this->backPaperScheduleRow($req), [
             'created_at' => now(),
             'updated_at' => now(),
         ]));
@@ -697,8 +679,12 @@ class MasterSettingsController extends Controller
 
     public function backPaperScheduleUpdate(Request $req, $id)
     {
+        $v = Validator::make($req->all(), $this->backPaperScheduleRules(true));
+        if ($v->fails())
+            return response()->json(['errors' => $v->errors()], 422);
+
         DB::table('back_paper_schedules')->where('id', $id)->update(array_merge(
-            $req->only(['program_id', 'semester', 'session_year', 'start_from', 'end_on', 'late_fee_applicable', 'late_fee']),
+            $this->backPaperScheduleRow($req),
             ['updated_at' => now()]
         ));
         return response()->json(['message' => 'Updated.']);
@@ -902,10 +888,50 @@ class MasterSettingsController extends Controller
                 'id'            => $s->id,
                 'semester_num'  => $s->semester_num,
                 'semester_name' => $s->semester_name,
+                'academic_cycle' => $s->academic_cycle,
+                'research_paper' => (bool) ($s->research_paper ?? false),
                 'label'         => $s->label,   // "Semester 1 (ODD)"
                 'status'        => $s->status,
             ])->values()
         );
+    }
+
+    // PATCH /settings/course/semesters/{id}/academic-cycle — the one editable
+    // field on Semester Master (number and parity stay system-defined).
+    public function semesterAcademicCycleUpdate(Request $req, $id)
+    {
+        $v = Validator::make($req->all(), [
+            'academic_cycle' => 'required|in:' . implode(',', array_keys(SemesterMaster::ACADEMIC_CYCLES)),
+        ]);
+        if ($v->fails())
+            return response()->json(['message' => $v->errors()->first(), 'errors' => $v->errors()], 422);
+
+        $sem = SemesterMaster::find($id);
+        if (!$sem)
+            return response()->json(['message' => 'Semester not found.'], 404);
+
+        $sem->update(['academic_cycle' => $req->academic_cycle]);
+        return response()->json([
+            'message' => "Semester {$sem->semester_num}: " . SemesterMaster::ACADEMIC_CYCLES[$req->academic_cycle] . '.',
+        ]);
+    }
+
+    // PATCH /settings/course/semesters/{id}/research-paper — Yes/No: does
+    // U.G. Part 6 show the Research Paper row in this semester.
+    public function semesterResearchPaperUpdate(Request $req, $id)
+    {
+        $v = Validator::make($req->all(), ['research_paper' => 'required|boolean']);
+        if ($v->fails())
+            return response()->json(['message' => $v->errors()->first(), 'errors' => $v->errors()], 422);
+
+        $sem = SemesterMaster::find($id);
+        if (!$sem)
+            return response()->json(['message' => 'Semester not found.'], 404);
+
+        $sem->update(['research_paper' => $req->boolean('research_paper')]);
+        return response()->json([
+            'message' => "Semester {$sem->semester_num}: Research Paper " . ($sem->research_paper ? 'Yes' : 'No') . '.',
+        ]);
     }
 
     // 10. Subject Master ──────────────────────────────────────────────
@@ -1119,6 +1145,7 @@ class MasterSettingsController extends Controller
             'papers.*.max_marks' => 'nullable|integer|min:1',
             'papers.*.min_marks' => 'nullable|integer|min:0',
             'papers.*.credits' => 'nullable|integer|min:0|max:99',
+            'papers.*.optional_group' => 'nullable|integer|in:1,2',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -1142,15 +1169,28 @@ class MasterSettingsController extends Controller
             }
         }
 
+        // Optional papers (P.G. / B.Ed.) must say which Part 6 list they belong to.
+        if ($allowedSelection) {
+            foreach ($req->papers as $i => $p) {
+                if ((($p['selection_type'] ?? null) ?: 'Compulsory') === 'Optional' && empty($p['optional_group'])) {
+                    return response()->json(['errors' => [
+                        "papers.{$i}.optional_group" => ['Select Optional Group (1 or 2) for every Optional paper.'],
+                    ]], 422);
+                }
+            }
+        }
+
         $rows = [];
         foreach ($req->papers as $p) {
+            $sel = $allowedSelection ? (($p['selection_type'] ?? null) ?: 'Compulsory') : null;
             $rows[] = [
                 'program_id' => $req->program_id,
                 'subject_id' => $req->subject_id,
                 'session_year' => $req->session_year,
                 'semester_no' => $req->semester_no,
                 'paper_type' => ($p['paper_type'] ?? null) ?: 'Theory',
-                'selection_type' => $allowedSelection ? (($p['selection_type'] ?? null) ?: 'Compulsory') : null,
+                'selection_type' => $sel,
+                'optional_group' => $sel === 'Optional' ? (int) $p['optional_group'] : null,
                 'paper_code' => $p['paper_code'] ?? null,
                 'paper_name' => $p['paper_name'],
                 'credits' => isset($p['credits']) && $p['credits'] !== '' ? (int) $p['credits'] : null,
@@ -1179,6 +1219,7 @@ class MasterSettingsController extends Controller
             'max_marks' => 'nullable|integer|min:1',
             'min_marks' => 'nullable|integer|min:0',
             'credits' => 'nullable|integer|min:0|max:99',
+            'optional_group' => 'nullable|integer|in:1,2',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
@@ -1210,6 +1251,19 @@ class MasterSettingsController extends Controller
                 ]], 422);
             }
             $update['selection_type'] = $allowedSelection ? $sel : null;
+        }
+        // Optional group follows the (new or saved) selection type.
+        $finalSel = array_key_exists('selection_type', $update) ? $update['selection_type'] : $paper->selection_type;
+        if ($finalSel === 'Optional') {
+            $group = $req->has('optional_group') ? $req->optional_group : ($paper->optional_group ?? null);
+            if (empty($group)) {
+                return response()->json(['errors' => [
+                    'optional_group' => ['Select Optional Group (1 or 2) for this Optional paper.'],
+                ]], 422);
+            }
+            $update['optional_group'] = (int) $group;
+        } else {
+            $update['optional_group'] = null;
         }
         if ($req->has('group_label')) {
             $update['group_label'] = $req->group_label ?: null;
@@ -1518,7 +1572,7 @@ class MasterSettingsController extends Controller
     // 15. Vocational & Co-Curriculum Paper Master ─────────────────────
     /**
      * Public list of vocational / co-curricular papers, used to populate the
-     * Minor Subject dropdown on the (public) UG registration form.
+     * AEC / SEC rows of U.G. application Part 6.
      * GET /student/register/vocational-papers?program_id=&semester_no=&session_year=
      */
     public function publicVocationalPapers(Request $req)
@@ -1824,7 +1878,7 @@ class MasterSettingsController extends Controller
             'mother_name' => 'required|string|max:255',
             'gender' => 'required|in:Male,Female,Transgender',
             'social_category' => 'required|in:General,OBC,SC,ST,EWS',
-            'admission_category' => 'required|in:General,OBC,SC,ST,EWS',
+            'admission_category' => 'required|in:General,OBC,SC,ST,EWS,PH/PwD',
             'admission_type' => 'required|in:Regular,Private',
             'state_rank' => 'required|integer',
             'category_rank' => 'nullable|integer',
