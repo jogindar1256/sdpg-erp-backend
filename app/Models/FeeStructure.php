@@ -122,6 +122,9 @@ class FeeStructure extends Model
             ->where('admission_type', $admissionType)
             ->where('category', $category)
             ->where('is_active', true)
+            // SDPGC / DDU are per-particular settings now; only the plain structure counts.
+            ->where('sdpgc_student', false)
+            ->where('ddu_affiliated', false)
             ->pluck('amount_json')
             ->map(fn ($j) => $j ? (is_string($j) ? json_decode($j, true) : $j) : [])
             ->all();
@@ -153,6 +156,9 @@ class FeeStructure extends Model
             ->where('admission_type', $admissionType)
             ->where('category', $category)
             ->where('is_active', true)
+            // SDPGC / DDU are per-particular settings now; only the plain structure counts.
+            ->where('sdpgc_student', false)
+            ->where('ddu_affiliated', false)
             ->get(['amount_json']);
 
         $breakdown = [];
@@ -192,6 +198,8 @@ class FeeStructure extends Model
         DB::table('fee_structures')
             ->where('academic_year', $academicYear)
             ->where('is_active', true)
+            ->where('sdpgc_student', false)
+            ->where('ddu_affiliated', false)
             ->when($programId, fn ($q) => $q->where('program_id', $programId))
             ->get(['program_id', 'semester_no', 'admission_type', 'category', 'amount_json'])
             ->each(function ($row) use (&$map) {

@@ -6,6 +6,7 @@ use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Support\Part6Rules;
+use App\Support\Payments;
 use App\Support\RegistrationInputGuard;
 use App\Support\TextNormalizer;
 use Barryvdh\DomPDF\Facade\Pdf;
@@ -70,6 +71,7 @@ class StudentRegistrationController extends Controller
             'abc_id' => 'required|string|max:50',
             'family_id' => 'nullable|string|max:50', // optional — not every applicant has one issued yet
             'eligibility_class' => 'nullable|in:' . implode(',', self::eligibilityFor($req->reg_type)),
+            'passing_year' => 'nullable|integer|between:2002,' . now()->year,
         ]);
 
         if ($v->fails()) {
@@ -136,6 +138,9 @@ class StudentRegistrationController extends Controller
         }
         if (!self::openScheduleQuery(array_unique([self::currentSessionYear(), (string) $req->session]))->where('program_id', $req->program_id)->exists()) {
             return response()->json(['errors' => ['program_id' => ['Admission is not open for this course right now.']]], 422);
+        }
+        if ($e = $this->registrationSubjectError($req, (int) $req->program_id, $regType)) {
+            return response()->json(['errors' => $e], 422);
         }
 
         // Was missing 'email' here — direct_registrations_email_unique_active
@@ -264,7 +269,6 @@ class StudentRegistrationController extends Controller
                 'cut_off' => $req->cut_off,
 
                 'fee_amount' => $this->resolveRegistrationFee($req->program_id ? (int) $req->program_id : null, $req->session, $req->gender, $req->category, $regType),
-                'payment_status' => 'pending',
                 'status' => 'pending',
 
                 'temp_password' => Hash::make($password),
@@ -579,7 +583,7 @@ class StudentRegistrationController extends Controller
         if (!$reg)
             return response()->json(['message' => 'Registration not found.'], 404);
 
-        if ($reg->payment_status === 'paid') {
+        if (\App\Support\Payments::registrationFeePaid((int) $reg->id)) {
             return response()->json(['message' => 'Registration is locked after payment. Please contact the college office to make changes.'], 409);
         }
 
@@ -868,7 +872,7 @@ class StudentRegistrationController extends Controller
         if (!$reg->phone_verified || !$reg->email_verified) {
             return response()->json(['message' => 'Verify mobile and email before paying.'], 422);
         }
-        if ($reg->payment_status === 'paid') {
+        if (\App\Support\Payments::registrationFeePaid((int) $reg->id)) {
             return response()->json(['message' => 'Registration fee already paid.'], 409);
         }
 
@@ -907,10 +911,7 @@ class StudentRegistrationController extends Controller
 
         $order = $resp->json();
 
-        DB::table('direct_registrations')->where('id', $reg->id)->update([
-            'razorpay_order_id' => $order['id'],
-            'updated_at' => now(),
-        ]);
+        Payments::openOrder(Payments::forRegistration($reg), $rupees, $order['id']);
 
         return response()->json([
             'order_id' => $order['id'],
@@ -950,17 +951,28 @@ class StudentRegistrationController extends Controller
             $this->markFailed($reg);
             return response()->json(['message' => 'Payment could not be verified. Registration saved as incomplete.'], 422);
         }
+        // Must be the order created for this registration (initiatePayment()).
+        $payment = Payments::orderFor(
+            (string) $req->razorpay_order_id, 'direct_registration_id', (int) $reg->id,
+            null, Payments::forRegistration($reg), (float) ($reg->fee_amount ?? 0)
+        );
+        if (!$payment) {
+            return response()->json(['message' => 'This payment does not belong to this registration.'], 422);
+        }
+        if (\App\Support\Payments::registrationFeePaid((int) $reg->id)) {
+            return response()->json(['message' => 'Registration fee already paid.'], 409);
+        }
 
         $receiptNo = 'RCPT' . date('y') . str_pad($reg->id, 6, '0', STR_PAD_LEFT);
 
+        // payment_status / paid_at / receipt_no are computed from `payments`
+        // (see App\Support\Payments); only the workflow status is a real column.
         DB::table('direct_registrations')->where('id', $reg->id)->update([
-            'payment_status' => 'paid',
             'status' => 'registered',
-            'razorpay_payment_id' => $req->razorpay_payment_id,
-            'paid_at' => now(),
-            'receipt_no' => $receiptNo,
             'updated_at' => now(),
         ]);
+        Payments::markOnlinePaid((int) $payment->id, (string) $req->razorpay_payment_id, (string) $req->razorpay_signature,
+            (float) ($reg->fee_amount ?: $payment->amount), null, $receiptNo);
 
         $reg = $this->findReg($reg->id); // refresh
         $this->provisionAccount($reg, paid: true);
@@ -1001,7 +1013,7 @@ class StudentRegistrationController extends Controller
         if (!$reg)
             return response()->json(['message' => 'Registration not found.'], 404);
 
-        if ($reg->payment_status === 'paid') {
+        if (\App\Support\Payments::registrationFeePaid((int) $reg->id)) {
             return response()->json(['message' => 'Payment already completed.'], 409);
         }
 
@@ -1016,8 +1028,8 @@ class StudentRegistrationController extends Controller
 
     private function markFailed(object $reg): void
     {
+        Payments::failOpenOrders('direct_registration_id', (int) $reg->id);
         DB::table('direct_registrations')->where('id', $reg->id)->update([
-            'payment_status' => 'failed',
             'status' => 'incomplete',
             'updated_at' => now(),
         ]);
@@ -1034,7 +1046,7 @@ class StudentRegistrationController extends Controller
         $reg = $this->findReg($id);
         if (!$reg)
             return response()->json(['message' => 'Registration not found.'], 404);
-        if ($reg->payment_status !== 'paid') {
+        if (!\App\Support\Payments::registrationFeePaid((int) $reg->id)) {
             return response()->json(['message' => 'Receipt is available only after successful payment.'], 422);
         }
 
@@ -1069,7 +1081,12 @@ class StudentRegistrationController extends Controller
             ->where(function ($q) use ($user) {
                 $q->where('user_id', $user->id)->orWhere('mobile', $user->mobile);
             })
-            ->where('payment_status', '!=', 'paid')
+            ->whereNotExists(function ($q) {
+                $q->select(DB::raw(1))->from('payments')
+                    ->whereColumn('payments.direct_registration_id', 'direct_registrations.id')
+                    ->where('payments.purpose', 'registration')
+                    ->where('payments.status', 'paid');
+            })
             ->orderByDesc('id')
             ->first();
 
@@ -1083,7 +1100,7 @@ class StudentRegistrationController extends Controller
                 'reg_type' => $reg->reg_type,
                 'session' => $reg->session_year,
                 'fee' => (float) $reg->fee_amount,
-                'payment_status' => $reg->payment_status,
+                'payment_status' => \App\Support\Payments::registrationPaymentStatus((int) $reg->id),
                 'status' => $reg->status,
             ]
         ]);
@@ -1183,7 +1200,7 @@ class StudentRegistrationController extends Controller
             'father_name' => $reg->father_name,
             // Hint only — helps the student recall which mobile is their User ID.
             'mobile_hint' => strlen($mobile) === 10 ? substr($mobile, 0, 2) . 'XXXXXX' . substr($mobile, -2) : null,
-            'paid' => $reg->payment_status === 'paid',
+            'paid' => \App\Support\Payments::registrationFeePaid((int) $reg->id),
         ]);
     }
 
@@ -1306,10 +1323,16 @@ class StudentRegistrationController extends Controller
 
         // 2) Enrich from the most recent PAID self-registration of the same person
         //    (this is where father/mother/Hindi names/ID proof/caste live).
-        $prior = DB::table('direct_registrations')
-            ->where('student_id', $student->id)
-            ->where('payment_status', 'paid')
-            ->orderByDesc('id')
+        $prior = DB::table('direct_registrations as dr')
+            ->where('dr.student_id', $student->id)
+            ->whereExists(function ($q) {
+                $q->select(DB::raw(1))->from('payments')
+                    ->whereColumn('payments.direct_registration_id', 'dr.id')
+                    ->where('payments.purpose', 'registration')
+                    ->where('payments.status', 'paid');
+            })
+            ->orderByDesc('dr.id')
+            ->select('dr.*')
             ->first();
 
         $genderMap = ['male' => 'Male', 'female' => 'Female', 'transgender' => 'Transgender', 'other' => 'Transgender', 'trans' => 'Transgender'];
@@ -1414,15 +1437,22 @@ class StudentRegistrationController extends Controller
                 'dr.phone_verified',
                 'dr.email_verified',
                 'dr.fee_amount',
-                'dr.payment_status',
+                DB::raw("(EXISTS (SELECT 1 FROM payments WHERE payments.direct_registration_id = dr.id AND payments.purpose = 'registration' AND payments.status = 'paid')) as payment_status_paid"),
                 'dr.status',
-                'dr.paid_at',
-                'dr.razorpay_payment_id',
                 'dr.created_at',
                 'p.short_name as program',
                 'p.full_name as program_name'
             )
-            ->when($req->payment_status, fn($q) => $q->where('dr.payment_status', $req->payment_status))
+            ->when($req->payment_status === 'paid', fn($q) => $q->whereExists(function ($q2) {
+                $q2->select(DB::raw(1))->from('payments')
+                    ->whereColumn('payments.direct_registration_id', 'dr.id')
+                    ->where('payments.purpose', 'registration')->where('payments.status', 'paid');
+            }))
+            ->when($req->payment_status && $req->payment_status !== 'paid', fn($q) => $q->whereNotExists(function ($q2) {
+                $q2->select(DB::raw(1))->from('payments')
+                    ->whereColumn('payments.direct_registration_id', 'dr.id')
+                    ->where('payments.purpose', 'registration')->where('payments.status', 'paid');
+            }))
             ->when($req->reg_type, fn($q) => $q->where('dr.reg_type', strtoupper($req->reg_type)))
             ->when($req->session, fn($q) => $q->where('dr.session_year', $req->session))
             ->when($req->search, fn($q) => $q->where(function ($q2) use ($req) {
@@ -1556,6 +1586,15 @@ class StudentRegistrationController extends Controller
             $program = $reg->program_id ? DB::table('programs')->find($reg->program_id) : null;
             $org = $reg->organization_id ? DB::table('organizations')->find($reg->organization_id) : null;
 
+            // payment_status/paid_at/razorpay_payment_id/receipt_no are gone
+            // from direct_registrations (Phase 4) — the Blade view still
+            // reads them off $reg, so patch them on from `payments`.
+            $regPaidPayment = \App\Support\Payments::paidRegistrationPayment((int) $reg->id);
+            $reg->payment_status = $regPaidPayment ? 'paid' : 'pending';
+            $reg->paid_at = $regPaidPayment->paid_at ?? null;
+            $reg->razorpay_payment_id = $regPaidPayment->gateway_payment_id ?? null;
+            $reg->receipt_no = $regPaidPayment->receipt_no ?? null;
+
             $pdf = Pdf::loadView('pdf.registration-receipt', [
                 'reg' => $reg,
                 'program' => $program,
@@ -1631,12 +1670,20 @@ class StudentRegistrationController extends Controller
         $reg = $this->findReg($id);
         if (!$reg)
             return response()->json(['message' => 'Registration not found.'], 404);
-        if ($reg->payment_status !== 'paid') {
+        if (!\App\Support\Payments::registrationFeePaid((int) $reg->id)) {
             return response()->json(['message' => 'Registration slip is available only after payment.'], 422);
         }
 
         $program = $reg->program_id ? DB::table('programs')->find($reg->program_id) : null;
         $org = $reg->organization_id ? DB::table('organizations')->find($reg->organization_id) : null;
+
+        // paid_at/razorpay_payment_id/razorpay_order_id are gone from
+        // direct_registrations (Phase 4) — the Blade view still reads them
+        // off $reg, so patch them on from `payments`.
+        $slipPaidPayment = \App\Support\Payments::paidRegistrationPayment((int) $reg->id);
+        $reg->paid_at = $slipPaidPayment->paid_at ?? null;
+        $reg->razorpay_payment_id = $slipPaidPayment->gateway_payment_id ?? null;
+        $reg->razorpay_order_id = $slipPaidPayment->gateway_order_id ?? null;
 
         $slot = fn(int $n) => Part6Rules::subjectSlot($reg, $n);
         $subjIds = array_filter([$slot(1), $slot(2), $slot(3), $reg->subject_id ?? null]);
@@ -1677,9 +1724,10 @@ class StudentRegistrationController extends Controller
     private function receiptData(object $reg): array
     {
         $program = $reg->program_id ? DB::table('programs')->find($reg->program_id) : null;
+        $paidPayment = \App\Support\Payments::paidRegistrationPayment((int) $reg->id);
         return [
             'reg_no' => $reg->registration_no,
-            'receipt_no' => $reg->receipt_no,
+            'receipt_no' => $paidPayment->receipt_no ?? null,
             'name' => $reg->name,
             'father_name' => $reg->father_name,
             'mobile' => $reg->mobile,
@@ -1687,8 +1735,8 @@ class StudentRegistrationController extends Controller
             'course' => $program->full_name ?? $program->short_name ?? $reg->reg_type,
             'session' => $reg->session_year,
             'fee' => (float) $reg->fee_amount,
-            'payment_id' => $reg->razorpay_payment_id,
-            'paid_at' => $reg->paid_at,
+            'payment_id' => $paidPayment->gateway_payment_id ?? null,
+            'paid_at' => $paidPayment->paid_at ?? null,
             'status' => $reg->status,
         ];
     }
@@ -1696,6 +1744,28 @@ class StudentRegistrationController extends Controller
     // ── small utilities ────────────────────────────────────────────────────
 
     /** U.G.: Subject -1/-2/-3 must be three different subjects. */
+    /**
+     * Every chosen subject must belong to the selected course. P.G. must pick
+     * its subject here — Part 6 takes it from the registration and the
+     * student cannot change it later.
+     */
+    private function registrationSubjectError(Request $req, int $programId, string $regType): ?array
+    {
+        $own = DB::table('subjects')->where('program_id', $programId)->where('is_active', true)
+            ->pluck('id')->map(fn($v) => (int) $v)->all();
+        $errors = [];
+        foreach (['subject_1', 'subject_2', 'subject_3', 'subject_id'] as $f) {
+            $v = $req->input($f);
+            if ($v !== null && $v !== '' && !in_array((int) $v, $own, true)) {
+                $errors[$f] = ['Selected subject does not belong to this course.'];
+            }
+        }
+        if ($regType === 'PG' && $own && !$req->input('subject_id')) {
+            $errors['subject_id'] = ['Please select the subject.'];
+        }
+        return $errors ?: null;
+    }
+
     private function repeatedSubjectError(array $ids): ?array
     {
         $ids = array_values(array_filter(array_map('intval', $ids)));

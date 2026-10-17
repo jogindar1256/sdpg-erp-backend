@@ -379,7 +379,7 @@ class SecurityController extends Controller
                 'u.email',
                 't.created_at as login_at',
                 't.last_used_at',
-                DB::raw('TIMESTAMPDIFF(MINUTE, t.created_at, IFNULL(t.last_used_at, NOW())) as duration_minutes')
+                DB::raw('FLOOR(EXTRACT(EPOCH FROM (COALESCE(t.last_used_at, NOW()) - t.created_at)) / 60)::int as duration_minutes')
             )
             ->orderByDesc('t.created_at')
             ->get();

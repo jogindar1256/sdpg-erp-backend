@@ -61,11 +61,13 @@ class FeesController extends Controller
             ->leftJoinSub($latestReg, 'lr', 'lr.user_id', '=', DB::raw('COALESCE(s.user_id, adm.user_id)'))
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->leftJoin('student_applications as sa', 'sa.id', '=', 'adm.application_id')
+            ->leftJoin('fee_refunds as rf', 'rf.fee_receipt_id', '=', 'fr.id')
             ->select([
                 'sa.application_no', 'dr.category',
                 'fr.id', 'fr.receipt_no', 'fr.receipt_type as fee_type', 'fr.net_amount as amount',
                 'fr.transaction_id as utr_no', 'fr.bank_ref_no', 'fr.receipt_date as payment_date',
                 'fr.is_verified', 'fr.status', 'fr.created_at',
+                'fr.cancel_reason', 'rf.status as refund_status', 'rf.refund_amount', 'rf.refund_ref', 'rf.refunded_at',
                 's.personal_info->first_name as first_name', 's.personal_info->middle_name as middle_name', 's.personal_info->last_name as last_name',
                 'dr.name as reg_name', 'dr.father_name',
                 'p.short_name as class_name', 'fr.semester_no',
@@ -164,6 +166,69 @@ class FeesController extends Controller
         ]);
     }
 
+    // ─── Refund register: GET /fees/refunds ─────────────────────────────────────
+    // Every refund owed: rejected / cancelled receipts and cancelled admissions.
+    public function refundsIndex(Request $request): JsonResponse
+    {
+        $latestReg = $this->latestRegistrationSub();
+        $q = DB::table('fee_refunds as rf')
+            ->leftJoin('admissions as adm', 'adm.id', '=', 'rf.admission_id')
+            ->leftJoin('student_applications as sa', 'sa.id', '=', DB::raw('COALESCE(rf.student_application_id, adm.application_id)'))
+            ->leftJoin('programs as p', 'p.id', '=', DB::raw('COALESCE(sa.program_id, adm.program_id)'))
+            ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'rf.fee_receipt_id')
+            ->leftJoin('direct_registrations as drc', 'drc.id', '=', 'sa.direct_registration_id')
+            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', '=', 'sa.user_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
+            ->leftJoin('users as ru', 'ru.id', '=', 'rf.requested_by')
+            ->leftJoin('users as fu', 'fu.id', '=', 'rf.refunded_by')
+            ->select([
+                'rf.*',
+                'sa.application_no', 'adm.admission_no', 'fr.receipt_no',
+                DB::raw('COALESCE(drc.name, dr.name) as student_name'),
+                DB::raw('COALESCE(drc.father_name, dr.father_name) as father_name'),
+                DB::raw('COALESCE(drc.mobile, dr.mobile) as mobile'),
+                'p.short_name as class_name', 'sa.semester_no',
+                'ru.name as requested_by_name', 'fu.name as refunded_by_name',
+            ])
+            ->when($request->status, fn($q, $v) => $q->where('rf.status', strtolower($v)))
+            ->when($request->session, fn($q, $v) => $q->where('rf.academic_year', $v))
+            ->when($request->source, fn($q, $v) => $q->where('rf.source', $v))
+            ->when($request->search, function ($q, $v) {
+                $q->where(function ($w) use ($v) {
+                    $w->where('sa.application_no', 'ilike', "%$v%")
+                        ->orWhere('fr.receipt_no', 'ilike', "%$v%")
+                        ->orWhere('adm.admission_no', 'ilike', "%$v%")
+                        ->orWhere('drc.name', 'ilike', "%$v%")
+                        ->orWhere('dr.name', 'ilike', "%$v%")
+                        ->orWhere('drc.mobile', 'ilike', "%$v%");
+                });
+            })
+            ->orderByRaw("CASE WHEN rf.status = 'pending' THEN 0 ELSE 1 END")
+            ->orderByDesc('rf.id');
+
+        $summary = DB::table('fee_refunds')
+            ->when($request->session, fn($q, $v) => $q->where('academic_year', $v))
+            ->selectRaw("COUNT(*) FILTER (WHERE status = 'pending') as pending,
+                         COALESCE(SUM(refund_amount) FILTER (WHERE status = 'pending'), 0) as pending_amount,
+                         COUNT(*) FILTER (WHERE status = 'refunded') as refunded,
+                         COALESCE(SUM(refund_amount) FILTER (WHERE status = 'refunded'), 0) as refunded_amount")
+            ->first();
+
+        return response()->json(['summary' => $summary] + $q->paginate((int) $request->input('per_page', 50))->toArray());
+    }
+
+    // ─── POST /fees/refunds/{id}/refunded ─────────────────────────────────────────
+    public function refundMark(Request $request, int $id): JsonResponse
+    {
+        $request->validate([
+            'refund_ref' => 'required|string|max:100',
+            'refund_mode' => 'nullable|string|max:30',
+            'refund_remarks' => 'nullable|string|max:500',
+        ]);
+        [$code, $msg] = \App\Support\FeeRefunds::markRefunded($id, $request->refund_ref, $request->refund_mode, $request->refund_remarks, Auth::id());
+        return response()->json(['message' => $msg], $code);
+    }
+
     // ─── Verify: POST /fees/verify/{id}/{act} ────────────────────────────────────
     public function verifyAction(Request $request, int $id, string $act): JsonResponse
     {
@@ -172,6 +237,22 @@ class FeesController extends Controller
 
         if (!in_array($act, ['verify', 'reject'])) {
             return response()->json(['message' => 'Invalid action.'], 422);
+        }
+
+        if ($receipt->status === 'cancelled') {
+            return response()->json(['message' => 'This receipt is cancelled / rejected.'], 422);
+        }
+        if ($act === 'verify' && $receipt->is_verified) {
+            return response()->json(['message' => 'Receipt already verified.'], 409);
+        }
+
+        if ($act === 'reject') {
+            // Shared with FeeReceiptController::cancel — keeps the receipt,
+            // marks the refund pending and puts the application back to unpaid.
+            [$code, $msg] = \App\Support\ReceiptCancellation::cancel($id, $request->remarks, Auth::id());
+            if ($code >= 400) {
+                return response()->json(['message' => $msg], $code);
+            }
         }
 
         if ($act === 'verify') {
@@ -184,6 +265,8 @@ class FeesController extends Controller
 
             // Verifying the receipt is what turns a first-time applicant
             // into a student (students row + active admission).
+            \App\Support\Payments::markVerified($id, Auth::id());
+
             $appId = $receipt->admission_id
                 ? DB::table('admissions')->where('id', $receipt->admission_id)->value('application_id')
                 : null;
@@ -192,13 +275,6 @@ class FeesController extends Controller
             }
             $status = 'Verified';
         } else {
-            DB::table('fee_receipts')->where('id', $id)->update([
-                'status'        => 'cancelled',
-                'cancel_reason' => $request->remarks,
-                'verified_by'   => Auth::id(),
-                'verified_at'   => now(),
-                'updated_at'    => now(),
-            ]);
             $status = 'Rejected';
         }
 
@@ -220,7 +296,7 @@ class FeesController extends Controller
     // ─── Student Ledger: GET /fees/ledger ────────────────────────────────────────
     public function ledgerIndex(Request $request): JsonResponse
     {
-        $query = $request->query;
+        $query = $request->input('query');
         if (!$query) return response()->json(['message' => 'Query required.'], 422);
 
         $latestReg = $this->latestRegistrationSub();
@@ -233,7 +309,7 @@ class FeesController extends Controller
             ->select([
                 'adm.id as admission_id', 'adm.admission_no', 'adm.program_id',
                 'adm.academic_year as session', 'adm.semester_no', 'adm.admission_type',
-                'adm.fee_status', 'adm.student_id',
+                'adm.student_id', 'adm.application_id',
                 's.personal_info->first_name as first_name', 's.personal_info->middle_name as middle_name', 's.personal_info->last_name as last_name',
                 'dr.name as reg_name', 'dr.father_name', 'dr.mother_name',
                 's.mobile', 's.personal_info->gender as gender', 's.personal_info->category as category',
@@ -277,7 +353,7 @@ class FeesController extends Controller
             'admission_no'       => $admission->admission_no,
             'session'            => $admission->session,
             'semester_no'        => $admission->semester_no,
-            'fee_status'         => $admission->fee_status,
+            'fee_status'         => \App\Support\Payments::admissionFeeStatus((int) $admission->admission_id),
             'student_id'         => $admission->student_id,
             'name'               => $this->composeName($admission->reg_name, $admission->first_name, $admission->middle_name, $admission->last_name),
             'father_name'        => $admission->father_name,
@@ -341,11 +417,21 @@ class FeesController extends Controller
 
         $totalStudents = (clone $admQuery)->count();
 
+        // adm.fee_status is gone (Phase 4) — paid via the application's own
+        // fee or any paid money tagged to the admission directly (misc),
+        // same as App\Support\Payments::admissionFeeStatus(). 'Partial' was
+        // never actually written anywhere (syncAdmission only ever set
+        // Paid/Pending) — kept here as a permanent 0 for the response shape.
+        $admissionPaidExists = "EXISTS (
+                SELECT 1 FROM payments p
+                WHERE (p.student_application_id = adm.application_id AND p.purpose IN ('admission', 'semester_upgrade', 'back_paper') AND p.status = 'paid')
+                   OR (p.admission_id = adm.id AND p.status = 'paid')
+            )";
         $statusBreakdown = (clone $admQuery)
             ->selectRaw("
-                SUM(CASE WHEN adm.fee_status='Paid' THEN 1 ELSE 0 END) as fee_paid,
-                SUM(CASE WHEN adm.fee_status='Partial' THEN 1 ELSE 0 END) as fee_partial,
-                SUM(CASE WHEN adm.fee_status='Pending' OR adm.fee_status IS NULL THEN 1 ELSE 0 END) as fee_pending
+                SUM(CASE WHEN {$admissionPaidExists} THEN 1 ELSE 0 END) as fee_paid,
+                0 as fee_partial,
+                SUM(CASE WHEN NOT {$admissionPaidExists} THEN 1 ELSE 0 END) as fee_pending
             ")->first();
 
         $summary = [

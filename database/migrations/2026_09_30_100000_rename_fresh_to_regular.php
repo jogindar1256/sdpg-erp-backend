@@ -44,33 +44,8 @@ return new class extends Migration
               AND direct_registration_id IS NOT NULL
         ");
 
-        // ── semester_registrations.registration_type ────────────────────
-        // Dead column (see doc comment) — constraint swap only, backfill
-        // included defensively in case any row somehow has a non-null
-        // value here despite no code path setting one.
-        DB::statement(<<<'SQL'
-            DO $$
-            DECLARE r record;
-            BEGIN
-                FOR r IN
-                    SELECT con.conname
-                    FROM pg_constraint con
-                    JOIN pg_class rel ON rel.oid = con.conrelid
-                    JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = ANY(con.conkey)
-                    WHERE rel.relname = 'semester_registrations'
-                      AND con.contype = 'c'
-                      AND att.attname = 'registration_type'
-                LOOP
-                    EXECUTE format('ALTER TABLE semester_registrations DROP CONSTRAINT %I', r.conname);
-                END LOOP;
-            END $$;
-        SQL);
-
-        DB::table('semester_registrations')
-            ->whereIn('registration_type', ['fresh', 'ex_student'])
-            ->update(['registration_type' => 'regular']);
-
-        DB::statement("ALTER TABLE semester_registrations ADD CONSTRAINT semester_registrations_registration_type_check CHECK (registration_type IN ('regular','back_paper'))");
+        // semester_registrations was dropped (2026_10_17_120000) and its
+        // create migration removed — its constraint swap no longer applies.
     }
 
     public function down(): void
@@ -90,11 +65,5 @@ return new class extends Migration
             ->where('application_type', 'regular')
             ->update(['application_type' => 'fresh']);
         DB::statement("ALTER TABLE student_applications ADD CONSTRAINT student_applications_application_type_check CHECK (application_type IN ('fresh','back_paper','semester_upgrade'))");
-
-        DB::statement('ALTER TABLE semester_registrations DROP CONSTRAINT IF EXISTS semester_registrations_registration_type_check');
-        DB::table('semester_registrations')
-            ->where('registration_type', 'regular')
-            ->update(['registration_type' => 'fresh']);
-        DB::statement("ALTER TABLE semester_registrations ADD CONSTRAINT semester_registrations_registration_type_check CHECK (registration_type IN ('fresh','ex_student','back_paper'))");
     }
 };

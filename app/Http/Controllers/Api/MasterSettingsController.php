@@ -153,7 +153,7 @@ class MasterSettingsController extends Controller
             'category_requirements.obc'          => 'required|array',
             'category_requirements.sc'           => 'required|array',
             'category_requirements.st'           => 'required|array',
-            'category_requirements.ews'          => 'required|array',
+            'category_requirements.ews'          => 'nullable|array',
             'category_requirements.*.mark_type'  => 'required|in:Mark,CGPA',
             'category_requirements.*.male'       => 'nullable|numeric|min:0',
             'category_requirements.*.female'     => 'nullable|numeric|min:0',
@@ -835,7 +835,6 @@ class MasterSettingsController extends Controller
         'admissions' => 'admissions',
         'student_applications' => 'applications',
         'direct_registrations' => 'registrations',
-        'semester_registrations' => 'semester registrations',
         'counselling_reports' => 'counselling records',
         'examinations' => 'examinations',
     ];
@@ -1371,10 +1370,15 @@ class MasterSettingsController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        DB::table('subject_seats')->updateOrInsert(
-            ['program_id' => $req->program_id, 'subject_id' => $req->subject_id],
-            array_merge($req->except(['program_id', 'subject_id']), ['updated_at' => now()])
-        );
+        // Only the validated columns — the edit form posts the whole grid row
+        // (id, subject_name, timestamps…), which are not subject_seats columns.
+        $data = collect($v->validated())->except(['program_id', 'subject_id'])->all();
+        $key = ['program_id' => $req->program_id, 'subject_id' => $req->subject_id];
+        if (DB::table('subject_seats')->where($key)->exists()) {
+            DB::table('subject_seats')->where($key)->update($data + ['updated_at' => now()]);
+        } else {
+            DB::table('subject_seats')->insert($key + $data + ['created_at' => now(), 'updated_at' => now()]);
+        }
         return response()->json(['message' => 'Seat configuration saved.']);
     }
 

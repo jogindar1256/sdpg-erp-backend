@@ -299,21 +299,6 @@ class Student extends Model
         return $this->hasMany(FeeReceipt::class);
     }
 
-    public function documents(): HasMany
-    {
-        return $this->hasMany(StudentDocument::class);
-    }
-
-    public function semesterRegistrations(): HasMany
-    {
-        return $this->hasMany(SemesterRegistration::class);
-    }
-
-    public function examApplications(): HasMany
-    {
-        return $this->hasMany(ExamApplication::class);
-    }
-
     public function amendments(): HasMany
     {
         return $this->hasMany(Amendment::class);

@@ -258,7 +258,7 @@ class FinancialController extends Controller
         $receiptNo = $this->nextReceiptNo('RCP');
         $amount    = (float) $request->input('amount');
 
-        DB::table('fee_receipts')->insert([
+        $receiptId = DB::table('fee_receipts')->insertGetId([
             'organization_id' => $admission->organization_id,
             'student_id'      => $admission->student_id,
             'admission_id'    => $admission->id,
@@ -280,9 +280,21 @@ class FinancialController extends Controller
             'updated_at'      => now(),
         ]);
 
-        DB::table('admissions')
-            ->where('id', $admission->id)
-            ->update(['fee_status' => 'Paid', 'updated_at' => now()]);
+
+        // Bank / NEFT money entered by the office → payments (mode neft).
+        $sa = $admission->application_id ? DB::table('student_applications')->where('id', $admission->application_id)->first() : null;
+        $link = $sa ? \App\Support\Payments::forApplication($sa) : [
+            'organization_id' => $admission->organization_id, 'user_id' => $admission->user_id ?? null,
+            'admission_id' => $admission->id, 'student_id' => $admission->student_id,
+            'academic_year' => $admission->academic_year, 'semester_no' => $admission->semester_no,
+        ];
+        \App\Support\Payments::recordOffline(
+            ['purpose' => 'misc', 'admission_id' => $admission->id] + $link,
+            $amount,
+            ['mode' => 'neft', 'instrument_no' => $request->input('utr_no'), 'bank_ref_no' => $request->input('bank_ref_no'),
+             'remarks' => $request->input('payment_for')],
+            (int) $receiptId, $receiptNo, auth()->id(), $request->input('payment_date')
+        );
 
         return response()->json([
             'message'    => 'Payment processed successfully.',

@@ -25,142 +25,11 @@ class RegistrationController extends Controller
     // 1. REGISTRATION (UG / PG / B.Ed)
     //    All three use the same endpoints, filtered by program level
     // ══════════════════════════════════════════════════════════════
-    public function index(Request $req)
-    {
-        // latest direct_registrations snapshot per user (see
-        // ResolvesStudentIdentity), with first/middle/last as a fallback.
-        $latestReg = $this->latestRegistrationSub();
-
-        $q = DB::table('semester_registrations as sr')
-            ->join('admissions as a', 'a.id', 'sr.admission_id')
-            ->join('students as s', 's.id', 'a.student_id')
-            ->join('programs as p', 'p.id', 'a.program_id')
-            ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
-            ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
-            ->select(
-                'sr.*',
-                's.personal_info->first_name as first_name',
-                's.personal_info->middle_name as middle_name',
-                's.personal_info->last_name as last_name',
-                'dr.name',
-                'dr.father_name',
-                's.mobile',
-                's.personal_info->gender as gender',
-                's.university_roll_no as roll_no',
-                'a.account_no',
-                's.enrollment_no',
-                'p.short_name as course',
-                'p.full_name',
-                'p.level'
-            )
-            ->where('sr.session_year', $req->session_year ?? $this->sessionYear())
-            ->when($req->level, fn($q) => $q->where('p.level', $req->level))
-            ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
-            ->when($req->semester_no, fn($q) => $q->where('sr.semester_no', $req->semester_no))
-            ->when($req->status, fn($q) => $q->where('sr.status', $req->status))
-            ->when($req->search, fn($q) => $q->where(function ($q2) use ($req) {
-                $q2->where('dr.name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.personal_info->first_name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.personal_info->last_name', 'ilike', "%{$req->search}%")
-                    ->orWhere('s.university_roll_no', 'ilike', "%{$req->search}%");
-            }))
-            ->orderBy('s.university_roll_no');
-
-        $result = $q->paginate(50);
-        $result->getCollection()->transform(fn($row) => $this->withComposedName($row));
-
-        return response()->json($result);
-    }
-
-    /**
-     * Approve / reject a single registration
-     */
-    public function updateStatus(Request $req, $id)
-    {
-        $v = Validator::make($req->all(), [
-            'status' => 'required|in:Approved,Pending,Rejected',
-        ]);
-        if ($v->fails())
-            return response()->json(['errors' => $v->errors()], 422);
-
-        DB::table('semester_registrations')->where('id', $id)
-            ->update(['status' => $req->status, 'approved_at' => now(), 'updated_at' => now()]);
-
-        return response()->json(['message' => 'Status updated.']);
-    }
-
-    /**
-     * Bulk approve all filtered records
-     */
-    public function bulkApprove(Request $req)
-    {
-        $ids = DB::table('semester_registrations as sr')
-            ->join('admissions as a', 'a.id', 'sr.admission_id')
-            ->join('programs as p', 'p.id', 'a.program_id')
-            ->where('sr.session_year', $req->session_year ?? $this->sessionYear())
-            ->when($req->level, fn($q) => $q->where('p.level', $req->level))
-            ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
-            ->when($req->semester_no, fn($q) => $q->where('sr.semester_no', $req->semester_no))
-            ->where('sr.status', 'Pending')
-            ->pluck('sr.id');
-
-        DB::table('semester_registrations')->whereIn('id', $ids)
-            ->update(['status' => 'Approved', 'approved_at' => now(), 'updated_at' => now()]);
-
-        return response()->json(['message' => count($ids) . ' registrations approved.']);
-    }
-
-    /**
-     * Create a new registration record
-     */
-    public function store(Request $req)
-    {
-        $v = Validator::make($req->all(), [
-            'admission_id' => 'required|exists:admissions,id',
-            'session_year' => 'required|string',
-            'semester_no' => 'required|string',
-            'exam_type' => 'required|in:Regular,Back Paper,Upgrade',
-            'fee_paid' => 'nullable|boolean',
-        ]);
-        if ($v->fails())
-            return response()->json(['errors' => $v->errors()], 422);
-
-        // Prevent duplicate
-        $exists = DB::table('semester_registrations')
-            ->where('admission_id', $req->admission_id)
-            ->where('session_year', $req->session_year)
-            ->where('semester_no', $req->semester_no)
-            ->exists();
-
-        if ($exists) {
-            return response()->json(['message' => 'Registration already exists for this student/semester.'], 409);
-        }
-
-        $id = DB::table('semester_registrations')->insertGetId([
-            'admission_id' => $req->admission_id,
-            'session_year' => $req->session_year,
-            'semester_no' => $req->semester_no,
-            'exam_type' => $req->exam_type,
-            'fee_paid' => $req->fee_paid ?? false,
-            'status' => 'Pending',
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        return response()->json(['id' => $id, 'message' => 'Registration created.'], 201);
-    }
 
     public function registrationStatus(Request $req)
     {
         $sessionYear = $req->session_year ?? $this->sessionYear();
 
-        // Latest application per registration. Was keyed off student_id via
-        // a students join (student_id === s.id), but under the "defer
-        // students row creation to approval" architecture a fresh
-        // application has NO students row to join through until it's
-        // approved — that made this join silently miss every unapproved
-        // application. direct_registration_id is set on every application
-        // at creation time (store()), so join on that instead.
         $latestApp = DB::table('student_applications')
             ->select('direct_registration_id', DB::raw('MAX(id) as sa_id'))
             ->whereNotNull('direct_registration_id')
@@ -179,6 +48,15 @@ class RegistrationController extends Controller
             ->where('status', 'active')
             ->groupBy('admission_id');
 
+        $regPaid = DB::table('payments')
+            ->select('direct_registration_id', DB::raw('MAX(id) as id'))
+            ->where('purpose', 'registration')->where('status', 'paid')
+            ->groupBy('direct_registration_id');
+        $appPaid = DB::table('payments')
+            ->select('student_application_id', DB::raw('MAX(id) as id'))
+            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
+            ->groupBy('student_application_id');
+
         $records = DB::table('direct_registrations as dr')
             ->leftJoin('programs as p', 'p.id', 'dr.program_id')
             ->leftJoin('students as s', 's.user_id', '=', 'dr.user_id')
@@ -188,6 +66,10 @@ class RegistrationController extends Controller
             ->leftJoin('admissions as adm', 'adm.id', '=', 'lad.adm_id')
             ->leftJoinSub($latestRcpt, 'lr', 'lr.admission_id', '=', 'adm.id')
             ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'lr.fr_id')
+            ->leftJoinSub($regPaid, 'rp', 'rp.direct_registration_id', '=', 'dr.id')
+            ->leftJoin('payments as regpay', 'regpay.id', '=', 'rp.id')
+            ->leftJoinSub($appPaid, 'ap', 'ap.student_application_id', '=', 'sa.id')
+            ->leftJoin('payments as apppay', 'apppay.id', '=', 'ap.id')
             ->where('dr.session_year', $sessionYear)
             ->whereNull('dr.deleted_at')
             ->when($req->program_id, fn($q) => $q->where('dr.program_id', $req->program_id))
@@ -209,25 +91,18 @@ class RegistrationController extends Controller
                 'dr.mobile',
                 'dr.email',
                 'dr.status as reg_status',
-                'dr.payment_status as reg_payment_status',
-                'dr.paid_at as reg_paid_at',
+                DB::raw("CASE WHEN regpay.id IS NOT NULL THEN 'paid' ELSE NULL END as reg_payment_status"),
+                'regpay.paid_at as reg_paid_at',
                 'dr.reg_date',
                 'dr.created_at',
                 'p.short_name as course',
                 'p.level',
                 'sa.id as application_id',
-                // student_applications has no code/unique_code column of its
-                // own — the application's code is always its registration's
-                // unique_code, looked up dynamically (same pattern used
-                // elsewhere, e.g. ApplicationController::store()'s response).
-                // Selecting a nonexistent sa.code here was throwing a SQL
-                // error on every request, which is why this page showed 0
-                // records for everyone, not just unapproved applications.
                 'dr.unique_code as application_code',
                 'sa.application_no',
                 'sa.status as app_status',
-                'adm.payment_status as edu_payment_status',
-                'adm.paid_at as edu_paid_at',
+                DB::raw("CASE WHEN apppay.id IS NOT NULL THEN 'paid' ELSE NULL END as edu_payment_status"),
+                'apppay.paid_at as edu_paid_at',
                 'fr.receipt_no',
                 'fr.receipt_date'
             )
@@ -236,15 +111,7 @@ class RegistrationController extends Controller
 
         // Derive pipeline flags for each row.
         $rows = $records->map(function ($r) {
-            // direct_registrations.status never actually holds the literal value
-        // 'incomplete' in practice for a row that's otherwise fine — the
-        // real values in use are 'pending'/'draft'/'registered'/'incomplete'
-        // (set only on a failed-payment retry path)/'cancelled'. 'registered'
-        // is the one status set on successful payment/registration
-        // completion (see RegistrationController::verify()/markFailed() and
-        // StudentRegistrationController), so that's the actual "complete"
-        // signal — checking merely "!= incomplete" counted pending/draft
-        // rows as complete too.
+
         $regComplete = $r->reg_status === 'registered';
             $regFeePaid = $r->reg_payment_status === 'paid';
             $appSubmit = $r->app_status && $r->app_status !== 'draft';
@@ -258,11 +125,6 @@ class RegistrationController extends Controller
 
             $r->reg_complete = $regComplete;
             $r->reg_fee_paid = $regFeePaid;
-            // Whether a student_applications row exists at all yet — distinct
-            // from app_final_submit, which is about a row that exists but is
-            // still a draft. "Fill Form" needs to tell these apart: a draft
-            // already has its application_id/application_code, a
-            // not-yet-initiated one has neither.
             $r->app_initiated = !empty($r->application_id);
             $r->app_final_submit = (bool) $appSubmit;
             $r->app_approval = $approval;
@@ -332,36 +194,55 @@ class RegistrationController extends Controller
     // 3. STUDENT STATUS
     //    Per-student registration status lookup
     // ══════════════════════════════════════════════════════════════
+
     public function studentStatus(Request $req)
     {
         $v = Validator::make($req->all(), [
-            'roll_no' => 'required_without:search|string',
+            'roll_no' => 'nullable|string',
+            'search' => 'nullable|string',
+            'session_year' => 'nullable|string|max:12',
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
+        $sessionYear = $req->session_year ?: $this->sessionYear();
         $latestReg = $this->latestRegistrationSub();
+        $sessionApp = DB::table('student_applications')
+            ->select('student_id', DB::raw('MAX(id) as app_id'))
+            ->where('academic_year', $sessionYear)
+            ->whereIn('application_type', ApplicationController::ADMISSION_APP_TYPES)
+            ->whereNull('deleted_at')
+            ->groupBy('student_id');
+
+        $statusAppPaid = DB::table('payments')
+            ->select('student_application_id', DB::raw('MAX(id) as id'))
+            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
+            ->groupBy('student_application_id');
 
         $q = DB::table('admissions as a')
             ->join('students as s', 's.id', 'a.student_id')
             ->join('programs as p', 'p.id', 'a.program_id')
             ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
-            ->leftJoin('semester_registrations as sr', function ($j) use ($req) {
-                $j->on('sr.admission_id', 'a.id')
-                    ->where('sr.session_year', $req->session_year ?? '2025-2026');
-            })
+            ->leftJoinSub($sessionApp, 'la', 'la.student_id', 's.id')
+            ->leftJoin('student_applications as sa', 'sa.id', 'la.app_id')
+            ->leftJoinSub($statusAppPaid, 'sap', 'sap.student_application_id', '=', 'sa.id')
+            ->leftJoin('payments as sapay', 'sapay.id', '=', 'sap.id')
+            ->whereNull('a.deleted_at')
             ->select(
                 'a.id as admission_id',
+                'a.program_id',
                 's.university_roll_no as roll_no',
                 'a.account_no',
                 's.enrollment_no',
                 'a.semester_no',
+                'a.status as admission_status',
                 's.personal_info->first_name as first_name',
                 's.personal_info->middle_name as middle_name',
                 's.personal_info->last_name as last_name',
                 'dr.name',
                 'dr.father_name',
+                'dr.mother_name',
                 'dr.dob',
                 's.mobile',
                 's.personal_info->gender as gender',
@@ -369,12 +250,13 @@ class RegistrationController extends Controller
                 'p.short_name as course',
                 'p.full_name',
                 'p.level',
-                'sr.id as reg_id',
-                'sr.semester_no as reg_semester',
-                'sr.status as reg_status',
-                'sr.exam_type',
-                'sr.fee_paid',
-                'sr.approved_at'
+                'sa.id as reg_id',
+                'sa.application_no',
+                'sa.semester_no as reg_semester',
+                'sa.status as reg_status',
+                'sa.application_type as exam_type',
+                DB::raw('(sapay.id is not null) as fee_paid'),
+                'sa.approved_at'
             )
             ->when($req->roll_no, fn($q) => $q->where('s.university_roll_no', $req->roll_no))
             ->when($req->search, fn($q) => $q->where(function ($q2) use ($req) {
@@ -384,7 +266,8 @@ class RegistrationController extends Controller
                     ->orWhere('s.university_roll_no', 'ilike', "%{$req->search}%")
                     ->orWhere('s.mobile', 'ilike', "%{$req->search}%");
             }))
-            ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id));
+            ->when($req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
+            ->orderByDesc('a.id');
 
         $result = $q->paginate(20);
         $result->getCollection()->transform(function ($row) {
@@ -396,88 +279,153 @@ class RegistrationController extends Controller
         return response()->json($result);
     }
 
-    // Summary stats for the registration pages
-    public function stats(Request $req)
-    {
-        $sessionYear = $req->session_year ?? $this->sessionYear();
-
-        return response()->json([
-            'total_registered' => DB::table('semester_registrations')
-                ->where('session_year', $sessionYear)->where('status', 'Approved')->count(),
-            'pending' => DB::table('semester_registrations')
-                ->where('session_year', $sessionYear)->where('status', 'Pending')->count(),
-            'total_students' => DB::table('admissions')->where('status', 'Verified')->count(),
-        ]);
-    }
-
     // ══════════════════════════════════════════════════════════════
     // 6. STUDENT PORTAL — Registration Status
     //    GET /student/registration-status
-    //    Returns the authenticated student's own registration record.
+    //    The signed-in student's semester status, built from their latest
+    //    regular / semester-upgrade application (session filter optional).
+    //    Works before a students row exists (first-time applicants).
     // ══════════════════════════════════════════════════════════════
     public function studentPortalStatus(Request $req)
     {
         $user = $req->user();
         $student = Student::flat(DB::table('students')->where('user_id', $user->id)->first());
-        $sessionYear = $req->session_year ?? $this->sessionYear();
         $pending = $this->pendingRegistrationFor($user);
 
-        // the pending draft so the portal can prompt for payment/verification
-        if (!$student) {
-            return response()->json([
-                'data' => null,
-                'pending_registration' => $pending,
-                'message' => $pending
-                    ? 'Complete your registration payment and verification.'
-                    : 'Student profile not found.',
-            ], $pending ? 200 : 404);
-        }
+        $portalAppPaid = DB::table('payments')
+            ->select('student_application_id', DB::raw('MAX(id) as id'))
+            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
+            ->groupBy('student_application_id');
 
-        $record = DB::table('admissions as a')
-            ->join('students as s', 's.id', 'a.student_id')
-            ->join('programs as p', 'p.id', 'a.program_id')
-            ->leftJoin('semester_registrations as sr', function ($j) use ($sessionYear) {
-                $j->on('sr.admission_id', 'a.id')
-                    ->where('sr.session_year', $sessionYear);
+        $app = DB::table('student_applications as sa')
+            ->join('programs as p', 'p.id', 'sa.program_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', 'sa.direct_registration_id')
+            ->leftJoinSub($portalAppPaid, 'pap', 'pap.student_application_id', '=', 'sa.id')
+            ->leftJoin('payments as pappay', 'pappay.id', '=', 'pap.id')
+            ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'pappay.fee_receipt_id')
+            ->leftJoin('admissions as a', 'a.application_id', 'sa.id')
+            ->whereNull('sa.deleted_at')
+            ->whereIn('sa.application_type', ApplicationController::ADMISSION_APP_TYPES)
+            ->where(function ($q) use ($user, $student) {
+                $q->where('sa.user_id', $user->id);
+                if ($student) {
+                    $q->orWhere('sa.student_id', $student->id);
+                }
             })
-            ->where('a.student_id', $student->id)
+            ->when($req->session_year, fn($q) => $q->where('sa.academic_year', $req->session_year))
+            ->orderByDesc('sa.id')
             ->select(
-                's.university_roll_no as roll_no',
-                's.enrollment_no',
-                'a.semester_no as semester',
+                'sa.id as application_id',
+                'sa.application_no',
+                'sa.application_type',
+                'sa.academic_year as session',
+                'sa.semester_no as semester',
+                'sa.status as app_status',
+                DB::raw('(pappay.id is not null) as fee_paid'),
+                'pappay.paid_at as paid_at',
+                'sa.approved_at',
+                'sa.updated_at',
+                'sa.part_6',
+                'sa.program_id',
                 'p.short_name as program',
                 'p.full_name as program_name',
-                DB::raw("'{$sessionYear}' as session"),
-                'sr.id as registration_id',
-                'sr.status as registration_status',
-                'sr.fee_paid as fee_receipt_status',
-                'sr.exam_type',
-                'sr.approved_at',
+                'dr.registration_no',
+                'fr.receipt_no',
+                'fr.is_verified as receipt_verified',
+                'fr.verified_at as receipt_verified_at',
+                'fr.status as receipt_status',
+                'a.status as admission_status'
             )
-            ->latest('a.id')
             ->first();
 
-        if (!$record) {
+        if (!$app) {
             return response()->json([
                 'data' => null,
                 'pending_registration' => $pending,
+                'message' => $pending ? 'Complete your registration payment and verification.' : 'No application found.',
             ]);
         }
 
-        // Load subjects for this registration
-        $subjects = [];
-        if ($record->registration_id) {
-            $subjects = DB::table('registration_subjects as rs')
-                ->join('subjects as sub', 'sub.id', 'rs.subject_id')
-                ->where('rs.registration_id', $record->registration_id)
-                ->select('sub.name', 'sub.paper_code', 'rs.type')
-                ->get();
-        }
+        // Each step: approved | rejected | cancelled | on_hold | pending
+        $formStatus = match ($app->app_status) {
+            'draft' => 'pending',
+            'rejected' => 'rejected',
+            'cancelled' => 'cancelled',
+            default => 'approved', // submitted onwards = form complete
+        };
+        $feeStatus = !$app->fee_paid ? 'pending'
+            : ($app->receipt_status === 'cancelled' ? 'cancelled' : ($app->receipt_verified ? 'verified' : 'pending'));
+        $verification = match ($app->app_status) {
+            'approved' => 'approved',
+            'rejected' => 'rejected',
+            'cancelled' => 'cancelled',
+            'on_hold' => 'on_hold',
+            default => 'pending',
+        };
+        $admitted = $app->admission_status === 'active' ? 'approved'
+            : (in_array($app->admission_status, ['cancelled', 'rejected'], true) ? $app->admission_status : 'pending');
+
+        $data = [
+            'application_id' => $app->application_id,
+            'application_no' => $app->application_no,
+            'application_type' => $app->application_type,
+            'session' => $app->session,
+            'semester' => $app->semester,
+            'program' => $app->program,
+            'program_name' => $app->program_name,
+            'registration_no' => $app->registration_no,
+            'roll_no' => $student->university_roll_no ?? null,
+            'enrollment_no' => $student->enrollment_no ?? null,
+            'receipt_no' => $app->receipt_no,
+            'registration_status' => $formStatus,
+            'fee_receipt_status' => $feeStatus,
+            'fee_receipt_status_date' => $app->receipt_verified_at ?? $app->paid_at,
+            'verification_status' => $verification,
+            'verification_status_date' => $app->approved_at,
+            'principal_approval_status' => $admitted,
+            'subjects' => $this->subjectsFromPart6($app),
+        ];
 
         return response()->json([
-            'data' => array_merge((array) $record, ['subjects' => $subjects]),
+            'data' => $data,
             'pending_registration' => $pending,
         ]);
+    }
+
+    /** Subjects / papers the application's Part 6 recorded, for display. */
+    private function subjectsFromPart6(object $app): array
+    {
+        $p6 = $app->part_6 ? (json_decode($app->part_6, true) ?: []) : [];
+        $out = [];
+
+        $paperIds = array_merge(
+            (array) ($p6['compulsory_paper_ids'] ?? []),
+            (array) ($p6['optional_paper_ids'] ?? []),
+            (array) ($p6['teaching_paper_ids'] ?? [])
+        );
+        if ($paperIds) {
+            $papers = DB::table('subject_papers')->whereIn('id', array_map('intval', $paperIds))
+                ->get(['id', 'paper_name', 'paper_code', 'selection_type'])->keyBy('id');
+            foreach ($paperIds as $id) {
+                if ($pp = $papers->get((int) $id)) {
+                    $out[] = ['name' => $pp->paper_name, 'paper_code' => $pp->paper_code, 'type' => $pp->selection_type];
+                }
+            }
+            return $out;
+        }
+
+        $subjectIds = array_values(array_filter([
+            $p6['subject_1'] ?? null, $p6['subject_2'] ?? null, $p6['subject_3'] ?? null,
+        ]));
+        if ($subjectIds) {
+            $names = DB::table('subjects')->whereIn('id', array_map('intval', $subjectIds))->pluck('name', 'id');
+            foreach ($subjectIds as $id) {
+                if (isset($names[(int) $id])) {
+                    $out[] = ['name' => $names[(int) $id], 'paper_code' => null, 'type' => 'Core'];
+                }
+            }
+        }
+        return $out;
     }
 
     private function pendingRegistrationFor($user): ?array
@@ -490,7 +438,11 @@ class RegistrationController extends Controller
                     $q->orWhere('dr.mobile', $user->mobile);
                 }
             })
-            ->where('dr.payment_status', '!=', 'paid')
+            ->whereNotExists(function ($q) {
+                $q->select(DB::raw(1))->from('payments')
+                    ->whereColumn('payments.direct_registration_id', 'dr.id')
+                    ->where('payments.purpose', 'registration')->where('payments.status', 'paid');
+            })
             ->whereNull('dr.deleted_at')
             ->orderByDesc('dr.id')
             ->select(
@@ -501,7 +453,6 @@ class RegistrationController extends Controller
                 'dr.name',
                 'dr.father_name',
                 'dr.fee_amount',
-                'dr.payment_status',
                 'dr.status',
                 'dr.phone_verified',
                 'dr.email_verified',
@@ -525,12 +476,12 @@ class RegistrationController extends Controller
             'name' => $row->name,
             'father_name' => $row->father_name,
             'fee' => (float) ($row->fee_amount ?? 0),
-            'payment_status' => $row->payment_status,
+            'payment_status' => 'pending', // this row only exists when it is not paid
             'status' => $row->status,
             'phone_verified' => (bool) $row->phone_verified,
             'email_verified' => (bool) $row->email_verified,
             'reg_date' => $row->reg_date,
-            'needs_payment' => $row->payment_status !== 'paid',
+            'needs_payment' => true,
             'needs_verification' => !$row->phone_verified || !$row->email_verified,
         ];
     }
@@ -542,8 +493,15 @@ class RegistrationController extends Controller
     {
         $user = $req->user();
 
+        $dashRegPaid = DB::table('payments')
+            ->select('direct_registration_id', DB::raw('MAX(id) as id'))
+            ->where('purpose', 'registration')->where('status', 'paid')
+            ->groupBy('direct_registration_id');
+
         $reg = DB::table('direct_registrations as dr')
             ->leftJoin('programs as p', 'p.id', '=', 'dr.program_id')
+            ->leftJoinSub($dashRegPaid, 'drp', 'drp.direct_registration_id', '=', 'dr.id')
+            ->leftJoin('payments as drpay', 'drpay.id', '=', 'drp.id')
             ->where(function ($q) use ($user) {
                 $q->where('dr.user_id', $user->id);
                 if (!empty($user->mobile)) {
@@ -561,10 +519,10 @@ class RegistrationController extends Controller
                 'dr.dob',
                 'dr.session_year as session',
                 'dr.status',
-                'dr.payment_status',
-                'dr.paid_at',
+                DB::raw("CASE WHEN drpay.id IS NOT NULL THEN 'paid' ELSE 'pending' END as payment_status"),
+                'drpay.paid_at as paid_at',
                 'dr.reg_date',
-                'dr.receipt_no',
+                'drpay.receipt_no as receipt_no',
                 'dr.updated_at',
                 'dr.program_id',
                 'p.short_name as course',
@@ -615,7 +573,7 @@ class RegistrationController extends Controller
                 'reg_date' => $reg->reg_date,
                 'paid_at' => $reg->paid_at,
                 'updated_at' => $reg->updated_at,
-            ]
+            ] + \App\Support\StudentSemesters::cards($user, $reg->program_id ? (int) $reg->program_id : null),
         ]);
     }
 }

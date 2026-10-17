@@ -35,10 +35,6 @@ class Examination extends Model
         return $this->belongsTo(Program::class);
     }
 
-    public function applications(): HasMany
-    {
-        return $this->hasMany(ExamApplication::class);
-    }
 
     public function isFormOpen(): bool
     {

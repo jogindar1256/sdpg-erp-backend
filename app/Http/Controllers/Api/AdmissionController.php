@@ -5,7 +5,6 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Admission;
 use App\Models\Student;
-use App\Models\Program;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -116,7 +115,12 @@ class AdmissionController extends Controller
             'registration' => $registration,
             'complete_fill' => $applications()->where('status', '!=', 'draft')->count(),
             'approved_application' => $applications()->where('status', 'approved')->count(),
-            'paid_fee' => $admissions()->where('a.payment_status', 'paid')->count(),
+            'paid_fee' => $admissions()->whereExists(function ($q) {
+                $q->select(DB::raw(1))->from('payments')
+                    ->whereColumn('payments.student_application_id', 'a.application_id')
+                    ->whereIn('payments.purpose', ['admission', 'semester_upgrade', 'back_paper'])
+                    ->where('payments.status', 'paid');
+            })->count(),
             'student_id_generated' => $admissions()
                 ->join('students as s', 's.id', 'a.student_id')
                 ->whereNotNull('s.student_uid')
@@ -130,11 +134,10 @@ class AdmissionController extends Controller
     public function show(Admission $admission): JsonResponse
     {
         $admission->load([
-            'student.documents',
+            'student',
             'program',
-            'application.selectedSubjectsData',
+            'application.documents', // uploaded documents live on the application
             'feeReceipts',
-            'semesterRegistrations',
         ]);
         return response()->json($admission);
     }
@@ -177,11 +180,24 @@ class AdmissionController extends Controller
 
     public function cancel(Request $request, Admission $admission): JsonResponse
     {
-        $request->validate(['cancel_reason' => 'required|string|max:500']);
+        $request->validate([
+            'cancel_reason' => 'required|string|max:500',
+            'cancel_charge' => 'nullable|numeric|min:0',
+        ]);
 
         if ($admission->status === 'cancelled') {
             return response()->json(['message' => 'Admission is already cancelled.'], 422);
         }
+        $paid = \App\Support\FeeRefunds::paidForAdmission((int) $admission->id);
+        if ((float) $request->input('cancel_charge', 0) > $paid) {
+            return response()->json(['message' => "Cancellation charge cannot exceed the fee paid (₹{$paid})."], 422);
+        }
+        \App\Support\FeeRefunds::openForAdmissionCancel(
+            (int) $admission->id,
+            (float) $request->input('cancel_charge', 0),
+            $request->cancel_reason,
+            $request->user()->id
+        );
 
         $admission->update([
             'status' => 'cancelled',

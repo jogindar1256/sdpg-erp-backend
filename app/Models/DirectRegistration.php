@@ -26,11 +26,10 @@ class DirectRegistration extends Model
         'ug_university', 'ug_institute', 'ug_session', 'ug_roll_no',
         'stream', 'entrance_session', 'entrance_roll_no', 'state_rank', 'category_rank', 'cut_off',
         'phone_verified', 'email_verified',
-        'payment_status', 'razorpay_order_id', 'razorpay_payment_id', 'paid_at',
         'temp_password', 'temp_password_plain',
         'status', 'approved_by', 'approved_at', 'remarks',
         'cancelled_by', 'cancelled_at', 'cancel_reason',
-        'fee_amount', 'course_group', 'receipt_no', 'pdf_path',
+        'fee_amount', 'course_group', 'pdf_path',
     ];
 
     protected $casts = [
@@ -38,7 +37,6 @@ class DirectRegistration extends Model
         'caste_cert_date' => 'date',
         'phone_verified' => 'boolean',
         'email_verified' => 'boolean',
-        'paid_at' => 'datetime',
         'approved_at' => 'datetime',
         'cancelled_at' => 'datetime',
         'fee_amount' => 'decimal:2',

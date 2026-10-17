@@ -35,9 +35,10 @@ trait LocksStudentIdentity
         // contact/mobile|email endpoints below, never through a raw
         // part-save. Still locked here as the backstop for updatePart().
         'mobile', 'email',
-        // registration / payment identifiers — system-owned
-        'registration_no', 'reg_no', 'reg_type', 'payment_status',
-        'razorpay_order_id', 'razorpay_payment_id', 'fee_amount', 'receipt_no',
+        // registration / payment identifiers — system-owned. payment_status/
+        // razorpay_order_id/razorpay_payment_id/receipt_no used to live here
+        // too; those columns are gone (see `payments` table, Phase 4).
+        'registration_no', 'reg_no', 'reg_type', 'fee_amount',
     ];
 
     /**

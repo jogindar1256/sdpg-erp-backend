@@ -25,7 +25,6 @@ class DiagnoseDatabase extends Command
             'migrations' => $this->migrations(),
             'sms_templates' => $this->smsTemplates(),
             'student_applications' => $this->studentApplications(),
-            'semester_registrations' => $this->semesterRegistrations(),
             'direct_registrations' => $this->directRegistrations(),
             'admissions' => $this->admissions(),
             'students' => $this->students(),
@@ -99,7 +98,12 @@ class DiagnoseDatabase extends Command
         // transaction wrapping in doApplicationPayVerify().
         $paidButNoAdmission = DB::table('student_applications as sa')
             ->whereNull('sa.deleted_at')
-            ->where('sa.fee_paid', true)
+            ->whereExists(function ($q) {
+                $q->select(DB::raw(1))->from('payments')
+                    ->whereColumn('payments.student_application_id', 'sa.id')
+                    ->whereIn('payments.purpose', ['admission', 'semester_upgrade', 'back_paper'])
+                    ->where('payments.status', 'paid');
+            })
             ->whereNotExists(function ($q) {
                 $q->select(DB::raw(1))->from('admissions as a')->whereColumn('a.application_id', 'sa.id');
             })
@@ -111,18 +115,6 @@ class DiagnoseDatabase extends Command
             'leftover_fresh_or_lateral_values' => $leftoverFreshOrLateral,
             'student_id_null_by_status' => $studentIdNullByStatus,
             'RED_FLAG_fee_paid_but_no_admission_row' => $paidButNoAdmission,
-        ];
-    }
-
-    private function semesterRegistrations(): array
-    {
-        $byType = DB::table('semester_registrations')
-            ->select('registration_type', DB::raw('count(*) as n'))->groupBy('registration_type')->pluck('n', 'registration_type');
-        $exStudentLeftover = DB::table('semester_registrations')->where('registration_type', 'ex_student')->count();
-
-        return [
-            'by_registration_type' => $byType,
-            'leftover_ex_student_values' => $exStudentLeftover,
         ];
     }
 
@@ -228,7 +220,6 @@ class DiagnoseDatabase extends Command
         $this->line('  admissions with orphaned application_id: ' . $report['admissions']['RED_FLAG_orphaned_application_id']);
         $this->line('  fee_receipts with null student_id: ' . $report['fee_receipts']['RED_FLAG_null_student_id']);
         $this->line('  leftover fresh/lateral application_type values: ' . $report['student_applications']['leftover_fresh_or_lateral_values']);
-        $this->line('  leftover ex_student registration_type values: ' . $report['semester_registrations']['leftover_ex_student_values']);
 
         $this->newLine();
         $this->info('Full detail in the JSON file above.');

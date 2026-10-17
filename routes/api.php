@@ -23,7 +23,6 @@ use App\Http\Controllers\Api\ReportController;
 use App\Http\Controllers\Api\FeesController;
 use App\Http\Controllers\Api\SecurityController;
 use App\Http\Controllers\Api\LookupController;
-use App\Http\Controllers\PaymentLedgerController;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Request;
@@ -247,12 +246,13 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('sms-templates/{smsTemplate}/preview', [SmsTemplateController::class, 'preview']);
 
         // Students
+        // Before apiResource so 'statistics' is not captured as students/{student}.
+        Route::get('students/statistics', [StudentController::class, 'statistics']);
         Route::apiResource('students', StudentController::class)->except('destroy');
         Route::post('students/{student}/photo', [StudentController::class, 'uploadPhoto']);
         Route::post('students/{student}/signature', [StudentController::class, 'uploadSignature']);
         Route::post('students/{student}/block', [StudentController::class, 'blockUnblock']);
         Route::get('students/{student}/ledger', [StudentController::class, 'ledger']);
-        Route::get('students/statistics', [StudentController::class, 'statistics']);
 
         // Applications (Office view)
         Route::prefix('applications')->group(function () {
@@ -339,7 +339,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::prefix('admissions')->group(function () {
             // Literal route first so the resource's id wildcard can't swallow it.
             Route::get('pipeline-summary', [AdmissionController::class, 'pipelineSummary']);
-            Route::apiResource('/', AdmissionController::class)->except(['store', 'destroy']);
+            Route::get('/', [AdmissionController::class, 'index']);
             Route::post('{admission}/verify', [AdmissionController::class, 'verify']);
             Route::post('{admission}/cancel', [AdmissionController::class, 'cancel']);
             Route::get('statistics', [AdmissionController::class, 'statistics']);
@@ -351,6 +351,10 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('ledger', [AdmissionController::class, 'ledger']);
             Route::get('statistics', [AdmissionController::class, 'statistics']);
             Route::get('subject-statistics', [AdmissionController::class, 'subjectStatistics']);
+            // Wildcards last — apiResource('/') registered these as "admissions/{}"
+            // (empty parameter), so GET /admissions/{id} was a 404.
+            Route::get('{admission}', [AdmissionController::class, 'show'])->whereNumber('admission');
+            Route::match(['put', 'patch'], '{admission}', [AdmissionController::class, 'update'])->whereNumber('admission');
         });
 
 
@@ -366,15 +370,12 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('fee-receipts/{feeReceipt}/download', [FeeReceiptController::class, 'download']);
         Route::post('fee-receipts/{feeReceipt}/verify', [FeeReceiptController::class, 'verify']);
         Route::post('fee-receipts/{feeReceipt}/cancel', [FeeReceiptController::class, 'cancel']);
+        Route::post('fee-receipts/{id}/refund', [FeeReceiptController::class, 'markRefunded']);
 
 
         // Registration
         Route::prefix('registration')->group(function () {
             // UG / PG / B.Ed registration list + actions (level passed as query param)
-            Route::get('/', [RegistrationController::class, 'index']);
-            Route::post('/', [RegistrationController::class, 'store']);
-            Route::patch('{id}/status', [RegistrationController::class, 'updateStatus']);
-            Route::post('bulk-approve', [RegistrationController::class, 'bulkApprove']);
 
             // Registration Status summary
             Route::get('status', [RegistrationController::class, 'registrationStatus']);
@@ -401,7 +402,6 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('student-status', [RegistrationController::class, 'studentStatus']);
 
             // Stats
-            Route::get('stats', [RegistrationController::class, 'stats']);
             Route::get('self-registered', [StudentRegistrationController::class, 'adminIndex']);
 
             // Office copies — any registration in the college (staff-gated
@@ -599,6 +599,8 @@ Route::middleware('auth:sanctum')->group(function () {
 
             // Student Ledger — per-student transaction history
             Route::get('ledger', [FeesController::class, 'ledgerIndex']);
+            Route::get('refunds', [FeesController::class, 'refundsIndex']);
+            Route::post('refunds/{id}/refunded', [FeesController::class, 'refundMark']);
 
             // Financial Summary — aggregate stats
             Route::get('summary', [FeesController::class, 'summaryIndex']);
@@ -756,18 +758,6 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::delete('counselling/{id}', [MasterSettingsController::class, 'counsellingDestroy']);
         });
 
-        // payment ledger
-        Route::prefix('ledger')->group(function () {
-            Route::get('/', [PaymentLedgerController::class, 'index']);
-            Route::get('/summary', [PaymentLedgerController::class, 'summary']);
-            Route::get('/student/{studentId}', [PaymentLedgerController::class, 'studentStatement']);
-            Route::get('/{id}', [PaymentLedgerController::class, 'show']);
-            Route::post('/offline', [PaymentLedgerController::class, 'storeOffline']);
-            Route::post('/{id}/verify', [PaymentLedgerController::class, 'verify']);
-            Route::post('/{id}/refund', [PaymentLedgerController::class, 'refund']);
-        });
-
-
     });
 
     // ── STUDENT PORTAL ────────────────────────────────────────────────────
@@ -776,6 +766,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
         // ── Student profile ───────────────────────────────────────────────────────
         Route::get('profile', [StudentController::class, 'myProfile']);
+        Route::get('education-history', [StudentController::class, 'myEducationHistory']);
         Route::put('profile', [StudentController::class, 'updateProfile']);
 
         // studentPrograms() is the correct handler here — eligibility- and

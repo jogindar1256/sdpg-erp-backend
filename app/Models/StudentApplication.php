@@ -52,6 +52,11 @@ class StudentApplication extends Model
         return $this->belongsTo(User::class, 'approved_by');
     }
 
+    public function documents(): HasMany
+    {
+        return $this->hasMany(StudentApplicationDocument::class, 'application_id');
+    }
+
     public function admission(): HasOne
     {
         return $this->hasOne(Admission::class, 'application_id');

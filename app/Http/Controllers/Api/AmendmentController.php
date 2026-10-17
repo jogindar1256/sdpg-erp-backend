@@ -114,7 +114,7 @@ class AmendmentController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $k = $req->query;
+        $k = $req->input('query');
         $latestReg = $this->regJoinSub();
         $latestApp = DB::table('student_applications')
             ->select('student_id', DB::raw('MAX(id) as app_id'))
@@ -128,10 +128,6 @@ class AmendmentController extends Controller
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->leftJoinSub($latestApp, 'la', 'la.student_id', 's.id')
             ->leftJoin('student_applications as sa', 'sa.id', 'la.app_id')
-            ->leftJoin('semester_registrations as sr', function ($j) use ($req) {
-                $j->on('sr.admission_id', 'a.id')
-                    ->where('sr.session_year', $req->session_year ?? \App\Support\AcademicSession::current());
-            })
             ->leftJoin('fee_receipts as fr', 'fr.admission_id', 'a.id')
             ->where(function ($q) use ($k) {
                 $q->where('s.university_roll_no', 'ilike', "%{$k}%")
@@ -171,7 +167,7 @@ class AmendmentController extends Controller
                 'sa.application_no',
                 'dr.registration_no as reg_no',
                 'sa.status as app_status',
-                'sr.status as reg_status',
+                'sa.status as reg_status', // semester status = the student's latest application
                 DB::raw('MAX(fr.receipt_no) as final_receipt_no'),
                 DB::raw('MAX(fr.status) as fee_status')
             )
@@ -199,8 +195,7 @@ class AmendmentController extends Controller
                 'p.level',
                 'sa.application_no',
                 'dr.registration_no',
-                'sa.status',
-                'sr.status'
+                'sa.status'
             )
             ->limit(20)
             ->get();
@@ -1129,14 +1124,20 @@ class AmendmentController extends Controller
         if (!$student)
             return response()->json(['message' => 'Student not found.'], 404);
 
-        $fee = DB::table('fee_receipts')->where('admission_id', $student->admission_id)->latest()->first();
+        $receipts = $student->admission_id ? \App\Support\FeeRefunds::receiptsForAdmission((int) $student->admission_id) : collect();
+        $fee = $receipts->sortByDesc('id')->first();
+        $refund = $student->admission_id
+            ? DB::table('fee_refunds')->where('admission_id', $student->admission_id)->where('source', 'admission_cancel')->first()
+            : null;
 
         return response()->json([
             'admission' => [
                 'admission_id' => $student->admission_id,
                 'status' => $student->admission_status,
                 'receipt_date' => $fee->receipt_date ?? null,
-                'deposited_amount' => (float) ($fee->net_amount ?? 0),
+                // Everything paid on this admission — the refund is this less the charge.
+                'deposited_amount' => round((float) $receipts->sum('net_amount'), 2),
+                'refund' => $refund,
                 'session' => $student->academic_year,
                 'class_name' => $student->course,
             ],
@@ -1210,15 +1211,31 @@ class AmendmentController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        DB::table('admissions')->where('id', $req->admission_id)->update([
-            'status' => 'cancelled',
-            'cancel_reason' => $req->reason,
-            'cancel_date' => $req->cancel_date,
-            'cancelled_by' => $req->user()?->id,
-            'updated_at' => now(),
-        ]);
+        $adm = DB::table('admissions')->where('id', $req->admission_id)->first();
+        if ((int) $adm->student_id !== (int) $req->student_id) {
+            return response()->json(['message' => 'This admission does not belong to the selected student.'], 422);
+        }
+        if ($adm->status === 'cancelled') {
+            return response()->json(['message' => 'This admission is already cancelled.'], 422);
+        }
+        $paid = \App\Support\FeeRefunds::paidForAdmission((int) $adm->id);
+        $charge = round((float) ($req->cancel_charge ?? 0), 2);
+        if ($charge < 0 || $charge > $paid) {
+            return response()->json(['errors' => ['cancel_charge' => ["Cancellation charge must be between 0 and the fee paid (₹{$paid})."]]], 422);
+        }
 
         $refNo = $this->refNo('CAN');
+        $refund = DB::transaction(function () use ($req, $adm, $charge) {
+            DB::table('admissions')->where('id', $adm->id)->update([
+                'status' => 'cancelled',
+                'cancel_reason' => $req->reason,
+                'cancel_date' => $req->cancel_date,
+                'cancelled_by' => $req->user()?->id,
+                'updated_at' => now(),
+            ]);
+            // Fee paid − cancellation charge goes to the refund register.
+            return \App\Support\FeeRefunds::openForAdmissionCancel((int) $adm->id, $charge, $req->reason, $req->user()?->id);
+        });
 
         DB::table('amendment_logs')->insert([
             'student_id' => $req->student_id,
@@ -1232,7 +1249,13 @@ class AmendmentController extends Controller
             'updated_at' => now(),
         ]);
 
-        return response()->json(['message' => 'Admission cancelled.', 'ref_no' => $refNo]);
+        return response()->json([
+            'message' => 'Admission cancelled.',
+            'ref_no' => $refNo,
+            'paid_amount' => $refund[1],
+            'refund_amount' => $refund[2],
+            'refund_id' => $refund[0],
+        ]);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1296,6 +1319,16 @@ class AmendmentController extends Controller
             ]);
 
         app(ApplicationController::class)->blockRelatedRecords($app, $newStatus, null, $req->user()?->id);
+
+        // Cancelling an application whose fee was paid → full refund owed.
+        if ($newStatus === 'cancelled') {
+            $admId = DB::table('admissions')->where('application_id', $app->id)->value('id');
+            if ($admId) {
+                \App\Support\FeeRefunds::openForAdmissionCancel((int) $admId, 0, 'Cancelled by college', $req->user()?->id);
+            } elseif (($rid = \App\Support\Payments::applicationFeeReceiptId((int) $app->id)) && ($rc = DB::table('fee_receipts')->where('id', $rid)->first())) {
+                \App\Support\FeeRefunds::openForReceipt($rc, 'Cancelled by college', $req->user()?->id); // back paper: no admission row
+            }
+        }
 
         return response()->json(['message' => "Application {$req->action}ed."]);
     }

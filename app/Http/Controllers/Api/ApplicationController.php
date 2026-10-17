@@ -68,11 +68,17 @@ class ApplicationController extends Controller
             ->where('id', $sa->program_id)
             ->first();
 
-        $sa->admission = DB::table('admissions')
-            ->where('student_id', $sa->student_id)
-            ->where('program_id', $sa->program_id)
-            ->orderByDesc('id')
-            ->first();
+        // This application's own admission row first. A first-time applicant
+        // has no student_id yet — `where('student_id', null)` would match
+        // another applicant's admission, so never look up by a null id.
+        $sa->admission = DB::table('admissions')->where('application_id', $sa->id)->orderByDesc('id')->first()
+            ?: (!empty($sa->student_id)
+                ? DB::table('admissions')
+                    ->where('student_id', $sa->student_id)
+                    ->where('program_id', $sa->program_id)
+                    ->orderByDesc('id')
+                    ->first()
+                : null);
 
         $sa->registration = $sa->direct_registration_id
             ? DB::table('direct_registrations')->where('id', $sa->direct_registration_id)->whereNull('deleted_at')->first()
@@ -196,6 +202,16 @@ class ApplicationController extends Controller
             ->whereNull('deleted_at')
             ->groupBy('user_id');
 
+        // Latest paid application-fee payment per student_application_id —
+        // used twice below: once keyed to sa.id itself (back_paper's own
+        // fee), once keyed to adm.application_id (the admission's own
+        // originating application fee).
+        $paidAppFee = DB::table('payments')
+            ->select('student_application_id', DB::raw('MAX(id) as id'))
+            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])
+            ->where('status', 'paid')
+            ->groupBy('student_application_id');
+
         // students is now a LEFT join — was an inner join, which silently
         // dropped every 'regular' application from this list.
         // Identity fields (name/mobile/gender/dob/category/aadhar/abc_id)
@@ -220,6 +236,8 @@ class ApplicationController extends Controller
             ->leftJoinSub($latestReg, 'lr', 'lr.user_id', 's.user_id')
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
+            ->leftJoinSub($paidAppFee, 'sapay', 'sapay.student_application_id', 'sa.id')
+            ->leftJoinSub($paidAppFee, 'admpay', 'admpay.student_application_id', 'adm.application_id')
             ->whereNull('sa.deleted_at')
             ->select(
                 'sa.id',
@@ -230,7 +248,7 @@ class ApplicationController extends Controller
                 'sa.status',
                 'sa.form_progress',
                 'sa.fee_amount',
-                'sa.fee_paid',
+                DB::raw('(sapay.id is not null) as fee_paid'),
                 'sa.created_at',
                 'sa.updated_at',
                 's.personal_info->first_name as first_name',
@@ -248,7 +266,7 @@ class ApplicationController extends Controller
                 'p.short_name as course',
                 'p.full_name',
                 'p.level',
-                'adm.payment_status as edu_payment_status',
+                DB::raw("CASE WHEN admpay.id IS NOT NULL THEN 'paid' ELSE NULL END as edu_payment_status"),
                 'drc.unique_code as code'
             )
             ->when($req->academic_year, fn($q) => $q->where('sa.academic_year', $req->academic_year))
@@ -368,6 +386,14 @@ class ApplicationController extends Controller
         // Only exists once the college has approved this exact application.
         $admissionRow = DB::table('admissions')->where('application_id', $app->id)->first();
 
+        // sa.* above pulls every student_applications column, including the
+        // legacy fee_paid/fee_receipt_id/paid_at ones; recompute them from
+        // `payments` explicitly so this keeps working once those columns
+        // are dropped (see App\Support\Payments).
+        $appFeePaid = \App\Support\Payments::applicationFeePaid((int) $app->id);
+        $appFeeReceiptId = \App\Support\Payments::applicationFeeReceiptId((int) $app->id);
+        $appPaidAt = \App\Support\Payments::applicationPaidAt((int) $app->id);
+
         return response()->json([
             'student' => $student,
             'admission' => array_merge((array) $app, [
@@ -378,6 +404,9 @@ class ApplicationController extends Controller
                 'university_roll_no' => $student?->university_roll_no,
                 'admission_id' => $admissionRow->id ?? null,
                 'admission_no' => $admissionRow->admission_no ?? null,
+                'fee_paid' => $appFeePaid,
+                'fee_receipt_id' => $appFeeReceiptId,
+                'paid_at' => $appPaidAt,
             ]),
             'program' => $program,
         ]);
@@ -601,6 +630,11 @@ class ApplicationController extends Controller
         if ($locked = $this->assertNotLocked($app, 'approved')) {
             return $locked;
         }
+        // Only a submitted application can be approved — a draft has skipped
+        // the complete-every-part check, a rejected/cancelled one is closed.
+        if (!in_array($app->status, ['submitted', 'under_review', 'on_hold'], true)) {
+            return response()->json(['message' => "An application that is {$app->status} cannot be approved."], 422);
+        }
 
         DB::table('student_applications')->where('id', $id)->update([
             'status' => 'approved',
@@ -618,11 +652,13 @@ class ApplicationController extends Controller
         // a first-time applicant once the receipt has been verified (which
         // may already have happened).
         $paidApp = DB::table('student_applications')->where('id', $id)->first();
-        if ($paidApp && $paidApp->fee_paid && in_array($paidApp->application_type, self::ADMISSION_APP_TYPES, true)) {
+        $paidAppFeePaid = $paidApp ? \App\Support\Payments::applicationFeePaid((int) $paidApp->id) : false;
+        if ($paidApp && $paidAppFeePaid && in_array($paidApp->application_type, self::ADMISSION_APP_TYPES, true)) {
             $knownStudent = $paidApp->student_id
                 ?: ($paidApp->user_id ? DB::table('students')->where('user_id', $paidApp->user_id)->value('id') : null);
-            $receiptVerified = $paidApp->fee_receipt_id
-                && DB::table('fee_receipts')->where('id', $paidApp->fee_receipt_id)->value('is_verified');
+            $paidAppReceiptId = \App\Support\Payments::applicationFeeReceiptId((int) $paidApp->id);
+            $receiptVerified = $paidAppReceiptId
+                && DB::table('fee_receipts')->where('id', $paidAppReceiptId)->value('is_verified');
             if ($knownStudent || $receiptVerified) {
                 DB::transaction(fn() => $this->confirmStudentAndCreateAdmission($paidApp, (int) $req->user()->id));
             }
@@ -708,6 +744,8 @@ class ApplicationController extends Controller
                 'ref_no' => $refNo,
                 'decision' => $req->decision,
                 'status' => $req->decision === 'hold' ? 'hold' : 'active',
+                // What Release Hold puts back (see releaseHold()).
+                'previous_status' => $app->status,
                 'hold_type' => $req->decision === 'hold' ? $req->hold_type : null,
                 'reason' => $req->reason,
                 'objections' => json_encode(array_values(array_filter($req->input('objections', [])))),
@@ -789,7 +827,16 @@ class ApplicationController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        DB::transaction(function () use ($hold, $app, $req) {
+        // Back to where it was before the hold — an approved / paid application
+        // must not drop back into the pending queue. Holds placed before
+        // previous_status existed: paid means it had been approved (pay
+        // comes after approve), else submitted.
+        $restore = $hold->previous_status ?? null;
+        if (!$restore || in_array($restore, ['on_hold', 'rejected', 'cancelled'], true)) {
+            $restore = \App\Support\Payments::applicationFeePaid((int) $app->id) ? 'approved' : 'submitted';
+        }
+
+        DB::transaction(function () use ($hold, $app, $req, $restore) {
             DB::table('rejected_applications')->where('id', $hold->id)->update([
                 'status' => 'released',
                 'released_by' => $req->user()->id,
@@ -800,7 +847,7 @@ class ApplicationController extends Controller
             ]);
 
             DB::table('student_applications')->where('id', $app->id)->update([
-                'status' => 'submitted',
+                'status' => $restore,
                 'updated_at' => now(),
             ]);
 
@@ -816,7 +863,7 @@ class ApplicationController extends Controller
         });
         $this->syncAdmissionForApplication((int) $app->id);
 
-        return response()->json(['message' => 'Hold released.']);
+        return response()->json(['message' => 'Hold released.', 'status' => $restore]);
     }
 
     /**
@@ -884,7 +931,7 @@ class ApplicationController extends Controller
      */
     private function assertNotLocked(object $app, string $newStatus): ?JsonResponse
     {
-        if ($app->status === 'approved' && $app->fee_paid && !in_array($newStatus, ['cancelled', 'on_hold'], true)) {
+        if ($app->status === 'approved' && \App\Support\Payments::applicationFeePaid((int) $app->id) && !in_array($newStatus, ['cancelled', 'on_hold'], true)) {
             return response()->json([
                 'message' => 'This application is already approved and the fee is paid — it cannot be moved back. Only Cancel or Hold is allowed.',
             ], 422);
@@ -952,7 +999,7 @@ class ApplicationController extends Controller
             'mobile' => $reg->mobile ?? ($student->mobile ?? null),
             'email' => $reg->email ?? ($student->email ?? null),
             'aadhar_no' => $reg->aadhar_no ?? ($student->aadhar_no ?? null),
-            'state' => $part2['permanent_state'] ?? ($reg->domestic_state ?? ($student->permanent_state ?? null)),
+            'state' => $part2['perm_state'] ?? $part2['permanent_state'] ?? ($reg->domestic_state ?? ($student->permanent_state ?? null)),
             'registration_no' => $reg->registration_no ?? null,
             'application_no' => $app->application_no ?? null,
         ], fn($v) => $v !== null && $v !== '');
@@ -1015,7 +1062,7 @@ class ApplicationController extends Controller
             $blocking = in_array($target, ['on_hold', 'rejected', 'cancelled'], true);
             if (!$blocking && in_array($existing->status, self::ADMISSION_FINAL_STATUSES, true)) {
                 $status = $existing->status; // already admitted — don't pull it back
-            } elseif ($target === 'approved' && $existing->student_id && $app->fee_paid && $existing->is_verified) {
+            } elseif ($target === 'approved' && $existing->student_id && \App\Support\Payments::applicationFeePaid((int) $app->id) && $existing->is_verified) {
                 $status = 'active'; // e.g. hold released after the admission was confirmed
             }
             $data['status'] = $status;
@@ -1053,7 +1100,7 @@ class ApplicationController extends Controller
             !$app
             || !in_array($app->application_type, self::ADMISSION_APP_TYPES, true)
             || $app->status !== 'approved'
-            || !$app->fee_paid
+            || !\App\Support\Payments::applicationFeePaid((int) $app->id)
         ) {
             return;
         }
@@ -1128,15 +1175,19 @@ class ApplicationController extends Controller
 
         $fee = $this->computeApplicationFee($sa);
         $headNames = DB::table('fee_heads')
-            ->whereIn('id', collect($fee['breakdown'])->pluck('fee_head_id')->filter()->all() ?: [0])
+            ->whereIn('id', collect($fee['breakdown'])->merge($fee['college_breakdown'] ?? [])->pluck('fee_head_id')->filter()->all() ?: [0])
             ->pluck('name', 'id');
-        $receipt = $sa->fee_receipt_id
-            ? DB::table('fee_receipts')->where('id', $sa->fee_receipt_id)->first()
+        $saFeeReceiptId = \App\Support\Payments::applicationFeeReceiptId((int) $sa->id);
+        $receipt = $saFeeReceiptId
+            ? DB::table('fee_receipts')->where('id', $saFeeReceiptId)->first()
             : null;
         $required = $fee['missing_structure'] ? null : (float) $fee['total'];
         $paid = (float) ($receipt->net_amount ?? 0);
 
         $yesNo = fn($v) => $v === null || $v === '' ? null : (in_array(strtolower((string) $v), ['yes', '1', 'true'], true) || $v === true ? 'Yes' : 'No');
+
+        $regPaidPayment = !empty($reg->id) ? \App\Support\Payments::paidRegistrationPayment((int) $reg->id) : null;
+        $saAppPaidPayment = \App\Support\Payments::paidApplicationPayment((int) $sa->id);
 
         return [
             'admission_id' => $admission->id,
@@ -1173,15 +1224,15 @@ class ApplicationController extends Controller
             'signature_url' => $sa->signature_url,
 
             'registration_no' => $reg->registration_no ?? null,
-            'reg_fee_status' => ($reg->payment_status ?? null) === 'paid' ? 'Paid' : 'Pending',
-            'reg_fee_paid' => ($reg->payment_status ?? null) === 'paid' ? (float) ($reg->fee_amount ?? 0) : 0,
-            'reg_fee_utr' => $reg->razorpay_payment_id ?? null,
-            'reg_fee_paid_at' => $reg->paid_at ?? null,
+            'reg_fee_status' => $regPaidPayment ? 'Paid' : 'Pending',
+            'reg_fee_paid' => $regPaidPayment ? (float) ($reg->fee_amount ?? 0) : 0,
+            'reg_fee_utr' => $regPaidPayment->gateway_payment_id ?? null,
+            'reg_fee_paid_at' => $regPaidPayment->paid_at ?? null,
 
             'application_no' => $sa->application_no,
-            'edu_fee_status' => $sa->fee_paid ? 'Paid' : 'Pending',
+            'edu_fee_status' => $saAppPaidPayment ? 'Paid' : 'Pending',
             'edu_fee_paid' => $paid,
-            'edu_fee_utr' => $receipt->transaction_id ?? $sa->payment_ref ?? null,
+            'edu_fee_utr' => $receipt->transaction_id ?? ($saAppPaidPayment->gateway_payment_id ?? null),
             'fee_receipt_id' => $receipt->id ?? null,
             'fee_receipt_verified' => (bool) ($receipt->is_verified ?? false),
 
@@ -1517,11 +1568,28 @@ class ApplicationController extends Controller
             return response()->json(['message' => 'Application not found.'], 404);
         }
 
+        // Student portal: only their own application. The registration-code
+        // check below is skipped for applications without a registration
+        // (office-created upgrade / back paper), so it is not enough alone.
+        if (($req->user()->portal ?? null) === 'student' && !$this->studentOwnsApplication($req->user()->id, $sa)) {
+            return response()->json(['message' => 'Application not found.'], 404);
+        }
+
         if ($denied = $this->rejectIfCodeInvalid($req, $sa)) {
             return $denied;
         }
 
         return response()->json($this->parseApp($sa, $req));
+    }
+
+    /** Own application: created by the user, via their registration, or for their students row. */
+    private function studentOwnsApplication(int $userId, object $sa): bool
+    {
+        if ((int) ($sa->user_id ?? 0) === $userId) return true;
+        if (!empty($sa->direct_registration_id)
+            && (int) DB::table('direct_registrations')->where('id', $sa->direct_registration_id)->value('user_id') === $userId) return true;
+        return !empty($sa->student_id)
+            && (int) DB::table('students')->where('id', $sa->student_id)->value('user_id') === $userId;
     }
 
     public function showByNumber(Request $req, string $applicationNo)
@@ -1727,6 +1795,21 @@ class ApplicationController extends Controller
                 ->where('program_id', $sa->program_id)
                 ->orderByDesc('id')
                 ->first();
+        // payment_status/paid_at/razorpay_payment_id are gone from
+        // direct_registrations (Phase 4) — the Blade view still reads them
+        // off $reg (= $registration), so patch them on from `payments`.
+        if ($registration) {
+            $regPaidPayment = \App\Support\Payments::paidRegistrationPayment((int) $registration->id);
+            $registration->payment_status = $regPaidPayment ? 'paid' : 'pending';
+            $registration->paid_at = $regPaidPayment->paid_at ?? null;
+            $registration->razorpay_payment_id = $regPaidPayment->gateway_payment_id ?? null;
+            $registration->razorpay_order_id = $regPaidPayment->gateway_order_id ?? null;
+        }
+
+        // $sa->razorpay_order_id used to be read directly off
+        // student_applications; the column is gone (Phase 4) — show the
+        // paid application payment's own gateway order id instead.
+        $sa->razorpay_order_id = \App\Support\Payments::paidApplicationPayment((int) $sa->id)->gateway_order_id ?? null;
 
         $documents = DB::table('student_application_documents')
             ->where('application_id', $sa->id)
@@ -1893,10 +1976,9 @@ class ApplicationController extends Controller
             return response()->json(['message' => 'Application form is not completed yet.'], 422);
         }
 
-        // NOTE: admissions has no payment_status column — fee-paid status
-        // lives on student_applications.fee_paid (set by the pay/verify
-        // flow below).
-        if (!$sa->fee_paid) {
+        // Fee-paid status is computed from `payments` (see App\Support\Payments);
+        // student_applications.fee_paid is gone.
+        if (!\App\Support\Payments::applicationFeePaid((int) $sa->id)) {
             return response()->json(['message' => 'Education fee is not paid yet. Print is available only after payment.'], 422);
         }
 
@@ -2202,7 +2284,8 @@ class ApplicationController extends Controller
             ->where('semester', (string) $sa->semester_no)
             ->where('session_year', $sa->academic_year)
             ->first();
-        if ($schedule && $schedule->late_fee_applicable && $schedule->end_on && now()->gt($schedule->end_on)) {
+        // end_on is India wall-clock as typed; the app runs in UTC.
+        if ($schedule && $schedule->late_fee_applicable && $schedule->end_on && \Carbon\Carbon::now('Asia/Kolkata')->format('Y-m-d H:i:s') > (string) $schedule->end_on) {
             $late = (float) $schedule->late_fee;
         }
 
@@ -2321,7 +2404,7 @@ class ApplicationController extends Controller
         if (!$sa)
             return response()->json(['message' => 'Application not found.'], 404);
 
-        return $this->doApplicationPayInitiate($sa);
+        return $this->doApplicationPayInitiate($sa, $this->payBeforeApprovalAllowed($sa));
     }
 
     /** POST /student/applications/{id}/pay/initiate (student) */
@@ -2331,7 +2414,23 @@ class ApplicationController extends Controller
         if ($sa instanceof \Illuminate\Http\JsonResponse)
             return $sa;
 
-        return $this->doApplicationPayInitiate($sa);
+        return $this->doApplicationPayInitiate($sa, $this->payBeforeApprovalAllowed($sa));
+    }
+
+    /**
+     * Odd semesters (a first admission, and odd-numbered semester upgrades)
+     * go through the normal ladder: office verifies/approves first, the fee
+     * is paid after. Even semesters (continuing-student upgrades to
+     * semester 2, 4, 6…) are the opposite — pay first, while the
+     * application is still submitted/under_review; approving it (via the
+     * admission-verification / semester-approval authorization routes) is
+     * what verifies it afterwards. A null/zero semester_no (first-time
+     * 'regular' admission) counts as odd.
+     */
+    private function payBeforeApprovalAllowed(object $sa): bool
+    {
+        $sem = (int) ($sa->semester_no ?? 0);
+        return $sem > 0 && $sem % 2 === 0;
     }
 
     private function doApplicationPayInitiate(object $sa, bool $allowPending = false)
@@ -2339,7 +2438,7 @@ class ApplicationController extends Controller
         if ($sa->application_type === 'back_paper') {
             return response()->json(['message' => 'Use the back-paper payment endpoint for this application.'], 422);
         }
-        if ($sa->fee_paid) {
+        if (\App\Support\Payments::applicationFeePaid((int) $sa->id)) {
             return response()->json(['message' => 'Education fee already paid.'], 409);
         }
         // Payment unlocks only after office approval (approve()) — not
@@ -2409,10 +2508,10 @@ class ApplicationController extends Controller
         $order = $resp->json();
 
         DB::table('student_applications')->where('id', $sa->id)->update([
-            'razorpay_order_id' => $order['id'],
-            'fee_amount' => $fee['total'],
+            'fee_amount' => $fee['total'], // amount due (not a payment fact)
             'updated_at' => now(),
         ]);
+        \App\Support\Payments::openOrder(\App\Support\Payments::forApplication($sa), (float) $fee['total'], $order['id']);
 
         return response()->json([
             'order_id' => $order['id'],
@@ -2434,7 +2533,7 @@ class ApplicationController extends Controller
         if (!$sa)
             return response()->json(['message' => 'Application not found.'], 404);
 
-        return $this->doApplicationPayVerify($sa, $req);
+        return $this->doApplicationPayVerify($sa, $req, $this->payBeforeApprovalAllowed($sa));
     }
 
     /** POST /student/applications/{id}/pay/verify (student) */
@@ -2444,7 +2543,7 @@ class ApplicationController extends Controller
         if ($sa instanceof \Illuminate\Http\JsonResponse)
             return $sa;
 
-        return $this->doApplicationPayVerify($sa, $req);
+        return $this->doApplicationPayVerify($sa, $req, $this->payBeforeApprovalAllowed($sa));
     }
 
     private function doApplicationPayVerify(object $sa, Request $req, bool $allowPending = false)
@@ -2461,6 +2560,17 @@ class ApplicationController extends Controller
         if (!$secret || !hash_equals($expected, $req->razorpay_signature)) {
             return response()->json(['message' => 'Payment could not be verified.'], 422);
         }
+        // The signature only proves *a* payment happened — make sure it is
+        // the order created for THIS application (no replaying a cheaper
+        // order, e.g. a registration fee, against the education fee).
+        $payment = \App\Support\Payments::orderFor(
+            (string) $req->razorpay_order_id, 'student_application_id', (int) $sa->id,
+            null, // legacy-column order-id adoption is dead — payments has covered this window for a long time
+            \App\Support\Payments::forApplication($sa), (float) ($sa->fee_amount ?? 0)
+        );
+        if (!$payment || $payment->status === 'paid') {
+            return response()->json(['message' => $payment ? 'This payment is already recorded.' : 'This payment does not belong to this application.'], $payment ? 409 : 422);
+        }
 
         // Defense in depth — doApplicationPayInitiate() already gates on
         // this, but verify is a separate request and must not trust that
@@ -2469,7 +2579,7 @@ class ApplicationController extends Controller
         if (!in_array($sa->status, $payable, true)) {
             return response()->json(['message' => 'This application is no longer open for payment.'], 422);
         }
-        if ($sa->fee_paid) {
+        if (\App\Support\Payments::applicationFeePaid((int) $sa->id)) {
             return response()->json(['message' => 'Education fee already paid.'], 409);
         }
 
@@ -2484,7 +2594,7 @@ class ApplicationController extends Controller
         ])->values()->all();
 
         $feeRefId = null;
-        $receipt = DB::transaction(function () use ($sa, $fee, $breakdown, $isSelfFinance, $req, &$feeRefId) {
+        $receipt = DB::transaction(function () use ($sa, $fee, $breakdown, $isSelfFinance, $req, &$feeRefId, $payment) {
             // The admissions row exists since submit; make sure of it.
             $admissionId = $this->syncAdmissionForApplication((int) $sa->id);
 
@@ -2535,27 +2645,16 @@ class ApplicationController extends Controller
                     $student->gender ?? ($applicant['gender'] ?? null)
                 );
 
-            if ($admissionId) {
-                DB::table('admissions')->where('id', $admissionId)->update([
-                    'payment_status' => 'paid',
-                    'fee_status' => 'Paid',
-                    'razorpay_order_id' => $req->razorpay_order_id,
-                    'razorpay_payment_id' => $req->razorpay_payment_id,
-                    'paid_at' => now(),
-                    'updated_at' => now(),
-                ]);
-            }
-
+            // Fee paid / paid_at / receipt / razorpay ids on the application
+            // and admission are projected from payments (markOnlinePaid below).
             DB::table('student_applications')->where('id', $sa->id)->update([
-                'fee_paid' => true,
-                'paid_at' => now(),
-                'payment_ref' => $req->razorpay_payment_id,
-                'fee_receipt_id' => $r->id,
                 'fee_ref_id' => $feeRefId,
                 // status stays 'approved' — approval already happened
                 // before payment was even possible, see approve().
                 'updated_at' => now(),
             ]);
+            \App\Support\Payments::markOnlinePaid((int) $payment->id, (string) $req->razorpay_payment_id, (string) $req->razorpay_signature,
+                (float) $fee['total'], (int) $r->id, $r->receipt_no, ['admission_id' => $admissionId, 'student_id' => $sa->student_id]);
 
             return $r;
         });
@@ -2589,11 +2688,12 @@ class ApplicationController extends Controller
         if ($sa instanceof \Illuminate\Http\JsonResponse)
             return $sa;
 
-        if (!$sa->fee_receipt_id) {
+        $saFeeReceiptId = \App\Support\Payments::applicationFeeReceiptId((int) $sa->id);
+        if (!$saFeeReceiptId) {
             return response()->json(['message' => 'No receipt available yet.'], 404);
         }
 
-        $receipt = FeeReceipt::find($sa->fee_receipt_id);
+        $receipt = FeeReceipt::find($saFeeReceiptId);
         if (!$receipt) {
             return response()->json(['message' => 'Receipt not found.'], 404);
         }
@@ -2613,6 +2713,7 @@ class ApplicationController extends Controller
     /** POST /college/applications/{id}/pay/failed (office) */
     public function applicationPayFailed($id)
     {
+        \App\Support\Payments::failOpenOrders('student_application_id', (int) $id);
         Log::info("Education fee payment reported failed/abandoned for application {$id}.");
         return response()->json(['message' => 'Payment marked as failed. You can retry.']);
     }
@@ -2620,6 +2721,10 @@ class ApplicationController extends Controller
     /** POST /student/applications/{id}/pay/failed (student) */
     public function studentApplicationPayFailed(Request $req, $id)
     {
+        $sa = $this->ownedStudentApp($req, $id);
+        if ($sa instanceof \Illuminate\Http\JsonResponse)
+            return $sa;
+        \App\Support\Payments::failOpenOrders('student_application_id', (int) $sa->id);
         Log::info("Education fee payment reported failed/abandoned for application {$id} by student {$req->user()->id}.");
         return response()->json(['message' => 'Payment marked as failed. You can retry.']);
     }
@@ -2656,7 +2761,7 @@ class ApplicationController extends Controller
         if ($sa->application_type !== 'back_paper') {
             return response()->json(['message' => 'Not a back paper application.'], 422);
         }
-        if ($sa->fee_paid) {
+        if (\App\Support\Payments::applicationFeePaid((int) $sa->id)) {
             return response()->json(['message' => 'Fee already paid — papers can no longer be changed.'], 422);
         }
 
@@ -2717,7 +2822,7 @@ class ApplicationController extends Controller
 
     private function doBackPaperPayInitiate(object $sa)
     {
-        if ($sa->fee_paid) {
+        if (\App\Support\Payments::applicationFeePaid((int) $sa->id)) {
             return response()->json(['message' => 'Fee already paid.'], 409);
         }
         if (!$sa->fee_amount || (float) $sa->fee_amount <= 0) {
@@ -2761,10 +2866,7 @@ class ApplicationController extends Controller
 
         $order = $resp->json();
 
-        DB::table('student_applications')->where('id', $sa->id)->update([
-            'razorpay_order_id' => $order['id'],
-            'updated_at' => now(),
-        ]);
+        \App\Support\Payments::openOrder(\App\Support\Payments::forApplication($sa), (float) $sa->fee_amount, $order['id']);
 
         return response()->json([
             'order_id' => $order['id'],
@@ -2813,12 +2915,29 @@ class ApplicationController extends Controller
         if (!$secret || !hash_equals($expected, $req->razorpay_signature)) {
             return response()->json(['message' => 'Payment could not be verified.'], 422);
         }
+        // The signature only proves *a* payment happened — make sure it is
+        // the order created for THIS application (no replaying a cheaper
+        // order, e.g. a registration fee, against the education fee).
+        $payment = \App\Support\Payments::orderFor(
+            (string) $req->razorpay_order_id, 'student_application_id', (int) $sa->id,
+            null, // legacy-column order-id adoption is dead — payments has covered this window for a long time
+            \App\Support\Payments::forApplication($sa), (float) ($sa->fee_amount ?? 0)
+        );
+        if (!$payment || $payment->status === 'paid') {
+            return response()->json(['message' => $payment ? 'This payment is already recorded.' : 'This payment does not belong to this application.'], $payment ? 409 : 422);
+        }
+        if (\App\Support\Payments::applicationFeePaid((int) $sa->id)) {
+            return response()->json(['message' => 'Back paper fee already paid.'], 409);
+        }
 
-        $admission = DB::table('admissions')
-            ->where('student_id', $sa->student_id)
-            ->where('program_id', $sa->program_id)
-            ->orderByDesc('id')
-            ->first();
+        // Back paper is for an existing student: never match on a null id.
+        $admission = !empty($sa->student_id)
+            ? DB::table('admissions')
+                ->where('student_id', $sa->student_id)
+                ->where('program_id', $sa->program_id)
+                ->orderByDesc('id')
+                ->first()
+            : null;
 
         if (!$admission) {
             return response()->json(['message' => 'No admission record found for this student/program — cannot generate a fee receipt.'], 422);
@@ -2871,13 +2990,11 @@ class ApplicationController extends Controller
         GenerateFeeReceiptPdf::dispatch($receipt->id);
 
         DB::table('student_applications')->where('id', $sa->id)->update([
-            'fee_paid' => true,
-            'paid_at' => now(),
-            'payment_ref' => $req->razorpay_payment_id,
-            'fee_receipt_id' => $receipt->id,
-            'status' => 'submitted',
+            'status' => 'submitted', // paying submits a back paper; fee fields come from payments
             'updated_at' => now(),
         ]);
+        \App\Support\Payments::markOnlinePaid((int) $payment->id, (string) $req->razorpay_payment_id, (string) $req->razorpay_signature,
+            (float) $fee['total'], (int) $receipt->id, $receipt->receipt_no, ['admission_id' => $admission->id, 'student_id' => $sa->student_id]);
 
         return response()->json([
             'message' => 'Payment successful.',
@@ -2890,6 +3007,7 @@ class ApplicationController extends Controller
     /** POST /college/applications/{id}/back-paper/pay/failed (office) */
     public function backPaperPayFailed($id)
     {
+        \App\Support\Payments::failOpenOrders('student_application_id', (int) $id);
         Log::info("Back paper payment reported failed/abandoned for application {$id}.");
         return response()->json(['message' => 'Payment marked as failed. You can retry.']);
     }
@@ -2926,7 +3044,7 @@ class ApplicationController extends Controller
 
     private function doPrintBackPaperForm(object $sa)
     {
-        if (!$sa->fee_paid) {
+        if (!\App\Support\Payments::applicationFeePaid((int) $sa->id)) {
             return response()->json(['message' => 'Print is available only after the fee is paid.'], 422);
         }
 
@@ -2943,6 +3061,13 @@ class ApplicationController extends Controller
             ->whereIn('id', $paperIds)
             ->orderBy('name')
             ->get();
+
+        // Already guarded as paid above; fee_paid/payment_ref are gone
+        // from student_applications (Phase 4) — the Blade view still reads
+        // them off $sa, so patch them on from the paid payment row.
+        $saPaidPayment = \App\Support\Payments::paidApplicationPayment((int) $sa->id);
+        $sa->fee_paid = (bool) $saPaidPayment;
+        $sa->payment_ref = $saPaidPayment->gateway_payment_id ?? ($saPaidPayment->instrument_no ?? null);
 
         try {
             $pdf = Pdf::loadView('pdf.back-paper-form', compact('sa', 'student', 'program', 'org', 'admission', 'papers'))->setPaper('a4');
@@ -3012,11 +3137,12 @@ class ApplicationController extends Controller
         if ($sa instanceof \Illuminate\Http\JsonResponse)
             return $sa;
 
-        if (!$sa->fee_receipt_id) {
+        $saFeeReceiptId = \App\Support\Payments::applicationFeeReceiptId((int) $sa->id);
+        if (!$saFeeReceiptId) {
             return response()->json(['message' => 'No fee receipt has been generated yet.'], 404);
         }
 
-        $receipt = DB::table('fee_receipts')->where('id', $sa->fee_receipt_id)->first();
+        $receipt = DB::table('fee_receipts')->where('id', $saFeeReceiptId)->first();
         if (!$receipt)
             return response()->json(['message' => 'Fee receipt not found.'], 404);
 
@@ -3048,12 +3174,20 @@ class ApplicationController extends Controller
             ->select('student_application_id', DB::raw('MAX(id) as decision_id'))
             ->groupBy('student_application_id');
 
+        $paidAppFee = DB::table('payments')
+            ->select('student_application_id', DB::raw('MAX(id) as id'))
+            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])
+            ->where('status', 'paid')
+            ->groupBy('student_application_id');
+
         $apps = DB::table('student_applications as sa')
             ->join('programs as p', 'p.id', 'sa.program_id')
             ->leftJoin('direct_registrations as dr', 'dr.id', 'sa.direct_registration_id')
             ->leftJoinSub($latestDecisionIds, 'ld', 'ld.student_application_id', 'sa.id')
             ->leftJoin('rejected_applications as ra', 'ra.id', 'ld.decision_id')
-            ->leftJoin('fee_receipts as fr', 'fr.id', 'sa.fee_receipt_id')
+            ->leftJoinSub($paidAppFee, 'sapay', 'sapay.student_application_id', 'sa.id')
+            ->leftJoin('payments as pay', 'pay.id', 'sapay.id')
+            ->leftJoin('fee_receipts as fr', 'fr.id', 'pay.fee_receipt_id')
             ->where(function ($q) use ($userId) {
                 $q->where('sa.user_id', $userId)
                     ->orWhere('dr.user_id', $userId);
@@ -3079,8 +3213,8 @@ class ApplicationController extends Controller
                 'dr.unique_code as code',
                 'dr.registration_no',
                 'fr.receipt_no as fee_receipt_no',
-                'sa.fee_paid',
-                'sa.paid_at',
+                DB::raw('(sapay.id is not null) as fee_paid'),
+                'pay.paid_at as paid_at',
             ])
             ->orderByDesc('sa.created_at')
             ->get()

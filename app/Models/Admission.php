@@ -56,11 +56,6 @@ class Admission extends Model
         return $this->hasMany(FeeReceipt::class);
     }
 
-    public function semesterRegistrations(): HasMany
-    {
-        return $this->hasMany(SemesterRegistration::class);
-    }
-
     public static function generateAdmissionNo(int $orgId, string $academicYear): string
     {
         $year = str_replace('-', '', $academicYear);

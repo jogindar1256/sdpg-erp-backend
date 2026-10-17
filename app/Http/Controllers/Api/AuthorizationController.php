@@ -29,6 +29,12 @@ class AuthorizationController extends Controller
         // below), so nothing regular could have been showing up here at all.
         // drc (direct_registrations via sa.direct_registration_id) is the
         // fallback identity source for exactly that case, same as index().
+        $paidPayment = DB::table('payments')
+            ->select('student_application_id', DB::raw('MAX(id) as id'))
+            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])
+            ->where('status', 'paid')
+            ->groupBy('student_application_id');
+
         $q = DB::table('student_applications as sa')
             ->leftJoin('students as s', 's.id', '=', 'sa.student_id')
             ->join('programs as p', 'p.id', '=', 'sa.program_id')
@@ -36,7 +42,9 @@ class AuthorizationController extends Controller
             ->leftJoin('direct_registrations as dr', 'dr.id', 'lr.reg_id')
             ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
             ->leftJoin('admissions as a', 'a.application_id', '=', 'sa.id')
-            ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'sa.fee_receipt_id')
+            ->leftJoinSub($paidPayment, 'pp', 'pp.student_application_id', '=', 'sa.id')
+            ->leftJoin('payments as pay', 'pay.id', '=', 'pp.id')
+            ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'pay.fee_receipt_id')
             ->whereIn('sa.application_type', $types)
             ->whereNull('sa.deleted_at')
             ->select(
@@ -46,7 +54,7 @@ class AuthorizationController extends Controller
                 'sa.academic_year as session',
                 'sa.semester_no',
                 'sa.status',
-                'sa.fee_paid',
+                DB::raw('(pay.id is not null) as fee_paid'),
                 'sa.created_at',
                 's.personal_info->first_name as first_name',
                 's.personal_info->middle_name as middle_name',
@@ -67,7 +75,7 @@ class AuthorizationController extends Controller
                 'a.status as admission_status',
                 DB::raw('COALESCE(fr.net_amount, 0) as paid_fee'),
                 DB::raw("COALESCE(fr.transaction_id, '') as utr_no"),
-                DB::raw("CASE WHEN sa.fee_paid THEN 'Paid' ELSE 'Pending' END as fee_status")
+                DB::raw("CASE WHEN pay.id IS NOT NULL THEN 'Paid' ELSE 'Pending' END as fee_status")
             );
 
         if ($s = $request->input('session'))
@@ -133,9 +141,9 @@ class AuthorizationController extends Controller
             ->reorder()
             ->select(DB::raw("
                 COUNT(*) as total,
-                SUM(CASE WHEN sa.status IN ('submitted','under_review') THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN sa.status = 'approved' THEN 1 ELSE 0 END) as approved,
-                SUM(CASE WHEN sa.status = 'rejected' THEN 1 ELSE 0 END) as rejected
+                COALESCE(SUM(CASE WHEN sa.status IN ('submitted','under_review') THEN 1 ELSE 0 END), 0) as pending,
+                COALESCE(SUM(CASE WHEN sa.status = 'approved' THEN 1 ELSE 0 END), 0) as approved,
+                COALESCE(SUM(CASE WHEN sa.status = 'rejected' THEN 1 ELSE 0 END), 0) as rejected
             "))->first();
 
         $records = $q->orderByDesc('sa.created_at')
@@ -304,13 +312,14 @@ class AuthorizationController extends Controller
             if (!$app)
                 return response()->json(['message' => 'Application not found.'], 404);
 
-            if ($app->status === 'approved' && $app->fee_paid) {
+            $appFeePaid = \App\Support\Payments::applicationFeePaid((int) $app->id);
+            if ($app->status === 'approved' && $appFeePaid) {
                 return response()->json([
                     'message' => 'This application is already approved and the fee is paid — it cannot be moved back. Only Cancel or Hold is allowed.',
                 ], 422);
             }
 
-            $newStatus = $app->fee_paid ? 'under_review' : 'submitted';
+            $newStatus = $appFeePaid ? 'under_review' : 'submitted';
 
             DB::table('student_applications')->where('id', $applicationId)->update([
                 'status' => $newStatus,
@@ -352,9 +361,9 @@ class AuthorizationController extends Controller
             ->reorder()
             ->select(DB::raw("
                 COUNT(*) as total,
-                SUM(CASE WHEN sa.status IN ('submitted','under_review') THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN sa.status = 'approved' THEN 1 ELSE 0 END) as approved,
-                SUM(CASE WHEN sa.status = 'rejected' THEN 1 ELSE 0 END) as rejected
+                COALESCE(SUM(CASE WHEN sa.status IN ('submitted','under_review') THEN 1 ELSE 0 END), 0) as pending,
+                COALESCE(SUM(CASE WHEN sa.status = 'approved' THEN 1 ELSE 0 END), 0) as approved,
+                COALESCE(SUM(CASE WHEN sa.status = 'rejected' THEN 1 ELSE 0 END), 0) as rejected
             "))->first();
 
         $records = $q->orderByDesc('sa.created_at')->paginate($request->input('per_page', 20));

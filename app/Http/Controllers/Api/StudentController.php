@@ -52,7 +52,6 @@ class StudentController extends Controller
     {
         $student->load([
             'currentAdmission.program',
-            'documents',
             'feeReceipts' => fn($q) => $q->latest()->take(5),
         ]);
 
@@ -70,6 +69,12 @@ class StudentController extends Controller
      * exist at all (Call to undefined method), which is why every load of
      * this card silently failed.
      */
+    // GET /student/education-history — semesters and back papers paid for.
+    public function myEducationHistory(Request $request): JsonResponse
+    {
+        return response()->json(['data' => \App\Support\StudentSemesters::history($request->user())]);
+    }
+
     public function myProfile(Request $request): JsonResponse
     {
         $userId = $request->user()->id;
@@ -103,8 +108,9 @@ class StudentController extends Controller
         }
 
         $program = DB::table('programs')->where('id', $app->program_id ?? $registration->program_id ?? 0)->first();
-        $receipt = !empty($app->fee_receipt_id)
-            ? DB::table('fee_receipts')->where('id', $app->fee_receipt_id)->first()
+        $appReceiptId = $app ? \App\Support\Payments::applicationFeeReceiptId((int) $app->id) : null;
+        $receipt = $appReceiptId
+            ? DB::table('fee_receipts')->where('id', $appReceiptId)->first()
             : null;
 
         // Photo: students table first, else the Part 7 upload.

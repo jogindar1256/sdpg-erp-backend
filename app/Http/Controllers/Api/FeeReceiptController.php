@@ -64,6 +64,13 @@ class FeeReceiptController extends Controller
     {
         $this->authorize('verify-fee-receipts');
 
+        if ($feeReceipt->status === 'cancelled') {
+            return response()->json(['message' => 'This receipt is cancelled.'], 422);
+        }
+        if ($feeReceipt->is_verified) {
+            return response()->json(['message' => 'Receipt already verified.'], 409);
+        }
+
         $feeReceipt->update([
             'is_verified' => true,
             'verified_by' => $request->user()->id,
@@ -89,16 +96,30 @@ class FeeReceiptController extends Controller
     {
         $request->validate(['cancel_reason' => 'required|string|max:500']);
 
-        if ($feeReceipt->status !== 'active') {
-            return response()->json(['message' => 'This receipt is already cancelled.'], 422);
-        }
+        [$code, $msg] = \App\Support\ReceiptCancellation::cancel(
+            (int) $feeReceipt->id,
+            $request->cancel_reason,
+            $request->user()?->id
+        );
 
-        $feeReceipt->update([
-            'status' => 'cancelled',
-            'cancel_reason' => $request->cancel_reason,
+        return response()->json(['message' => $msg], $code);
+    }
+
+    // POST /fee-receipts/{id}/refund — record the refund of a cancelled receipt.
+    public function markRefunded(Request $request, int $id): JsonResponse
+    {
+        $request->validate([
+            'refund_ref' => 'required|string|max:100',
+            'refund_remarks' => 'nullable|string|max:500',
         ]);
+        [$code, $msg] = \App\Support\ReceiptCancellation::markRefunded(
+            $id,
+            $request->refund_ref,
+            $request->refund_remarks,
+            $request->user()?->id
+        );
 
-        return response()->json(['message' => 'Receipt cancelled.']);
+        return response()->json(['message' => $msg], $code);
     }
 
     public function financialSummary(Request $request): JsonResponse
@@ -112,14 +133,14 @@ class FeeReceiptController extends Controller
 
         return response()->json([
             'total_collection' => $query->sum('net_amount'),
-            'by_type' => $query->selectRaw('receipt_type, sum(net_amount) as total')
+            'by_type' => (clone $query)->selectRaw('receipt_type, sum(net_amount) as total')
                 ->groupBy('receipt_type')
                 ->pluck('total', 'receipt_type'),
-            'by_month' => $query->selectRaw("to_char(receipt_date, 'YYYY-MM') as month, sum(net_amount) as total")
+            'by_month' => (clone $query)->selectRaw("to_char(receipt_date, 'YYYY-MM') as month, sum(net_amount) as total")
                 ->groupBy('month')
                 ->orderBy('month')
                 ->pluck('total', 'month'),
-            'by_payment_mode' => $query->selectRaw('payment_mode, count(*) as count, sum(net_amount) as total')
+            'by_payment_mode' => (clone $query)->selectRaw('payment_mode, count(*) as count, sum(net_amount) as total')
                 ->groupBy('payment_mode')
                 ->get(),
         ]);
