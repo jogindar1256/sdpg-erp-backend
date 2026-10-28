@@ -45,7 +45,15 @@ class AdmissionNumberService
             . $this->courseCode($program)
             . $this->categoryCode($category);
 
-        return $prefix . $this->nextSerial('students', 'student_uid', $prefix, 4);
+        // A first-time applicant's ID is reserved on student_applications at fee
+        // payment, before any students row exists — count both so two
+        // applicants can never be handed the same number.
+        $serial = max(
+            $this->maxSerial('students', 'student_uid', $prefix, 4),
+            $this->maxSerial('student_applications', 'student_uid', $prefix, 4)
+        ) + 1;
+
+        return $prefix . str_pad((string) $serial, 4, '0', STR_PAD_LEFT);
     }
 
     // ── 2. Fee Receipt No ──────────────────────────────────────────────────
@@ -182,15 +190,18 @@ class AdmissionNumberService
      * Next zero-padded serial of length $len whose full value starts with
      * $prefix and has exactly (prefix + len) characters.
      */
-    private function nextSerial(string $table, string $col, string $prefix, int $len): string
+    private function maxSerial(string $table, string $col, string $prefix, int $len): int
     {
         $total = strlen($prefix) + $len;
 
-        $max = DB::table($table)
+        return (int) DB::table($table)
             ->where($col, 'like', $prefix . '%')
             ->whereRaw("length($col) = ?", [$total])
             ->max(DB::raw("CAST(substring($col FROM " . (strlen($prefix) + 1) . ") AS INTEGER)"));
+    }
 
-        return str_pad(((int) $max) + 1, $len, '0', STR_PAD_LEFT);
+    private function nextSerial(string $table, string $col, string $prefix, int $len): string
+    {
+        return str_pad((string) ($this->maxSerial($table, $col, $prefix, $len) + 1), $len, '0', STR_PAD_LEFT);
     }
 }

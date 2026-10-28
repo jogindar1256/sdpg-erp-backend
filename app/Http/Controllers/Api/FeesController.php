@@ -72,6 +72,7 @@ class FeesController extends Controller
                 'dr.name as reg_name', 'dr.father_name',
                 'p.short_name as class_name', 'fr.semester_no',
                 'fr.admission_id', 'adm.admission_no',
+                DB::raw('COALESCE(s.student_uid, sa.student_uid) as student_uid'),
                 DB::raw('(SELECT name FROM users WHERE id = fr.generated_by LIMIT 1) as issued_by'),
             ]);
 
@@ -137,6 +138,117 @@ class FeesController extends Controller
             'summary' => $summary,
             'classes' => DB::table('programs')->where('is_active', true)->whereNull('deleted_at')->select('id', 'short_name as name')->orderBy('short_name')->get(),
         ]);
+    }
+
+    // ─── Final Fee Receipt: GET/POST /fees/generate, GET /fees/generate/{id}/pdf ──
+    // Lists the education-fee receipts already PAID (Applications → Edu. Fee →
+    // Pay) for a type; Generate renders the "Final Fee Receipt" PDF.
+    private const GENERATE_TYPES = ['regular_admission', 'back_paper', 'semester_upgrade'];
+
+    public function generateIndex(Request $request): JsonResponse
+    {
+        $type = in_array($request->type, self::GENERATE_TYPES, true) ? $request->type : 'regular_admission';
+
+        $rows = DB::table('fee_receipts as fr')
+            ->leftJoin('admissions as a', 'a.id', '=', 'fr.admission_id')
+            ->leftJoin('student_applications as sa', 'sa.id', '=', 'a.application_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', '=', 'a.direct_registration_id')
+            ->leftJoin('students as s', 's.id', '=', 'fr.student_id')
+            ->leftJoin('programs as p', 'p.id', '=', 'a.program_id')
+            ->whereNull('fr.deleted_at')
+            ->where('fr.status', '!=', 'cancelled')
+            ->where('fr.receipt_type', $type)
+            ->when($request->session_year, fn($q, $v) => $q->where('fr.academic_year', $v))
+            ->when($request->program_id, fn($q, $v) => $q->where('a.program_id', $v))
+            ->when($request->search, function ($q, $v) {
+                $q->where(function ($w) use ($v) {
+                    $w->where('dr.name', 'ilike', "%{$v}%")
+                        ->orWhere('fr.receipt_no', 'ilike', "%{$v}%")
+                        ->orWhere('sa.application_no', 'ilike', "%{$v}%")
+                        ->orWhere('a.admission_no', 'ilike', "%{$v}%")
+                        ->orWhere('sa.student_uid', 'ilike', "%{$v}%")
+                        ->orWhere('dr.mobile', 'ilike', "%{$v}%");
+                });
+            })
+            ->orderByDesc('fr.id')
+            ->limit(500)
+            ->get([
+                'fr.id', 'fr.receipt_no', 'fr.semester_no', 'fr.net_amount', 'fr.receipt_date',
+                'fr.final_receipt_generated_at',
+                'a.admission_no', 'sa.application_no', 'sa.student_uid as app_student_uid',
+                's.student_uid as student_student_uid', 's.university_roll_no',
+                'dr.name as reg_name', 's.personal_info as s_info',
+                'p.id as program_id', 'p.short_name', 'p.full_name', 'p.samarth_code', 'p.level',
+            ])
+            ->map(function ($r) {
+                $info = is_string($r->s_info) ? (json_decode($r->s_info, true) ?: []) : [];
+                $name = $r->reg_name ?: trim(implode(' ', array_filter([$info['first_name'] ?? null, $info['middle_name'] ?? null, $info['last_name'] ?? null])));
+                return [
+                    'id' => $r->id,
+                    'receipt_no' => $r->receipt_no,
+                    'student' => ['name' => $name ?: null],
+                    'roll_no' => $r->university_roll_no,
+                    'student_uid' => $r->student_student_uid ?: $r->app_student_uid,
+                    'application_no' => $r->application_no,
+                    'admission_no' => $r->admission_no,
+                    'program' => ['id' => $r->program_id, 'short_name' => $r->short_name, 'full_name' => $r->full_name, 'samarth_code' => $r->samarth_code, 'level' => $r->level],
+                    'semester' => $r->semester_no ?: 1,
+                    'fee_amount' => (float) $r->net_amount,
+                    'receipt_date' => $r->receipt_date,
+                    'receipt_generated' => !empty($r->final_receipt_generated_at),
+                ];
+            });
+
+        return response()->json(['data' => $rows, 'total' => $rows->count()]);
+    }
+
+    /** POST /fees/generate {type, receipt_ids[]} — render the PDFs. */
+    public function generateStore(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'receipt_ids' => 'required|array|min:1|max:200',
+            'receipt_ids.*' => 'integer',
+        ]);
+
+        $svc = app(\App\Services\FinalFeeReceiptService::class);
+        $ok = 0;
+        $failed = [];
+        foreach (\App\Models\FeeReceipt::whereIn('id', $data['receipt_ids'])->get() as $receipt) {
+            try {
+                $svc->generate($receipt, $request->user()?->id);
+                $ok++;
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::error("Final fee receipt failed for receipt {$receipt->id}: " . $e->getMessage());
+                $failed[] = $receipt->receipt_no;
+            }
+        }
+
+        return response()->json([
+            'count' => $ok,
+            'failed' => $failed,
+            'message' => $failed ? "Generated {$ok}; failed: " . implode(', ', $failed) : "Generated {$ok} receipt(s).",
+        ], $ok ? 200 : 500);
+    }
+
+    /** GET /fees/generate/{id}/pdf — download final-fee-receipt-[receipt_no].pdf (renders it if needed). */
+    public function generatePdf(Request $request, int $id)
+    {
+        $receipt = \App\Models\FeeReceipt::find($id);
+        if (!$receipt) {
+            return response()->json(['message' => 'Receipt not found.'], 404);
+        }
+        $svc = app(\App\Services\FinalFeeReceiptService::class);
+        if (!$receipt->final_receipt_path || !\Illuminate\Support\Facades\Storage::exists($receipt->final_receipt_path)) {
+            try {
+                $svc->generate($receipt, $request->user()?->id);
+                $receipt->refresh();
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::error("Final fee receipt failed for receipt {$receipt->id}: " . $e->getMessage());
+                return response()->json(['message' => 'Could not generate the receipt PDF.'], 500);
+            }
+        }
+
+        return \Illuminate\Support\Facades\Storage::download($receipt->final_receipt_path, \App\Services\FinalFeeReceiptService::fileName($receipt), ['Content-Type' => 'application/pdf']);
     }
 
     // ─── Verify Fee Receipts: GET /fees/verify ───────────────────────────────────
@@ -256,22 +368,46 @@ class FeesController extends Controller
         }
 
         if ($act === 'verify') {
-            DB::table('fee_receipts')->where('id', $id)->update([
-                'is_verified' => true,
-                'verified_by' => Auth::id(),
-                'verified_at' => now(),
-                'updated_at'  => now(),
-            ]);
-
-            // Verifying the receipt is what turns a first-time applicant
-            // into a student (students row + active admission).
-            \App\Support\Payments::markVerified($id, Auth::id());
-
             $appId = $receipt->admission_id
                 ? DB::table('admissions')->where('id', $receipt->admission_id)->value('application_id')
                 : null;
-            if ($appId) {
-                app(ApplicationController::class)->finalizeAdmissionAfterReceipt((int) $appId, (int) Auth::id());
+
+            try {
+                DB::transaction(function () use ($id, $appId) {
+                    DB::table('fee_receipts')->where('id', $id)->update([
+                        'is_verified' => true,
+                        'verified_by' => Auth::id(),
+                        'verified_at' => now(),
+                        'updated_at'  => now(),
+                    ]);
+                    \App\Support\Payments::markVerified($id, Auth::id());
+
+                    // Verifying the receipt is what turns a first-time applicant into a
+                    // student: the students row is created and the admission becomes
+                    // active (linked to that student) for exams, ledgers and the rest.
+                    if ($appId) {
+                        app(ApplicationController::class)->finalizeAdmissionAfterReceipt((int) $appId, (int) Auth::id());
+
+                        $app = DB::table('student_applications')->where('id', $appId)->first();
+                        $mustBeStudent = $app
+                            && $app->status === 'approved'
+                            && \App\Support\Payments::applicationFeePaid((int) $appId);
+                        $admStudent = DB::table('admissions')->where('application_id', $appId)->orderByDesc('id')->value('student_id');
+                        if ($mustBeStudent && !$admStudent) {
+                            throw new \RuntimeException('student_not_created');
+                        }
+                    }
+                });
+            } catch (\RuntimeException $e) {
+                if ($e->getMessage() !== 'student_not_created') throw $e;
+                return response()->json([
+                    'message' => 'Could not create the student record, so the receipt was NOT verified: ' . (ApplicationController::$lastStudentError ?? 'unknown reason — see the server log') . '.',
+                ], 422);
+            }
+            // The verified admission now shows up for the examination office
+            // (Accept Exam Form) — best effort, never blocks verification.
+            if ($receipt->admission_id) {
+                \App\Support\ExamFormSeeder::ensureForAdmission((int) $receipt->admission_id);
             }
             $status = 'Verified';
         } else {

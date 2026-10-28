@@ -28,6 +28,26 @@ class AdmissionController extends Controller
             $query->where('admission_type', $request->admission_type);
         if ($request->filled('is_verified'))
             $query->where('is_verified', $request->boolean('is_verified'));
+        // Manage Admission pipeline cards — "Paid Fee" and "Student ID
+        // Generated" aren't single status values, so they need their own
+        // filter flags rather than reusing `status` (office instruction,
+        // 2026-10-26 notebook batch). Same definitions as pipelineSummary().
+        if ($request->boolean('fee_paid')) {
+            $query->whereExists(function ($q) {
+                $q->select(DB::raw(1))->from('payments')
+                    ->whereColumn('payments.student_application_id', 'admissions.application_id')
+                    ->whereIn('payments.purpose', ['admission', 'semester_upgrade', 'back_paper'])
+                    ->where('payments.status', 'paid');
+            });
+        }
+        if ($request->boolean('student_id_generated')) {
+            $query->whereExists(function ($q) {
+                $q->select(DB::raw(1))->from('students')
+                    ->whereColumn('students.id', 'admissions.student_id')
+                    ->whereNotNull('students.student_uid')
+                    ->where('students.student_uid', '!=', '');
+            });
+        }
         if ($request->filled('search')) {
             $q = $request->search;
             // Grouped, so the OR branches stay inside this college's rows.

@@ -1591,7 +1591,10 @@ class MasterSettingsController extends Controller
             ->when($req->query('semester_no'), fn ($q) => $q->where('semester_no', $req->query('semester_no')))
             ->when($req->query('session_year'), fn ($q) => $q->where('session_year', $req->query('session_year')))
             ->orderBy('group_no')->orderBy('paper_name')
-            ->get(['id', 'paper_code', 'paper_name', 'group_no', 'group_name']);
+            ->get(array_merge(
+                ['id', 'paper_code', 'paper_name', 'group_no', 'group_name', 'max_select', 'min_select'],
+                \Illuminate\Support\Facades\Schema::hasColumn('vocational_papers', 'credits') ? ['credits'] : []
+            ));
 
         return response()->json(['papers' => $papers]);
     }
@@ -1623,6 +1626,7 @@ class MasterSettingsController extends Controller
             'papers' => 'required|array|min:1',
             'papers.*.paper_code' => 'required|string|max:50',
             'papers.*.paper_name' => 'required|string',
+            'papers.*.credits' => 'nullable|integer|min:0|max:99',
             'papers.*.max_marks' => 'nullable|integer|min:1',
             'papers.*.min_marks' => 'nullable|integer|min:0',
         ]);
@@ -1641,6 +1645,7 @@ class MasterSettingsController extends Controller
                 'min_select' => $req->min_select ?? 1,
                 'paper_code' => $p['paper_code'],
                 'paper_name' => $p['paper_name'],
+                'credits' => isset($p['credits']) && $p['credits'] !== '' ? (int) $p['credits'] : null,
                 'max_marks' => $p['max_marks'] ?? 100,
                 'min_marks' => $p['min_marks'] ?? 33,
                 'created_at' => now(),
@@ -1660,6 +1665,7 @@ class MasterSettingsController extends Controller
             'min_select' => 'nullable|integer|min:0',
             'paper_code' => 'nullable|string',
             'paper_name' => 'required|string',
+            'credits' => 'nullable|integer|min:0|max:99',
             'max_marks' => 'nullable|integer',
             'min_marks' => 'nullable|integer',
         ]);
@@ -1669,6 +1675,7 @@ class MasterSettingsController extends Controller
         DB::table('vocational_papers')->where('id', $id)->update([
             'paper_code' => $req->paper_code,
             'paper_name' => $req->paper_name,
+            'credits' => $req->filled('credits') ? (int) $req->credits : null,
             'max_marks' => $req->max_marks ?? 100,
             'min_marks' => $req->min_marks ?? 33,
             'updated_at' => now(),
@@ -1882,7 +1889,7 @@ class MasterSettingsController extends Controller
             'mother_name' => 'required|string|max:255',
             'gender' => 'required|in:Male,Female,Transgender',
             'social_category' => 'required|in:General,OBC,SC,ST,EWS',
-            'admission_category' => 'required|in:General,OBC,SC,ST,EWS,PH/PwD',
+            'admission_category' => 'required|in:General,OBC,SC,ST,H.C.,Freedom Fighter,EWS',
             'admission_type' => 'required|in:Regular,Private',
             'state_rank' => 'required|integer',
             'category_rank' => 'nullable|integer',

@@ -193,9 +193,32 @@ class AuthorizationController extends Controller
             ->select('a.*')
             ->first();
 
+        // The next 10 waiting, oldest first — one light query (no per-row card build).
+        $list = $this->pendingAdmissionQueue($request)
+            ->leftJoin('student_applications as sa', 'sa.id', '=', 'a.application_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', '=', 'a.direct_registration_id')
+            ->leftJoin('programs as pr', 'pr.id', '=', 'a.program_id')
+            ->orderBy('a.updated_at')
+            ->orderBy('a.id')
+            ->limit(10)
+            ->get([
+                'a.id as admission_id', 'a.admission_no', 'a.semester_no', 'a.created_at',
+                'sa.application_no', 'sa.declaration_at', 'dr.name', 'pr.short_name as course',
+            ])
+            ->map(fn($r) => [
+                'admission_id' => $r->admission_id,
+                'admission_no' => $r->admission_no,
+                'application_no' => $r->application_no,
+                'name' => $r->name,
+                'course' => $r->course,
+                'semester_no' => $r->semester_no,
+                'submitted_at' => $r->declaration_at ?? $r->created_at,
+            ])->values();
+
         return response()->json([
             'pending_count' => $pending,
             'record' => $admission ? app(ApplicationController::class)->verificationCardData($admission) : null,
+            'list' => $list,
         ]);
     }
 

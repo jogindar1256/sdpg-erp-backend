@@ -50,7 +50,8 @@
             <thead>
                 <tr>
                     <th style="width:20%">Paper Code</th>
-                    <th style="width:50%">Name of Minor Paper</th>
+                    <th style="width:40%">Name of Minor Paper</th>
+                    <th style="width:10%">Credits</th>
                     <th style="width:15%">Max</th>
                     <th style="width:15%">Min</th>
                 </tr>
@@ -60,6 +61,7 @@
                     <tr>
                         <td>{{ $p->paper_code }}</td>
                         <td>{{ $p->paper_name }}</td>
+                        <td>{{ $p->credits ?? '-' }}</td>
                         <td>{{ $p->max_marks }}</td>
                         <td>{{ $p->min_marks }}</td>
                     </tr>

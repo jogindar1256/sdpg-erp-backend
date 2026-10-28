@@ -72,6 +72,7 @@ class StudentRegistrationController extends Controller
             'family_id' => 'nullable|string|max:50', // optional — not every applicant has one issued yet
             'eligibility_class' => 'nullable|in:' . implode(',', self::eligibilityFor($req->reg_type)),
             'passing_year' => 'nullable|integer|between:2002,' . now()->year,
+            'marital_status' => 'nullable|in:unmarried,married,widowed',
         ]);
 
         if ($v->fails()) {
@@ -115,11 +116,17 @@ class StudentRegistrationController extends Controller
             'nationality',
             'domestic_state',
             'caste_cert_state',
+            'caste_cert_district',
             'is_divyang',
             'id_proof_type',
             'course_group',
             'stream',
+            'marital_status',
         ]));
+        // Spouse names only apply when married.
+        if ($req->input('marital_status') !== 'married') {
+            $req->merge(['spouse_name_english' => null, 'spouse_name_hindi' => null]);
+        }
 
         if (!Cache::get("pre_phone_verified_{$req->mobile}") || !Cache::get("pre_email_verified_{$req->email}")) {
             return response()->json([
@@ -199,7 +206,10 @@ class StudentRegistrationController extends Controller
         $orgId = $org->id ?? null;
 
         $regNo = $this->generateRegNo($req->session, $req->program_id);
-        $password = strtoupper(Str::random(3)) . rand(100, 999) . Str::lower(Str::random(2));
+        // Initial password = date of birth as DDMMYYYY (student can change it
+        // from the portal). Random only if the DOB is missing/unparseable.
+        $dobTs = $req->dob ? strtotime((string) $req->dob) : false;
+        $password = $dobTs ? date('dmY', $dobTs) : strtoupper(Str::random(3)) . rand(100, 999) . Str::lower(Str::random(2));
         $uniqueCode = $this->generateUniqueCode($regType, $req->program_id, $req->session);
 
         try {
@@ -230,6 +240,7 @@ class StudentRegistrationController extends Controller
                 'father_name_hindi' => $req->father_name_hindi,
                 'mother_name' => $req->mother_name,
                 'mother_name_hindi' => $req->mother_name_hindi,
+                'marital_status' => $req->marital_status ?: null,
                 'spouse_name_english' => $req->spouse_name_english,
                 'spouse_name_hindi' => $req->spouse_name_hindi,
                 'dob' => $req->dob,
@@ -248,6 +259,7 @@ class StudentRegistrationController extends Controller
                 'passing_year' => $req->passing_year,
                 'aadhar_no' => $req->aadhar_no,
                 'caste_cert_state' => $req->caste_cert_state,
+                'caste_cert_district' => $req->caste_cert_district,
                 'eligibility_roll_no' => $req->eligibility_roll_no,
 
                 'email' => $req->email,
@@ -303,7 +315,15 @@ class StudentRegistrationController extends Controller
     // 1b. PRE-REGISTRATION OTP (keyed by mobile/email, before any draft exists)
     //     Used in step 1 so nothing is created until both are verified.
     // ──────────────────────────────────────────────────────────────────────
-    private function findDuplicateIdentity(?string $mobile, ?string $email, ?string $aadhar, ?string $regType, ?string $session): ?string
+    /**
+     * Returns null when the identity is clear, or a structured duplicate
+     * report naming exactly which field(s) matched — the office wants a
+     * popup that says precisely what was found, not a generic message
+     * (office instruction, 2026-10-26 notebook batch).
+     *
+     * @return array{message:string, fields:array<int,string>, detail:string}|null
+     */
+    private function findDuplicateIdentity(?string $mobile, ?string $email, ?string $aadhar, ?string $regType, ?string $session): ?array
     {
         if ($regType && $session) {
             $dup = DB::table('direct_registrations')
@@ -315,10 +335,19 @@ class StudentRegistrationController extends Controller
                         ->when($email, fn($q2) => $q2->orWhere('email', $email))
                         ->when($aadhar, fn($q2) => $q2->orWhere('aadhar_no', $aadhar));
                 })
-                ->exists();
+                ->first();
 
             if ($dup) {
-                return 'A registration already exists with this mobile / email / Aadhaar for this session and course. It must be cancelled by the college office before you can register again.';
+                $fields = [];
+                if ($mobile && $dup->mobile === $mobile) $fields[] = 'Mobile No.';
+                if ($email && $dup->email === $email) $fields[] = 'Email';
+                if ($aadhar && $dup->aadhar_no === $aadhar) $fields[] = 'Aadhaar No.';
+                return [
+                    'message' => 'Duplicate identification not allowed.',
+                    'fields' => $fields,
+                    'detail' => 'A registration already exists with the same ' . implode(' / ', $fields)
+                        . ' for this session and course. It must be cancelled by the college office before you can register again.',
+                ];
             }
         }
 
@@ -346,7 +375,15 @@ class StudentRegistrationController extends Controller
                 ->whereNull('deleted_at')
                 ->exists();
             if ($hasActiveReg) {
-                return 'An account already exists with this mobile number or email. Please login instead of registering again.';
+                $fields = [];
+                if ($mobile && $u->mobile === $mobile) $fields[] = 'Mobile No.';
+                if ($email && $u->email === $email) $fields[] = 'Email';
+                return [
+                    'message' => 'Duplicate identification not allowed.',
+                    'fields' => $fields,
+                    'detail' => 'An account already exists with the same ' . implode(' / ', $fields)
+                        . '. Please login instead of registering again.',
+                ];
             }
         }
 
@@ -367,8 +404,8 @@ class StudentRegistrationController extends Controller
             return response()->json(['message' => $msg, 'errors' => ['mobile' => [$msg]]], 422);
         }
 
-        if ($dupMsg = $this->findDuplicateIdentity($req->mobile, $req->email, $req->aadhar_no, $req->reg_type, $req->session)) {
-            return response()->json(['message' => $dupMsg], 409);
+        if ($dup = $this->findDuplicateIdentity($req->mobile, $req->email, $req->aadhar_no, $req->reg_type, $req->session)) {
+            return response()->json($dup, 409);
         }
 
         $otp = rand(100000, 999999);
@@ -412,8 +449,8 @@ class StudentRegistrationController extends Controller
             'session' => 'nullable|string|max:12',
         ]);
 
-        if ($dupMsg = $this->findDuplicateIdentity($req->mobile, $req->email, $req->aadhar_no, $req->reg_type, $req->session)) {
-            return response()->json(['message' => $dupMsg], 409);
+        if ($dup = $this->findDuplicateIdentity($req->mobile, $req->email, $req->aadhar_no, $req->reg_type, $req->session)) {
+            return response()->json($dup, 409);
         }
 
         $otp = rand(100000, 999999);
@@ -566,6 +603,14 @@ class StudentRegistrationController extends Controller
             'updated_at' => now(),
         ]);
 
+        // Returning SDPGC UG pass-out applying to P.G.: carry the earlier
+        // data + enclosures over (never Part 6). Must never block creation.
+        try {
+            \App\Support\PreviousApplicationSeed::seed((int) $newId);
+        } catch (\Throwable $e) {
+            report($e);
+        }
+
         return response()->json([
             'id' => $newId,
             'application_no' => $appNo,
@@ -617,6 +662,7 @@ class StudentRegistrationController extends Controller
             'father_name_hindi',
             'mother_name',
             'mother_name_hindi',
+            'marital_status',
             'spouse_name_english',
             'spouse_name_hindi',
             'dob',
@@ -624,6 +670,7 @@ class StudentRegistrationController extends Controller
             'id_proof_type',
             'id_proof_no',
             'email',
+            'mobile',
             'aadhar_no',
             'abc_id',
             'ddurn_no',
@@ -636,6 +683,7 @@ class StudentRegistrationController extends Controller
             'caste_cert_no',
             'caste_cert_date',
             'caste_cert_state',
+            'caste_cert_district',
             'passing_year',
             'is_divyang',
             'eligibility_class',
@@ -665,10 +713,12 @@ class StudentRegistrationController extends Controller
             'nationality',
             'domestic_state',
             'caste_cert_state',
+            'caste_cert_district',
             'is_divyang',
             'id_proof_type',
             'course_group',
             'stream',
+            'marital_status',
         ];
 
         // Same validators initiate() runs at creation, applied here only to
@@ -716,6 +766,37 @@ class StudentRegistrationController extends Controller
                 }
             }
         }
+        // A CHANGED email / mobile (student or office edit) must have been verified by OTP.
+        if ($req->has('mobile')) {
+            $newMobile = trim((string) $req->input('mobile'));
+            $curMobile = (string) (DB::table('direct_registrations')->where('id', $id)->value('mobile') ?? '');
+            if ($newMobile !== $curMobile) {
+                if (!preg_match('/^\d{10}$/', $newMobile) || RegistrationInputGuard::mobileError($newMobile)) {
+                    $guardErrors['mobile'] = [RegistrationInputGuard::mobileError($newMobile) ?: 'Enter a valid 10-digit mobile number.'];
+                } elseif (!Cache::get("pre_phone_verified_{$newMobile}")) {
+                    $guardErrors['mobile'] = ['Verify the new mobile number with OTP.'];
+                } else {
+                    $ownUserId = DB::table('direct_registrations')->where('id', $id)->value('user_id');
+                    $taken = DB::table('direct_registrations')->where('mobile', $newMobile)->where('id', '!=', $id)
+                        ->where('status', '!=', 'cancelled')->whereNull('deleted_at')->exists()
+                        || DB::table('users')->where('portal', 'student')->where('mobile', $newMobile)
+                            ->when($ownUserId, fn($q) => $q->where('id', '!=', $ownUserId))->exists();
+                    if ($taken) {
+                        $guardErrors['mobile'] = ['This mobile number is already used by another account / registration.'];
+                    }
+                }
+            }
+        }
+        if ($req->has('email')) {
+            $chkEmail = trim((string) $req->input('email'));
+            if ($chkEmail !== '' && strcasecmp($chkEmail, (string) ($regRow->email ?? '')) !== 0
+                && !Cache::get("pre_email_verified_{$chkEmail}")) {
+                $guardErrors['email'] = ['Verify the new email address with OTP.'];
+            }
+        }
+        if ($req->filled('marital_status') && !in_array($req->input('marital_status'), ['unmarried', 'married', 'widowed'], true)) {
+            $guardErrors['marital_status'] = ['Marital status must be Married, Unmarried or Widow.'];
+        }
         $cur = DB::table('direct_registrations')->where('id', $id)->first();
         $slotIds = [];
         foreach ([1, 2, 3] as $n) {
@@ -738,9 +819,22 @@ class StudentRegistrationController extends Controller
                     ? ($req->input($f) ?: null)
                     : (TextNormalizer::upperValue($req->input($f)) ?: null));
         }
+        // Spouse names are only kept for a married applicant.
+        if ($req->has('marital_status') || $req->has('spouse_name_english') || $req->has('spouse_name_hindi')) {
+            $effMarital = $req->has('marital_status') ? ($req->input('marital_status') ?: null) : ($cur->marital_status ?? null);
+            if ($effMarital !== 'married') {
+                $update['spouse_name_english'] = null;
+                $update['spouse_name_hindi'] = null;
+            }
+        }
         $update['updated_at'] = now();
 
         DB::table('direct_registrations')->where('id', $id)->update($update);
+
+        // Mobile is the login ID: keep the account in step with a verified change.
+        if (!empty($update['mobile']) && $cur && (string) $cur->mobile !== (string) $update['mobile'] && $cur->user_id) {
+            DB::table('users')->where('id', $cur->user_id)->update(['mobile' => $update['mobile'], 'updated_at' => now()]);
+        }
 
         $reg = DB::table('direct_registrations')->where('id', $id)->first();
         if ($reg && $reg->pdf_path) {
@@ -1173,6 +1267,89 @@ class StudentRegistrationController extends Controller
     }
 
     // ──────────────────────────────────────────────────────────────────────
+    // 7c. CANCELLED REG. NO LOOKUP — "Have you Cancelled Reg. No:" step on
+    //     the registration form (office instruction, 2026-10-26 notebook
+    //     batch). Same applicant, registering fresh with a NEW registration
+    //     number — this only PRE-FILLS the new form from the old cancelled
+    //     row's data; it never reactivates or touches the cancelled row.
+    //     Public (pre-login, same as the rest of the registration form).
+    // ──────────────────────────────────────────────────────────────────────
+    public function cancelledRegistrationLookup(Request $req): JsonResponse
+    {
+        $regNo = trim((string) $req->query('registration_no'));
+        if ($regNo === '') {
+            return response()->json(['found' => false, 'message' => 'Enter the cancelled registration number.']);
+        }
+
+        $reg = DB::table('direct_registrations')
+            ->where('registration_no', $regNo)
+            ->where('status', 'cancelled')
+            ->whereNull('deleted_at')
+            ->first();
+
+        if (!$reg) {
+            return response()->json([
+                'found' => false,
+                'message' => 'No cancelled registration found for this number. Check the number, or leave it blank and fill the form manually.',
+            ]);
+        }
+
+        // Personal/demographic/document fields only — never program_id,
+        // session_year, subjects or anything payment/status related. Those
+        // belong to the registration the applicant is filling out right
+        // now, not the old cancelled one.
+        $data = array_filter([
+            'name' => $reg->name,
+            'name_hindi' => $reg->name_hindi,
+            'father_name' => $reg->father_name,
+            'father_name_hindi' => $reg->father_name_hindi,
+            'mother_name' => $reg->mother_name,
+            'mother_name_hindi' => $reg->mother_name_hindi,
+            'marital_status' => $reg->marital_status,
+            'spouse_name_english' => $reg->spouse_name_english,
+            'spouse_name_hindi' => $reg->spouse_name_hindi,
+            'dob' => $reg->dob,
+            'gender' => $reg->gender,
+            'domestic_state' => $reg->domestic_state,
+            'category' => $reg->category,
+            'admission_category' => $reg->admission_category,
+            'religion' => $reg->religion,
+            'nationality' => $reg->nationality,
+            'id_proof_type' => $reg->id_proof_type,
+            'id_proof_no' => $reg->id_proof_no,
+            'aadhar_no' => $reg->aadhar_no,
+            'caste_cert_no' => $reg->caste_cert_no,
+            'caste_cert_date' => $reg->caste_cert_date,
+            'caste_cert_state' => $reg->caste_cert_state,
+            'caste_cert_district' => $reg->caste_cert_district,
+            'eligibility_class' => $reg->eligibility_class,
+            'eligibility_roll_no' => $reg->eligibility_roll_no,
+            'is_divyang' => $reg->is_divyang,
+            'email' => $reg->email,
+            'mobile' => $reg->mobile,
+            'ug_university' => $reg->ug_university,
+            'ug_institute' => $reg->ug_institute,
+            'ug_session' => $reg->ug_session,
+            'ug_roll_no' => $reg->ug_roll_no,
+            'stream' => $reg->stream,
+            'entrance_session' => $reg->entrance_session,
+            'entrance_roll_no' => $reg->entrance_roll_no,
+            'state_rank' => $reg->state_rank,
+            'category_rank' => $reg->category_rank,
+            'cut_off' => $reg->cut_off,
+            'ddurn_no' => $reg->ddurn_no,
+            'abc_id' => $reg->abc_id,
+            'family_id' => $reg->family_id,
+        ], fn($v) => $v !== null && $v !== '');
+
+        return response()->json([
+            'found' => true,
+            'data' => $data,
+            'message' => 'Cancelled registration found — your details have been filled in. Please review before continuing.',
+        ]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
     // 8a. LOGIN LOOKUP — resolve name + father name from a registration no.
     //     Public (pre-login). Returns a masked mobile hint, never the full no.
     // ──────────────────────────────────────────────────────────────────────
@@ -1361,8 +1538,14 @@ class StudentRegistrationController extends Controller
             'caste_cert_no' => $prior->caste_cert_no ?? null,
             'caste_cert_date' => $prior->caste_cert_date ?? null,
             'caste_cert_state' => $prior->caste_cert_state ?? null,
+            'caste_cert_district' => $prior->caste_cert_district ?? null,
             'ddurn_no' => $prior->ddurn_no ?? null,
             'family_id' => $prior->family_id ?? null,
+            'marital_status' => $prior->marital_status ?? null,
+            // Spouse names only travel with a "married" status.
+            'spouse_name_english' => (($prior->marital_status ?? null) === 'married') ? ($prior->spouse_name_english ?? null) : null,
+            'spouse_name_hindi' => (($prior->marital_status ?? null) === 'married') ? ($prior->spouse_name_hindi ?? null) : null,
+            'is_divyang' => $prior->is_divyang ?? null,
         ];
 
         return response()->json([
@@ -1524,7 +1707,9 @@ class StudentRegistrationController extends Controller
                 }
             }
 
+            $accountCreatedNow = false;
             if (!$user) {
+                $accountCreatedNow = true;
                 // users_email_unique_idx is global (not portal/mobile-scoped)
                 // and now a live constraint. initiate() already refuses to
                 // create a registration at all when this email belongs to a
@@ -1575,6 +1760,27 @@ class StudentRegistrationController extends Controller
             }
 
             $this->sendCredentialsEmail($reg, $plain, $paid);
+
+            // Registration complete → SMS the Login ID + password (DLT template
+            // 'password_reset'). Only when THIS call created the account —
+            // an existing account keeps its own password, so $plain would be wrong.
+            // SMS only: no email on the notify target (the credentials email above is the email copy).
+            if ($paid && $accountCreatedNow) {
+                try {
+                    app(\App\Services\NotificationService::class)->sendByTrigger(
+                        (object) [
+                            'id' => null,
+                            'organization_id' => $reg->organization_id,
+                            'mobile' => $reg->mobile,
+                            'email' => null,
+                        ],
+                        'password_reset',
+                        [$reg->name, $reg->mobile, $plain]
+                    );
+                } catch (\Throwable $e) {
+                    Log::error("Credentials SMS failed for registration {$reg->id}: " . $e->getMessage());
+                }
+            }
         } catch (\Throwable $e) {
             Log::error("provisionAccount failed for registration {$reg->id}: " . $e->getMessage());
         }

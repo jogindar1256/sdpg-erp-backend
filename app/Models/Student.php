@@ -119,7 +119,8 @@ class Student extends Model
         foreach (['is_voter', 'has_epic', 'has_passport'] as $key) {
             $rules[$key] = 'nullable|in:Yes,No';
         }
-        $rules['admission_category'] = 'nullable|in:Social Category,H.C.,Freedom Fighter,EWS,PH/PwD';
+        // New list: General, OBC, SC, ST, H.C., Freedom Fighter, EWS. 'Social Category' / 'PH/PwD' stay valid for older saves.
+        $rules['admission_category'] = 'nullable|in:General,OBC,SC,ST,H.C.,Freedom Fighter,EWS,Social Category,PH/PwD';
         $rules['epic_no'] = 'nullable|string|max:20';
         $rules['passport_no'] = 'nullable|string|max:20';
         return $rules;

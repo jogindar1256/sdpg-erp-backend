@@ -57,6 +57,7 @@ class DashboardController extends Controller
 
             $q = DB::table('direct_registrations')
                 ->whereNull('deleted_at')
+                ->where('status', '!=', 'cancelled')
                 ->whereIn('reg_type', $regTypes);
             if ($session) $q->where('session_year', $session);
             return $q->count();
@@ -139,11 +140,20 @@ class DashboardController extends Controller
         $allGender      = $genderCount('all');
 
         // ── Sessions list for filter dropdown ─────────────────────────────────
+        // Union with registration sessions so a session with registrations but
+        // no admission yet is still selectable.
         $sessions = DB::table('admissions')
             ->whereNotNull('academic_year')
-            ->distinct()
-            ->orderByDesc('academic_year')
-            ->pluck('academic_year');
+            ->pluck('academic_year')
+            ->merge(
+                DB::table('direct_registrations')
+                    ->whereNull('deleted_at')
+                    ->whereNotNull('session_year')
+                    ->pluck('session_year')
+            )
+            ->unique()
+            ->sortDesc()
+            ->values();
 
         return response()->json([
             'filters' => [

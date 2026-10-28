@@ -17,6 +17,7 @@ class FeeReceipt extends Model
         'payment_mode', 'transaction_id', 'bank_name', 'dd_no', 'dd_date',
         'fee_breakdown', 'is_verified', 'verified_by', 'verified_at',
         'generated_by', 'pdf_path', 'status', 'cancel_reason',
+        'final_receipt_path', 'final_receipt_generated_at', 'final_receipt_generated_by',
     ];
 
     protected $casts = [

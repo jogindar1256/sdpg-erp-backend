@@ -66,18 +66,27 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function acceptFormIndex(Request $req)
     {
+        $session = $req->session_year ?? $this->sessionYear();
+        // Verified admissions appear here as Pending exam forms (also back-fills ones verified earlier).
+        if ($req->program_id) {
+            \App\Support\ExamFormSeeder::syncFor($session, (int) $req->program_id, $req->semester_no ?: null);
+        }
+
         $q = $this->withIdentity(
             DB::table('exam_forms as ef')
                 ->join('admissions as a', 'a.id', 'ef.admission_id')
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
+                ->leftJoin('student_applications as sa', 'sa.id', 'a.application_id')
+                ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
         )
-            ->select(array_merge(['ef.*', 's.university_roll_no as roll_no', 'a.account_no', 'p.short_name as course'], $this->identitySelect()))
-            ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
+            ->select(array_merge(['ef.*', 's.university_roll_no as roll_no', 's.mobile', 'sa.application_no', 'sa.id as application_id', 'drc.unique_code as code', 'a.account_no', 'p.short_name as course'], $this->identitySelect()))
+            ->where('ef.session_year', $session)
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
             ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-            ->when($req->status,      fn($q) => $q->where('ef.status',      $req->status));
+            ->when($req->status,      fn($q) => $q->where('ef.status',      $req->status))
+            ->orderBy('s.university_roll_no')->orderBy('ef.id');
 
         $records = $q->paginate(50);
         $records->getCollection()->transform(fn ($r) => $this->decorate($r));
@@ -92,8 +101,14 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        DB::table('exam_forms')->where('id', $id)
-            ->update(['status' => $req->status, 'updated_at' => now()]);
+        $current = DB::table('exam_forms')->where('id', $id)->value('status');
+        $update = ['status' => $req->status, 'updated_at' => now()];
+        if ($current === 'Accepted' && $req->status !== 'Accepted') {
+            $update['reversed_at'] = now(); // a later re-accept is password-gated
+            // A reversed form leaves the nominal roll too.
+            DB::table('exam_nominal_roll_entries')->where('exam_form_id', $id)->delete();
+        }
+        DB::table('exam_forms')->where('id', $id)->update($update);
 
         return response()->json(['message' => 'Status updated.']);
     }
@@ -113,6 +128,7 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     // 2. EXAM FORM ID ENTRY
     // ══════════════════════════════════════════════════════════════
+    // Accepted exam forms only — Form ID is entered after the form is accepted.
     public function formIdIndex(Request $req)
     {
         $q = $this->withIdentity(
@@ -120,17 +136,80 @@ class ExaminationController extends Controller
                 ->join('admissions as a', 'a.id', 'ef.admission_id')
                 ->join('students as s', 's.id', 'a.student_id')
                 ->join('programs as p', 'p.id', 'a.program_id')
+                ->leftJoin('student_applications as sa', 'sa.id', 'a.application_id')
+                ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
         )
-            ->select(array_merge(['ef.*', 's.personal_info->gender as gender', 's.university_roll_no as roll_no', 'a.account_no', 's.enrollment_no', 'p.short_name as course'], $this->identitySelect()))
+            ->select(array_merge(['ef.*', 's.personal_info->gender as gender', 's.university_roll_no as roll_no', 'a.account_no', 'sa.application_no', 'sa.id as application_id', 'drc.unique_code as code', 's.enrollment_no', 'p.short_name as course'], $this->identitySelect()))
+            ->where('ef.status', 'Accepted')
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
-            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type));
+            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
+            ->orderBy('s.university_roll_no')->orderBy('ef.id');
 
         $records = $q->paginate(50);
         $records->getCollection()->transform(fn ($r) => $this->decorate($r));
 
         return $records;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // 2b. UNIVERSITY ROLL NO. UPDATE — roll no / enrolment no (students) + form id
+    // ══════════════════════════════════════════════════════════════
+    public function rollUpdateIndex(Request $req)
+    {
+        return $this->formIdIndex($req);
+    }
+
+    public function rollUpdateUpdate(Request $req, $id)
+    {
+        $v = Validator::make($req->all(), [
+            'university_roll_no' => 'nullable|string|max:30',
+            'enrollment_no' => 'nullable|string|max:50',
+            'form_id' => 'nullable|string|max:50',
+        ]);
+        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
+
+        $form = DB::table('exam_forms as ef')->join('admissions as a', 'a.id', 'ef.admission_id')
+            ->where('ef.id', $id)->first(['ef.id', 'ef.session_year', 'a.student_id', 'a.program_id']);
+        if (!$form) return response()->json(['message' => 'Exam form not found.'], 404);
+
+        $update = [];
+        if ($req->has('university_roll_no')) {
+            $roll = trim((string) $req->university_roll_no) ?: null;
+            if ($roll && DB::table('students as s')
+                ->join('admissions as a', 'a.student_id', 's.id')
+                ->where('s.university_roll_no', $roll)->where('s.id', '!=', $form->student_id)
+                ->where('a.program_id', $form->program_id)->where('a.academic_year', $form->session_year)
+                ->whereNull('s.deleted_at')->exists()) {
+                return response()->json(['errors' => ['university_roll_no' => ['This roll number is already given to another student of this course and session.']]], 422);
+            }
+            $update['university_roll_no'] = $roll;
+        }
+        if ($req->has('enrollment_no')) {
+            $enr = trim((string) $req->enrollment_no) ?: null;
+            if ($enr && DB::table('students')->where('enrollment_no', $enr)->where('id', '!=', $form->student_id)->exists()) {
+                return response()->json(['errors' => ['enrollment_no' => ['This enrolment number already belongs to another student.']]], 422);
+            }
+            $update['enrollment_no'] = $enr;
+        }
+        if ($update) {
+            DB::table('students')->where('id', $form->student_id)->update($update + ['updated_at' => now()]);
+        }
+        if ($req->has('form_id')) {
+            DB::table('exam_forms')->where('id', $id)->update(['form_id' => trim((string) $req->form_id) ?: null, 'updated_at' => now()]);
+        }
+
+        return response()->json(['message' => 'Updated.']);
+    }
+
+    /** "Delete" = clear the roll no. and enrolment no. (the student and exam form stay). */
+    public function rollUpdateClear(Request $req, $id)
+    {
+        $studentId = DB::table('exam_forms as ef')->join('admissions as a', 'a.id', 'ef.admission_id')->where('ef.id', $id)->value('a.student_id');
+        if (!$studentId) return response()->json(['message' => 'Exam form not found.'], 404);
+        DB::table('students')->where('id', $studentId)->update(['university_roll_no' => null, 'enrollment_no' => null, 'updated_at' => now()]);
+        return response()->json(['message' => 'Roll no. and enrolment no. cleared.']);
     }
 
     public function formIdUpdate(Request $req, $id)
@@ -146,9 +225,40 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     // 3. EXAM SCHEDULE — ENTRY
     // ══════════════════════════════════════════════════════════════
+
+    /**
+     * How many examinees (from accepted exam forms) sit a given paper —
+     * broken down Regular / Back Paper / Total. Joined onto exam_schedules
+     * by paper_code + session_year + semester_no + program_id, which is
+     * the same key the "entry"/search grids group by. A paper nobody has
+     * filled a form for yet (schedule entered ahead of forms) reads 0, not
+     * null, so the UI shows a real count rather than '-' once forms exist.
+     */
+    private function withExamineeCounts($query, string $scheduleAlias = 'es')
+    {
+        $counts = DB::table('exam_form_papers as efp')
+            ->join('exam_forms as ef', 'ef.id', 'efp.exam_form_id')
+            ->join('admissions as adm', 'adm.id', 'ef.admission_id')
+            ->where('ef.status', 'Accepted')
+            ->select(
+                'efp.paper_code', 'ef.session_year', 'ef.semester_no', 'adm.program_id',
+                DB::raw("count(*) filter (where efp.exam_type = 'Regular') as regular_count"),
+                DB::raw("count(*) filter (where efp.exam_type = 'Back Paper') as bp_count"),
+                DB::raw('count(*) as total_count')
+            )
+            ->groupBy('efp.paper_code', 'ef.session_year', 'ef.semester_no', 'adm.program_id');
+
+        return $query->leftJoinSub($counts, 'cnt', function ($join) use ($scheduleAlias) {
+            $join->on('cnt.paper_code', "{$scheduleAlias}.paper_code")
+                ->on('cnt.session_year', "{$scheduleAlias}.session_year")
+                ->on('cnt.semester_no', "{$scheduleAlias}.semester_no")
+                ->on('cnt.program_id', "{$scheduleAlias}.program_id");
+        })->selectRaw('coalesce(cnt.regular_count, 0) as regular_count, coalesce(cnt.bp_count, 0) as bp_count, coalesce(cnt.total_count, 0) as total_count');
+    }
+
     public function scheduleIndex(Request $req)
     {
-        return response()->json(
+        $q = $this->withExamineeCounts(
             DB::table('exam_schedules as es')
                 ->join('subjects as sub', 'sub.id', 'es.subject_id')
                 ->join('programs as p', 'p.id', 'es.program_id')
@@ -157,9 +267,9 @@ class ExaminationController extends Controller
                 ->when($req->program_id,  fn($q) => $q->where('es.program_id',  $req->program_id))
                 ->when($req->semester_no, fn($q) => $q->where('es.semester_no', $req->semester_no))
                 ->when($req->exam_mode,   fn($q) => $q->where('es.exam_mode',   $req->exam_mode))
-                ->orderBy('es.exam_date')->orderBy('es.inning')
-                ->get()
         );
+
+        return response()->json($q->orderBy('es.exam_date')->orderBy('es.inning')->get());
     }
 
     public function scheduleStore(Request $req)
@@ -178,7 +288,19 @@ class ExaminationController extends Controller
         ]);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
-        $id = DB::table('exam_schedules')->insertGetId(array_merge($v->validated(), [
+        $data = $v->validated();
+        $duplicate = DB::table('exam_schedules')
+            ->where('session_year', $data['session_year'])
+            ->where('program_id', $data['program_id'])
+            ->where('semester_no', $data['semester_no'])
+            ->where('exam_mode', $data['exam_mode'])
+            ->where('paper_code', $data['paper_code'])
+            ->exists();
+        if ($duplicate) {
+            return response()->json(['message' => 'This paper already has a schedule entry for this session/semester/exam mode.'], 422);
+        }
+
+        $id = DB::table('exam_schedules')->insertGetId(array_merge($data, [
             'created_at' => now(), 'updated_at' => now(),
         ]));
         return response()->json(['id' => $id, 'message' => 'Schedule entry saved.'], 201);
@@ -192,11 +314,13 @@ class ExaminationController extends Controller
 
     public function scheduleSearch(Request $req)
     {
-        $q = DB::table('exam_schedules as es')
-            ->join('subjects as sub', 'sub.id', 'es.subject_id')
-            ->join('programs as p', 'p.id', 'es.program_id')
-            ->select('es.*', 'sub.name as subject_name', 'p.short_name as course')
-            ->where('es.session_year', $req->session_year ?? $this->sessionYear());
+        $q = $this->withExamineeCounts(
+            DB::table('exam_schedules as es')
+                ->join('subjects as sub', 'sub.id', 'es.subject_id')
+                ->join('programs as p', 'p.id', 'es.program_id')
+                ->select('es.*', 'sub.name as subject_name', 'p.short_name as course', DB::raw('(select sp.paper_name from subject_papers sp where sp.paper_code = es.paper_code and sp.program_id = es.program_id limit 1) as paper_name'))
+                ->where('es.session_year', $req->session_year ?? $this->sessionYear())
+        );
 
         if ($req->search_by === 'date') {
             $dates = array_map('trim', explode(',', $req->exam_date ?? ''));
@@ -211,6 +335,40 @@ class ExaminationController extends Controller
         }
 
         return response()->json($q->orderBy('es.exam_date')->get());
+    }
+
+    /** Suggestion lists for the schedule search screens (dates, innings, paper codes). */
+    public function scheduleOptions(Request $req)
+    {
+        $session = $req->session_year ?? $this->sessionYear();
+        $base = fn () => DB::table('exam_schedules as es')->where('es.session_year', $session);
+
+        $dates = $base()->distinct()->orderBy('es.exam_date')->pluck('es.exam_date')
+            ->map(fn ($d) => substr((string) $d, 0, 10))->unique()->values();
+        $innings = $base()->distinct()->orderBy('es.inning')->pluck('es.inning')->values();
+        $papers = $base()
+            ->join('subjects as sub', 'sub.id', 'es.subject_id')
+            ->join('programs as p', 'p.id', 'es.program_id')
+            ->select('es.paper_code', 'sub.name as subject_name', 'p.short_name as course', 'es.semester_no',
+                DB::raw('(select sp.paper_name from subject_papers sp where sp.paper_code = es.paper_code and sp.program_id = es.program_id limit 1) as paper_name'))
+            ->orderBy('es.paper_code')->get()->unique('paper_code')->values();
+
+        return response()->json(['dates' => $dates, 'innings' => $innings, 'papers' => $papers]);
+    }
+
+    /** Paper codes of one subject (for the schedule entry form dropdown). */
+    public function scheduleSubjectPapers(Request $req)
+    {
+        $rows = DB::table('subject_papers')
+            ->where('program_id', $req->program_id)
+            ->where('subject_id', $req->subject_id)
+            ->when($req->semester_no, fn ($q) => $q->where('semester_no', (string) $req->semester_no))
+            ->whereNotNull('paper_code')
+            ->orderBy('paper_code')
+            ->get(['paper_code', 'paper_name'])
+            ->unique('paper_code')->values();
+
+        return response()->json($rows);
     }
 
     public function scheduleUpdate(Request $req, $id)
@@ -575,42 +733,86 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function nominalRollIndex(Request $req)
     {
-        $q = $this->withIdentity(
-            DB::table('exam_forms as ef')
-                ->join('admissions as a', 'a.id', 'ef.admission_id')
-                ->join('students as s', 's.id', 'a.student_id')
-                ->join('programs as p', 'p.id', 'a.program_id')
-                ->leftJoin('exam_form_papers as efp', 'efp.exam_form_id', 'ef.id')
-        )
-            ->select(array_merge(
-                ['ef.*', 's.personal_info->gender as gender', 's.personal_info->date_of_birth as dob', 's.university_roll_no as roll_no',
-                 's.enrollment_no', 'p.short_name as course', 'efp.paper_code'],
-                $this->identitySelect()
-            ))
-            ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
+        $session = $req->session_year ?? $this->sessionYear();
+        $base = fn(bool $withType = true) => DB::table('exam_forms as ef')
+            ->join('admissions as a', 'a.id', 'ef.admission_id')
+            ->join('students as s', 's.id', 'a.student_id')
+            ->leftJoin('student_applications as sa', 'sa.id', 'a.application_id')
+            ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
+            ->leftJoin('exam_nominal_roll_entries as nr', 'nr.exam_form_id', 'ef.id')
+            ->where('ef.status', 'Accepted')
+            ->where('ef.session_year', $session)
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
-            ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
-            ->where('ef.status', 'Accepted')
-            ->orderBy('s.university_roll_no')
-            ->paginate(50);
+            ->when($withType && $req->exam_type, fn($q) => $q->where('ef.exam_type', $req->exam_type));
 
-        $q->getCollection()->transform(function ($r) {
+        $page = $this->withIdentity($base())
+            ->select(array_merge(
+                ['ef.id', 'ef.form_id', 'ef.exam_type', 'ef.semester_no', 'ef.admission_id',
+                 's.personal_info->gender as gender', 's.university_roll_no as roll_no', 's.enrollment_no',
+                 'sa.application_no', 'sa.id as application_id', 'drc.unique_code as code', 'a.account_no',
+                 'dr.category as reg_category', 's.personal_info->category as s_category',
+                 'dr.dob as reg_dob', 's.personal_info->date_of_birth as s_dob',
+                 DB::raw('(nr.id is not null) as in_nominal')],
+                $this->identitySelect()
+            ))
+            ->orderBy('s.university_roll_no')->orderBy('ef.id')
+            ->paginate(min((int) $req->input('per_page', 100), 1000));
+
+        // Subjects + paper codes per form (one query, not a join that repeats the student per paper).
+        $ids = $page->getCollection()->pluck('id')->all();
+        $papers = $ids
+            ? DB::table('exam_form_papers as efp')->leftJoin('subjects as sub', 'sub.id', 'efp.subject_id')
+                ->whereIn('efp.exam_form_id', $ids)->orderBy('efp.id')
+                ->get(['efp.exam_form_id', 'efp.paper_code', 'sub.name as subject'])->groupBy('exam_form_id')
+            : collect();
+
+        $page->getCollection()->transform(function ($r) use ($papers) {
             $r = $this->decorate($r);
-            $r->dob = $r->dob ?? null; // dr.dob preferred, decorate() doesn't touch dob
+            $r->dob = $r->reg_dob ?: $r->s_dob;
+            $r->category = $r->reg_category ?: $r->s_category;
+            $p = $papers->get($r->id, collect());
+            $r->subjects = $p->pluck('subject')->filter()->unique()->values()->all();
+            $r->paper_codes = $p->pluck('paper_code')->filter()->unique()->values()->all();
+            $r->in_nominal = (bool) $r->in_nominal;
             return $r;
         });
 
-        return response()->json($q);
+        // Counts over the whole fetched set (not just this page).
+        $stat = $base()->selectRaw("count(*) as enrolled,
+                count(*) filter (where nr.id is not null) as updated,
+                count(*) filter (where nr.id is null) as pending")->first();
+        $byType = $base(false)->selectRaw("count(*) filter (where ef.exam_type = 'Regular') as regular,
+                count(*) filter (where ef.exam_type = 'Back Paper') as back_paper")->first();
+        $stat->regular = (int) $byType->regular;
+        $stat->back_paper = (int) $byType->back_paper;
+
+        return response()->json(array_merge($page->toArray(), ['stats' => $stat]));
     }
 
-    public function nominalRollUpdate(Request $req, $id)
+    /** POST /examination/nominal-roll/create {ids?: []} — put accepted forms on the nominal roll (ids, else everything matching the filters). */
+    public function nominalRollCreate(Request $req)
     {
-        DB::table('exam_forms')->where('id', $id)->update(array_merge(
-            $req->only(['form_id']),
-            ['updated_at' => now()]
-        ));
-        return response()->json(['message' => 'Updated.']);
+        $session = $req->session_year ?? $this->sessionYear();
+        $forms = DB::table('exam_forms as ef')->join('admissions as a', 'a.id', 'ef.admission_id')
+            ->where('ef.status', 'Accepted')->where('ef.session_year', $session)
+            ->when($req->filled('ids'), fn($q) => $q->whereIn('ef.id', (array) $req->ids))
+            ->when(!$req->filled('ids') && $req->program_id, fn($q) => $q->where('a.program_id', $req->program_id))
+            ->when(!$req->filled('ids') && $req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
+            ->when(!$req->filled('ids') && $req->exam_type, fn($q) => $q->where('ef.exam_type', $req->exam_type))
+            ->get(['ef.id', 'ef.session_year', 'ef.semester_no', 'ef.exam_type', 'a.program_id']);
+
+        $n = 0;
+        foreach ($forms as $f) {
+            if (DB::table('exam_nominal_roll_entries')->where('exam_form_id', $f->id)->exists()) continue;
+            DB::table('exam_nominal_roll_entries')->insert([
+                'exam_form_id' => $f->id, 'session_year' => $f->session_year, 'program_id' => $f->program_id,
+                'semester_no' => $f->semester_no, 'exam_type' => $f->exam_type,
+                'created_by' => $req->user()?->id, 'created_at' => now(), 'updated_at' => now(),
+            ]);
+            $n++;
+        }
+        return response()->json(['message' => "{$n} record(s) added to the nominal roll.", 'count' => $n]);
     }
 
     // ══════════════════════════════════════════════════════════════

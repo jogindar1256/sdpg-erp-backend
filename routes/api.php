@@ -54,6 +54,7 @@ Route::prefix('student/register')->group(function () {
 
     Route::get('fetch-record', [StudentRegistrationController::class, 'fetchOldRecord']);
     Route::get('counselling-lookup', [StudentRegistrationController::class, 'counsellingLookup']);
+    Route::get('cancelled-lookup', [StudentRegistrationController::class, 'cancelledRegistrationLookup']);
 
     // Step-1 OTP — verify mobile + email BEFORE anything is created (keyed by contact).
     Route::post('otp/phone/send', [StudentRegistrationController::class, 'preSendPhoneOtp']);
@@ -423,12 +424,19 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('form-id', [ExaminationController::class, 'formIdIndex']);
             Route::patch('form-id/{id}', [ExaminationController::class, 'formIdUpdate']);
 
+            // University Roll No. Update (roll no / enrolment no / form id)
+            Route::get('roll-update', [ExaminationController::class, 'rollUpdateIndex']);
+            Route::patch('roll-update/{id}', [ExaminationController::class, 'rollUpdateUpdate']);
+            Route::delete('roll-update/{id}', [ExaminationController::class, 'rollUpdateClear']);
+
             // Exam Schedule
             Route::get('schedule', [ExaminationController::class, 'scheduleIndex']);
             Route::post('schedule', [ExaminationController::class, 'scheduleStore']);
             Route::patch('schedule/{id}', [ExaminationController::class, 'scheduleUpdate']);
             Route::delete('schedule/{id}', [ExaminationController::class, 'scheduleDestroy']);
             Route::get('schedule/search', [ExaminationController::class, 'scheduleSearch']);
+            Route::get('schedule/options', [ExaminationController::class, 'scheduleOptions']);
+            Route::get('schedule/subject-papers', [ExaminationController::class, 'scheduleSubjectPapers']);
 
             // Room Master
             Route::get('rooms', [ExaminationController::class, 'roomMasterIndex']);
@@ -459,7 +467,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
             // Nominal Roll
             Route::get('nominal-roll', [ExaminationController::class, 'nominalRollIndex']);
-            Route::patch('nominal-roll/{id}', [ExaminationController::class, 'nominalRollUpdate']);
+            Route::post('nominal-roll/create', [ExaminationController::class, 'nominalRollCreate']);
 
             // Result Update
             Route::get('result', [ExaminationController::class, 'resultIndex']);
@@ -592,6 +600,11 @@ Route::middleware('auth:sanctum')->group(function () {
 
             // All Fee Receipts — paginated list with filters
             Route::get('receipts', [FeesController::class, 'receiptsIndex']);
+
+            // Final Fee Receipt — list paid receipts by type, generate PDF
+            Route::get('generate', [FeesController::class, 'generateIndex']);
+            Route::post('generate', [FeesController::class, 'generateStore']);
+            Route::get('generate/{id}/pdf', [FeesController::class, 'generatePdf'])->whereNumber('id');
 
             // Verify Fee Receipts — list pending, verify/reject
             Route::get('verify', [FeesController::class, 'verifyIndex']);

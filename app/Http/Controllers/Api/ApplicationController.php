@@ -266,7 +266,11 @@ class ApplicationController extends Controller
                 'p.short_name as course',
                 'p.full_name',
                 'p.level',
-                DB::raw("CASE WHEN admpay.id IS NOT NULL THEN 'paid' ELSE NULL END as edu_payment_status"),
+                DB::raw("CASE WHEN admpay.id IS NOT NULL OR sapay.id IS NOT NULL THEN 'paid' ELSE NULL END as edu_payment_status"),
+                'sa.student_uid',
+                // Education fee actually collected (receipt of the paid payment).
+                DB::raw("(select fr.net_amount from payments pm join fee_receipts fr on fr.id = pm.fee_receipt_id where pm.student_application_id = sa.id and pm.status = 'paid' and pm.purpose in ('admission','semester_upgrade') order by pm.id desc limit 1) as edu_fee_paid"),
+                DB::raw("(select fr.receipt_no from payments pm join fee_receipts fr on fr.id = pm.fee_receipt_id where pm.student_application_id = sa.id and pm.status = 'paid' and pm.purpose in ('admission','semester_upgrade') order by pm.id desc limit 1) as edu_receipt_no"),
                 'drc.unique_code as code'
             )
             ->when($req->academic_year, fn($q) => $q->where('sa.academic_year', $req->academic_year))
@@ -1080,12 +1084,59 @@ class ApplicationController extends Controller
             'student_id' => null,
             'application_id' => $app->id,
             'admission_type' => $app->application_type === 'semester_upgrade' ? 'upgrade' : 'regular',
-            'admission_no' => $app->academic_year . '-' . str_pad((string) $app->id, 6, '0', STR_PAD_LEFT),
+            // admission_no is generated with the Student ID once the fee is paid (ensureStudentUid()).
             'admission_date' => now()->toDateString(),
             'is_verified' => false,
             'status' => $target,
             'created_at' => now(),
         ]);
+    }
+
+    /**
+     * Reserve the permanent 13-digit Student ID for a FIRST-TIME applicant
+     * (and generate the Admission No on the admissions row, for everyone).
+     *
+     * Only the number is generated: it is stored on student_applications and
+     * nothing is copied into students / admissions here — that still happens
+     * when the admission is confirmed (confirmStudentAndCreateAdmission()
+     * then reuses this same number). Existing students (upgrades, back
+     * papers) already have an ID and are skipped. Safe to call repeatedly.
+     */
+    public function ensureStudentUid(object $sa): ?string
+    {
+        $fresh = DB::table('student_applications')->where('id', $sa->id)->first();
+        if (!$fresh || !in_array($fresh->application_type, self::ADMISSION_APP_TYPES, true)) {
+            return null;
+        }
+        // The Admission No is generated at the same moment as the Student ID.
+        DB::table('admissions')
+            ->where('application_id', $fresh->id)
+            ->where(fn($q) => $q->whereNull('admission_no')->orWhere('admission_no', ''))
+            ->update([
+                'admission_no' => $fresh->academic_year . '-' . str_pad((string) $fresh->id, 6, '0', STR_PAD_LEFT),
+                'updated_at' => now(),
+            ]);
+        if (!empty($fresh->student_uid)) {
+            return $fresh->student_uid;
+        }
+        $knownStudentId = $fresh->student_id
+            ?: ($fresh->user_id ? DB::table('students')->where('user_id', $fresh->user_id)->value('id') : null);
+        if ($knownStudentId) {
+            return null; // already a student — keeps the ID they have
+        }
+        $program = DB::table('programs')->where('id', $fresh->program_id)->first();
+        if (!$program) {
+            return null;
+        }
+        $who = $this->applicantSnapshot($fresh);
+        try {
+            $uid = app(AdmissionNumberService::class)->studentId((string) $fresh->academic_year, $program, $who['category'] ?? null);
+        } catch (\Throwable $e) {
+            Log::warning("ensureStudentUid: could not generate a Student ID for application {$fresh->id}: " . $e->getMessage());
+            return null;
+        }
+        DB::table('student_applications')->where('id', $fresh->id)->update(['student_uid' => $uid, 'updated_at' => now()]);
+        return $uid;
     }
 
     /**
@@ -1385,6 +1436,7 @@ class ApplicationController extends Controller
                 'is_verified' => true,
                 'verified_by' => $approvedByUserId ?: null,
                 'verified_at' => now(),
+                'admission_no' => $existing->admission_no ?: $admissionNo,
                 'status' => $keep ? $existing->status : 'active',
                 'file_no' => $existing->file_no ?: $svc->fileNo($app->academic_year),
                 'record_no' => $existing->record_no ?: $svc->recordNo(),
@@ -1433,7 +1485,8 @@ class ApplicationController extends Controller
         // Assign the permanent Student ID once, on first confirmation only.
         if ($student && empty($student->student_uid) && $program) {
             try {
-                $studentUpdate['student_uid'] = $svc->studentId($app->academic_year, $program, $student->category);
+                $reserved = DB::table('student_applications')->where('id', $app->id)->value('student_uid');
+                $studentUpdate['student_uid'] = $reserved ?: $svc->studentId($app->academic_year, $program, $student->category);
             } catch (\Throwable $e) {
                 Log::warning("student_uid generation failed for student {$studentId}: " . $e->getMessage());
             }
@@ -1447,9 +1500,14 @@ class ApplicationController extends Controller
      * Only called once, from confirmStudentAndCreateAdmission() above, when
      * this applicant has no students row yet.
      */
+    /** Why the last createStudentFromApprovedApplication() returned null — shown to staff on Verify. */
+    public static ?string $lastStudentError = null;
+
     private function createStudentFromApprovedApplication(object $app): ?int
     {
+        self::$lastStudentError = null;
         if (!$app->user_id) {
+            self::$lastStudentError = 'the application has no login account (user) linked to it';
             return null; // no owner to attribute this row to — nothing safe to create
         }
 
@@ -1468,6 +1526,7 @@ class ApplicationController extends Controller
         $name = $registration->name ?? $user->name ?? null;
         $mobile = $registration->mobile ?? $user->mobile ?? null;
         if (empty($name) || empty($mobile)) {
+            self::$lastStudentError = 'the applicant name or mobile number is missing';
             return null; // nothing usable to create a real row from
         }
 
@@ -1497,14 +1556,21 @@ class ApplicationController extends Controller
         $emailToUse = $registration->email ?? $user->email ?? null;
         $aadharNo = $part1['aadhar_no'] ?? $registration->aadhar_no ?? null;
 
-        $permAddress = $part2['perm_house_no'] ?? null;
-        $permCity = $part2['perm_mohalla'] ?? null;
+        // House / plot no. is optional on the form (rural addresses often have none) —
+        // fall back to the mohalla / village so the address line is never empty.
+        $permCity = $part2['perm_mohalla'] ?? $part2['perm_post_office'] ?? null;
+        $permAddress = ($part2['perm_house_no'] ?? null) ?: $permCity;
         $permDistrict = $part2['perm_district'] ?? null;
         $permState = $part2['perm_state'] ?? $registration->domestic_state ?? null;
         $permPin = $part2['perm_pin_code'] ?? null;
 
         if (!$dob || !$permAddress || !$permCity || !$permDistrict || !$permState || !$permPin) {
-            Log::error("createStudentFromApprovedApplication: incomplete data for application {$app->id} (user_id={$app->user_id}) — missing dob and/or permanent address fields. Cannot create students row.");
+            $missing = array_keys(array_filter([
+                'dob' => !$dob, 'perm_house_no/perm_mohalla' => !$permAddress, 'perm_mohalla' => !$permCity,
+                'perm_district' => !$permDistrict, 'perm_state' => !$permState, 'perm_pin_code' => !$permPin,
+            ]));
+            self::$lastStudentError = 'these details are missing in the application: ' . implode(', ', $missing);
+            Log::error("createStudentFromApprovedApplication: incomplete data for application {$app->id} (user_id={$app->user_id}) — missing: " . implode(', ', $missing) . ". Cannot create students row.");
             return null;
         }
 
@@ -1526,6 +1592,7 @@ class ApplicationController extends Controller
             })
             ->first();
         if ($conflict) {
+            self::$lastStudentError = "the mobile / email / Aadhaar already belongs to another student (student id {$conflict->id})";
             Log::error("createStudentFromApprovedApplication: mobile/email/aadhar for application {$app->id} (user_id={$app->user_id}) already belongs to students.id={$conflict->id} — refusing to create a duplicate students row. Needs manual review (likely a genuine duplicate identity or a data-entry collision).");
             return null;
         }
@@ -2303,7 +2370,9 @@ class ApplicationController extends Controller
     {
         $admissionType = 'regular';
         [$gender, $category] = $this->feeGenderCategory($sa->student_id, $sa);
-        $semesterNos = array_unique([0, (int) $sa->semester_no]);
+        // A first-time 'regular' admission has no semester_no on the row — it is semester 1.
+        // (0 only matches structures saved as "every semester", which is why the fee read ₹0.)
+        $semesterNos = array_values(array_unique([0, max(1, (int) $sa->semester_no)]));
 
         $result = \App\Models\FeeStructure::breakdownFor(
             $sa->program_id,
@@ -2316,7 +2385,8 @@ class ApplicationController extends Controller
 
         // Per-particular rules (Fee Structure → SDPGC Student / DDU-Affiliated
         // College / Pay in College): exempt particulars are dropped, counter
-        // particulars are split out of the online amount.
+        // particulars ticked "Pay in College" are the ones collected now; the rest
+        // were already paid at the counselling centre ('college_*' keys = already paid).
         $settings = \App\Support\FeeHeadSettings::forConfig((int) $sa->program_id, (string) $sa->academic_year, $semesterNos, $admissionType);
         $who = \App\Support\FeeHeadSettings::passOutStatus($sa);
         $online = [];
@@ -2327,9 +2397,11 @@ class ApplicationController extends Controller
             if (\App\Support\FeeHeadSettings::isExempt($setting, $who)) {
                 $exempt[] = $b;
             } elseif ($setting && $setting->pay_in_college) {
-                $college[] = $b;
-            } else {
+                // "Pay in College" ticked = collected NOW, at this payment.
                 $online[] = $b;
+            } else {
+                // Not ticked = already paid at the counselling centre; nothing to collect.
+                $college[] = $b;
             }
         }
         $total = (float) collect($online)->sum('amount');
@@ -2339,7 +2411,7 @@ class ApplicationController extends Controller
             'total' => $total,                 // online (Razorpay) amount
             'breakdown' => $online,
             'college_total' => (float) collect($college)->sum('amount'),
-            'college_breakdown' => $college,   // pay at the college counter
+            'college_breakdown' => $college,   // already paid at the counselling centre (not collected)
             'exempt_breakdown' => $exempt,     // waived (SDPGC / DDU pass-out)
             'pass_out' => $who,
             'missing_structure' => $result['total'] <= 0,
@@ -2464,7 +2536,7 @@ class ApplicationController extends Controller
 
         $rupees = (int) round($fee['total']);
         if ($rupees <= 0) {
-            return response()->json(['message' => 'Nothing to pay online — the fee for this application is collected at the college counter.'], 422);
+            return response()->json(['message' => 'Nothing to collect — no fee particular of this application is marked "Pay in College" (the rest was already paid at the counselling centre).'], 422);
         }
         $amount = $rupees * 100; // paise
 
@@ -2659,9 +2731,21 @@ class ApplicationController extends Controller
             return $r;
         });
 
-        GenerateFeeReceiptPdf::dispatch($receipt->id);
+        // The payment is already recorded — a queue problem (e.g. no jobs table) must never fail it.
+        // The PDF is also generated on demand when it is first downloaded.
+        try {
+            GenerateFeeReceiptPdf::dispatch($receipt->id);
+        } catch (\Throwable $e) {
+            Log::warning("Receipt PDF job could not be queued for receipt {$receipt->id}: " . $e->getMessage());
+        }
+
+        // First-time applicant: generate the Student ID now (number only —
+        // no students / admissions data is created here).
+        $studentUid = $this->ensureStudentUid($sa);
 
         return response()->json([
+            'student_uid' => $studentUid,
+            'admission_no' => DB::table('admissions')->where('application_id', $sa->id)->orderByDesc('id')->value('admission_no'),
             'message' => $sa->status !== 'approved'
                 ? 'Education fee paid successfully. The application can now be approved.'
                 : ($sa->student_id
@@ -2987,7 +3071,13 @@ class ApplicationController extends Controller
             'status' => 'active',
         ]));
 
-        GenerateFeeReceiptPdf::dispatch($receipt->id);
+        // The payment is already recorded — a queue problem (e.g. no jobs table) must never fail it.
+        // The PDF is also generated on demand when it is first downloaded.
+        try {
+            GenerateFeeReceiptPdf::dispatch($receipt->id);
+        } catch (\Throwable $e) {
+            Log::warning("Receipt PDF job could not be queued for receipt {$receipt->id}: " . $e->getMessage());
+        }
 
         DB::table('student_applications')->where('id', $sa->id)->update([
             'status' => 'submitted', // paying submits a back paper; fee fields come from payments
@@ -3311,6 +3401,16 @@ class ApplicationController extends Controller
             'created_at' => now(),
             'updated_at' => now(),
         ]);
+
+        // Returning SDPGC UG pass-out applying to P.G.: carry the earlier
+        // data + enclosures over (never Part 6). Must never block creation.
+        if ($req->application_type === 'regular') {
+            try {
+                \App\Support\PreviousApplicationSeed::seed((int) $id);
+            } catch (\Throwable $e) {
+                report($e);
+            }
+        }
 
         return response()->json([
             'id' => $id,
@@ -3866,8 +3966,11 @@ class ApplicationController extends Controller
 
         $isFilled = function (string $name) use ($part1, $part4): bool {
             $n = strtolower($name);
+            // Migration is required (for a 'Conditional' enclosure) only when the
+            // applicant actually holds the original migration. PG/B.Ed. forms
+            // switch has_migration on by default, which must not force the upload.
             if (str_contains($n, 'migration'))
-                return !empty($part4['has_migration']);
+                return !empty($part4['has_migration']) && ($part4['mig_condition'] ?? null) === 'have_original_migration';
             if (str_contains($n, 'tc') || str_contains($n, 'transfer certificate'))
                 return ($part4['tc_condition'] ?? null) === 'have_original_tc';
             if (str_contains($n, 'caste'))
