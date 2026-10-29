@@ -114,26 +114,19 @@ class StudentController extends Controller
             : null;
 
         // Photo: students table first, else the Part 7 upload.
-        $photoPath = $student->photo_path ?? null;
-        if (!$photoPath && $app) {
-            $photoPath = DB::table('student_application_documents')
+        // Which disk the file is on comes from the document row / a cached
+        // lookup (FileUrls), not a Supabase HEAD request on every profile load.
+        $photoUrl = null;
+        if (!empty($student->photo_path)) {
+            $photoUrl = \App\Support\FileUrls::urls(['photo' => $student->photo_path])['photo'];
+        } elseif ($app) {
+            $photoDoc = DB::table('student_application_documents')
                 ->where('application_id', $app->id)
                 ->where('document_type', 'photo')
                 ->orderByDesc('id')
-                ->value('path');
-        }
-        $photoUrl = null;
-        if ($photoPath) {
-            if (preg_match('#^https?://#', $photoPath)) {
-                $photoUrl = $photoPath;
-            } else {
-                try {
-                    $photoUrl = Storage::disk('supabase')->exists($photoPath)
-                        ? Storage::disk('supabase')->url($photoPath)
-                        : Storage::disk('public')->url($photoPath);
-                } catch (\Throwable $e) {
-                    $photoUrl = Storage::disk('public')->url($photoPath);
-                }
+                ->first();
+            if ($photoDoc && $photoDoc->path) {
+                $photoUrl = \App\Support\FileUrls::forDocuments(collect([$photoDoc]))->first()->url;
             }
         }
 

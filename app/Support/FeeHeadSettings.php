@@ -45,14 +45,18 @@ class FeeHeadSettings
     public static function passOutStatus(object $sa): array
     {
         $out = ['sdpgc' => false, 'ddu' => false];
-        $program = DB::table('programs')->where('id', $sa->program_id)->first();
+        // ApplicationController::parseApp() has usually loaded both rows already.
+        $loaded = fn (string $prop, $id) => is_object($sa->$prop ?? null) && (string) ($sa->$prop->id ?? '') === (string) $id ? $sa->$prop : null;
+        $program = $loaded('program', $sa->program_id)
+            ?? DB::table('programs')->where('id', $sa->program_id)->first();
         if (!Part6Rules::formType($program)) {
             return $out;
         }
 
         // 1) The UG roll number given at registration is one of our own students.
         $reg = !empty($sa->direct_registration_id)
-            ? DB::table('direct_registrations')->where('id', $sa->direct_registration_id)->first()
+            ? ($loaded('registration', $sa->direct_registration_id)
+                ?? DB::table('direct_registrations')->where('id', $sa->direct_registration_id)->first())
             : null;
         $roll = trim((string) ($reg->ug_roll_no ?? ''));
         if ($roll !== '' && DB::table('students')

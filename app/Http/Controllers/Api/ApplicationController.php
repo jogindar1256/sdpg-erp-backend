@@ -25,6 +25,9 @@ use Illuminate\Support\Facades\Validator;
 
 class ApplicationController extends Controller
 {
+    /** parseApp()'s fee calculation, reused by verificationCardData() right after. */
+    private ?array $lastFeePreview = null;
+
     use LocksStudentIdentity;
 
     // =========================================================================
@@ -85,15 +88,16 @@ class ApplicationController extends Controller
             : null;
         $sa->has_registration_snapshot = (bool) $sa->registration;
 
-        $sa->approved_by_name = $sa->approved_by
-            ? DB::table('users')->where('id', $sa->approved_by)->value('name')
-            : null;
         $latestDecision = DB::table('rejected_applications')
             ->where('student_application_id', $sa->id)
             ->orderByDesc('id')
             ->first();
+        // Approver / decider / releaser names in one query.
+        $userIds = array_filter([$sa->approved_by ?? null, $latestDecision->decided_by ?? null, $latestDecision->released_by ?? null]);
+        $userNames = $userIds ? DB::table('users')->whereIn('id', $userIds)->pluck('name', 'id') : collect();
+        $sa->approved_by_name = $sa->approved_by ? ($userNames[$sa->approved_by] ?? null) : null;
         $sa->reviewed_by_name = ($latestDecision && $latestDecision->decided_by)
-            ? DB::table('users')->where('id', $latestDecision->decided_by)->value('name')
+            ? ($userNames[$latestDecision->decided_by] ?? null)
             : null;
 
         // Full hold/reject decision, for RejectHoldDialog's read-only view
@@ -113,13 +117,14 @@ class ApplicationController extends Controller
         $sa->release_remarks = $latestDecision->release_remarks ?? null;
         $sa->released_at = $latestDecision->released_at ?? null;
         $sa->released_by_name = ($latestDecision && $latestDecision->released_by)
-            ? DB::table('users')->where('id', $latestDecision->released_by)->value('name')
+            ? ($userNames[$latestDecision->released_by] ?? null)
             : null;
 
         // Fee preview — computeApplicationFee() is read-only (no order
         // created)
         if ($sa->application_type !== 'back_paper') {
             $feePreview = $this->computeApplicationFee($sa);
+            $this->lastFeePreview = ['application_id' => $sa->id, 'fee' => $feePreview];
             $sa->computed_fee_amount = $feePreview['missing_structure'] ? null : $feePreview['total'];
             // Particulars collected at the college counter (not in the online amount).
             $sa->computed_college_fee = (float) $feePreview['college_total'];
@@ -128,7 +133,7 @@ class ApplicationController extends Controller
             $sa->computed_college_fee = 0.0;
         }
 
-        $sa->documents = $this->withDocumentUrls(
+        $sa->documents = \App\Support\FileUrls::forDocuments(
             DB::table('student_application_documents')->where('application_id', $sa->id)->get()
         );
 
@@ -944,37 +949,22 @@ class ApplicationController extends Controller
 
     /** The registration an application came from (its own link, else the user's latest). */
     /**
-     * Sets ->url on each document row. Which disk a file lives on is stored
-     * in student_application_documents.disk, so building the URL costs no
-     * network call. Older rows (disk NULL) are checked against Supabase once
-     * — one HTTP HEAD per file — and the answer is saved, so that check never
-     * repeats. (Before, every document was HEAD-checked on every page load.)
+     * A row parseApp() has already put on the application object ($app->student,
+     * ->registration, ->program), if it is the row with this id — so helpers
+     * called from parseApp() / verificationCardData() don't load it again.
      */
-    private function withDocumentUrls($docs)
+    private static function loadedRow(object $app, string $prop, $id): ?object
     {
-        $resolved = []; // disk => [document ids]
-        foreach ($docs as $doc) {
-            $disk = $doc->disk ?? null;
-            if ($disk === null) {
-                try {
-                    $disk = Storage::disk('supabase')->exists($doc->path) ? 'supabase' : 'public';
-                    $resolved[$disk][] = $doc->id;
-                } catch (\Throwable $e) {
-                    $disk = 'public'; // storage unreachable — don't save a guess
-                }
-            }
-            $doc->url = Storage::disk($disk)->url($doc->path);
-        }
-        foreach ($resolved as $disk => $ids) {
-            DB::table('student_application_documents')->whereIn('id', $ids)->update(['disk' => $disk]);
-        }
-        return $docs;
+        $row = $app->$prop ?? null;
+        return is_object($row) && isset($row->id) && (string) $row->id === (string) $id ? $row : null;
     }
 
     private function registrationForApp(object $app): ?object
     {
         if (!empty($app->direct_registration_id)) {
-            $reg = DB::table('direct_registrations')->where('id', $app->direct_registration_id)->first();
+            // parseApp() has already loaded this very row (when not deleted).
+            $reg = self::loadedRow($app, 'registration', $app->direct_registration_id)
+                ?? DB::table('direct_registrations')->where('id', $app->direct_registration_id)->first();
             if ($reg) {
                 return $reg;
             }
@@ -1004,7 +994,8 @@ class ApplicationController extends Controller
         $part1 = is_array($app->part_1 ?? null) ? $app->part_1 : (json_decode($app->part_1 ?? '{}', true) ?: []);
         $part2 = is_array($app->part_2 ?? null) ? $app->part_2 : (json_decode($app->part_2 ?? '{}', true) ?: []);
         $student = !empty($app->student_id)
-            ? Student::flat(DB::table('students')->where('id', $app->student_id)->first())
+            ? (self::loadedRow($app, 'student', $app->student_id)
+                ?? Student::flat(DB::table('students')->where('id', $app->student_id)->first()))
             : null;
         $studentName = $student
             ? trim(implode(' ', array_filter([$student->first_name ?? null, $student->middle_name ?? null, $student->last_name ?? null])))
@@ -1234,18 +1225,26 @@ class ApplicationController extends Controller
         if (!$raw) {
             return null;
         }
-        $reg = $this->registrationForApp($raw);
-        $who = $this->applicantSnapshot($raw, $reg);
+        // parseApp() first: it loads the students / registration rows and the
+        // fee once, and the helpers below reuse them instead of re-querying.
+        $this->lastFeePreview = null;
         $sa = $this->parseApp($raw); // decodes part_* in place, adds documents / photo / program
+        $reg = $this->registrationForApp($sa);
+        $who = $this->applicantSnapshot($sa, $reg);
 
         $part4 = is_array($sa->part_4 ?? null) ? $sa->part_4 : [];
         $part6 = is_array($sa->part_6 ?? null) ? $sa->part_6 : [];
 
-        $fee = $this->computeApplicationFee($sa);
+        $fee = ($this->lastFeePreview['application_id'] ?? null) === $sa->id
+            ? $this->lastFeePreview['fee']
+            : $this->computeApplicationFee($sa); // back_paper: parseApp() doesn't compute it
+        $this->lastFeePreview = null;
         $headNames = DB::table('fee_heads')
             ->whereIn('id', collect($fee['breakdown'])->merge($fee['college_breakdown'] ?? [])->pluck('fee_head_id')->filter()->all() ?: [0])
             ->pluck('name', 'id');
-        $saFeeReceiptId = \App\Support\Payments::applicationFeeReceiptId((int) $sa->id);
+        // One payments lookup: applicationFeeReceiptId() is this payment's fee_receipt_id.
+        $saAppPaidPayment = \App\Support\Payments::paidApplicationPayment((int) $sa->id);
+        $saFeeReceiptId = $saAppPaidPayment->fee_receipt_id ?? null;
         $receipt = $saFeeReceiptId
             ? DB::table('fee_receipts')->where('id', $saFeeReceiptId)->first()
             : null;
@@ -1255,7 +1254,6 @@ class ApplicationController extends Controller
         $yesNo = fn($v) => $v === null || $v === '' ? null : (in_array(strtolower((string) $v), ['yes', '1', 'true'], true) || $v === true ? 'Yes' : 'No');
 
         $regPaidPayment = !empty($reg->id) ? \App\Support\Payments::paidRegistrationPayment((int) $reg->id) : null;
-        $saAppPaidPayment = \App\Support\Payments::paidApplicationPayment((int) $sa->id);
 
         return [
             'admission_id' => $admission->id,
@@ -1900,9 +1898,23 @@ class ApplicationController extends Controller
             ->orderBy('id')
             ->get();
 
-        $toDataUri = function (?string $path) {
+        $toDataUri = function (?object $doc) {
+            $path = $doc->path ?? null;
             if (!$path)
                 return null;
+            // Disk recorded on the document row: one read, no exists() /
+            // mimeType() round trips (3 Supabase requests per image before).
+            if (!empty($doc->disk)) {
+                try {
+                    $bytes = Storage::disk($doc->disk)->get($path);
+                    if ($bytes !== null) {
+                        $mime = (new \finfo(FILEINFO_MIME_TYPE))->buffer($bytes) ?: 'image/jpeg';
+                        return "data:{$mime};base64," . base64_encode($bytes);
+                    }
+                } catch (\Throwable $e) {
+                    // fall back to probing both disks below
+                }
+            }
             try {
                 foreach (['supabase', 'public'] as $disk) {
                     try {
@@ -1922,8 +1934,8 @@ class ApplicationController extends Controller
         };
         $photoDoc = $documents->firstWhere('document_type', 'photo');
         $sigDoc = $documents->firstWhere('document_type', 'signature');
-        $photoDataUri = $toDataUri($photoDoc->path ?? null);
-        $signatureDataUri = $toDataUri($sigDoc->path ?? null);
+        $photoDataUri = $toDataUri($photoDoc);
+        $signatureDataUri = $toDataUri($sigDoc);
 
         $parts = [];
         foreach (range(1, 8) as $n) {
@@ -2198,23 +2210,22 @@ class ApplicationController extends Controller
             ->orderByDesc('id')
             ->get()
             ->groupBy('application_id');
-        $resolveDocUrl = function (?string $path) {
-            if (!$path)
-                return null;
-            try {
-                return Storage::disk('supabase')->exists($path)
-                    ? Storage::disk('supabase')->url($path)
-                    : Storage::disk('public')->url($path);
-            } catch (\Throwable $e) {
-                try {
-                    return Storage::disk('public')->url($path);
-                } catch (\Throwable $e2) {
-                    return null;
+        // All photo / signature URLs for the page resolved up front: document
+        // rows from their recorded disk, the students.* fallbacks in one
+        // batched lookup — instead of one Supabase HEAD request per image.
+        \App\Support\FileUrls::forDocuments($appDocs->flatten(1));
+        $fallbackPaths = [];
+        foreach ($result->getCollection() as $row) {
+            $rowDocs = $appDocs->get($row->id, collect());
+            foreach (['photo' => 'photo_path', 'signature' => 'signature_path'] as $type => $col) {
+                if (empty($rowDocs->firstWhere('document_type', $type)->url ?? null)) {
+                    $fallbackPaths["{$row->id}:{$col}"] = $row->$col;
                 }
             }
-        };
+        }
+        $fallbackUrls = \App\Support\FileUrls::urls($fallbackPaths);
 
-        $result->getCollection()->transform(function ($row) use ($appDocs, $resolveDocUrl) {
+        $result->getCollection()->transform(function ($row) use ($appDocs, $fallbackUrls) {
             if (empty($row->name)) {
                 $row->name = trim(implode(' ', array_filter([
                     $row->first_name ?? null,
@@ -2229,8 +2240,8 @@ class ApplicationController extends Controller
             $rowDocs = $appDocs->get($row->id, collect());
             $photoDoc = $rowDocs->firstWhere('document_type', 'photo');
             $sigDoc = $rowDocs->firstWhere('document_type', 'signature');
-            $row->photo_path = $resolveDocUrl($photoDoc->path ?? null) ?? $resolveDocUrl($row->photo_path);
-            $row->signature_path = $resolveDocUrl($sigDoc->path ?? null) ?? $resolveDocUrl($row->signature_path);
+            $row->photo_path = ($photoDoc->url ?? null) ?: ($fallbackUrls["{$row->id}:photo_path"] ?? null);
+            $row->signature_path = ($sigDoc->url ?? null) ?: ($fallbackUrls["{$row->id}:signature_path"] ?? null);
 
             return $row;
         });
@@ -2443,7 +2454,10 @@ class ApplicationController extends Controller
      */
     private function feeGenderCategory(?int $studentId, ?object $app = null): array
     {
-        $student = $studentId ? Student::flat(DB::table('students')->where('id', $studentId)->first()) : null;
+        $student = $studentId
+            ? (($app ? self::loadedRow($app, 'student', $studentId) : null)
+                ?? Student::flat(DB::table('students')->where('id', $studentId)->first()))
+            : null;
 
         $gender = $student->gender ?? null;
         $category = $student->category ?? null;
@@ -4026,9 +4040,9 @@ class ApplicationController extends Controller
         // Upload status + enclosure number = real application_no + a running
         // sequence over this same fixed order (replaces the old client-side
         // "Appli.no.+01" placeholder computed from Object.keys().length).
-        $docs = DB::table('student_application_documents')
-            ->where('application_id', $sa->id)
-            ->get()
+        $docs = (isset($sa->documents) && $sa->documents instanceof \Illuminate\Support\Collection
+                ? $sa->documents // loaded by parseApp() just before
+                : DB::table('student_application_documents')->where('application_id', $sa->id)->get())
             ->keyBy('document_type');
 
         $seq = 0;

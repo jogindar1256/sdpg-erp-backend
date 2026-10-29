@@ -164,8 +164,9 @@ class PreviousApplicationSeed
         $n = 0;
         $docs = DB::table('student_application_documents')->where('application_id', $fromId)->get();
         foreach ($docs as $doc) {
-            $disk = null;
-            foreach (['supabase', 'public'] as $name) {
+            // The recorded disk when there is one; older rows are probed.
+            $disk = $doc->disk ?? null;
+            foreach ($disk ? [] : ['supabase', 'public'] as $name) {
                 try {
                     if (Storage::disk($name)->exists($doc->path)) {
                         $disk = $name;
