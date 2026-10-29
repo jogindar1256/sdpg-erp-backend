@@ -460,18 +460,37 @@ class MasterSettingsController extends Controller
         ]);
     }
 
+    /**
+     * POST /fee-structure
+     *
+     * Saves every particular (fee head) of one structure in a single request:
+     *   particulars: [{fee_head_id, amounts: {"Male_Gen": 100, …}, settings?: {…}}, …]
+     * The old one-particular body (top-level fee_head_id / amounts / settings)
+     * is still accepted and treated as a one-item list.
+     *
+     * All particulars are merged into the per-category rows first, so each
+     * category row is read once and written once whatever the number of
+     * particulars — new rows in one INSERT, existing rows in one UPDATE.
+     */
     public function feeStructureStore(Request $req)
     {
         $v = Validator::make($req->all(), [
             'program_id' => 'required|exists:programs,id',
-            'fee_head_id' => 'required|exists:fee_heads,id',
             'session_year' => 'required|string',
             'semester_no' => 'required|string',
             'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
             'term' => 'required|in:Admission,Semester Registration',
-            'amounts' => 'required|array',
+            'particulars' => 'required_without:fee_head_id|array|min:1',
+            'particulars.*.fee_head_id' => 'required|integer|distinct',
+            'particulars.*.amounts' => 'required|array',
+            'fee_head_id' => 'required_without:particulars|integer',
+            'amounts' => 'required_without:particulars|array',
             // Per-particular rules (see FeeHeadSettings). SDPGC / DDU only
             // mean anything for P.G. / B.Ed. and are stored false otherwise.
+            'particulars.*.settings' => 'nullable|array',
+            'particulars.*.settings.sdpgc_exempt' => 'nullable|boolean',
+            'particulars.*.settings.ddu_exempt' => 'nullable|boolean',
+            'particulars.*.settings.pay_in_college' => 'nullable|boolean',
             'settings' => 'nullable|array',
             'settings.sdpgc_exempt' => 'nullable|boolean',
             'settings.ddu_exempt' => 'nullable|boolean',
@@ -479,6 +498,18 @@ class MasterSettingsController extends Controller
         ]);
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
+
+        $particulars = $req->has('particulars')
+            ? array_values($req->input('particulars'))
+            : [['fee_head_id' => $req->input('fee_head_id'), 'amounts' => $req->input('amounts')]
+                + ($req->has('settings') ? ['settings' => $req->input('settings')] : [])];
+
+        // One query for every fee head instead of an exists: rule per item.
+        $headIds = array_map(fn ($p) => (int) $p['fee_head_id'], $particulars);
+        $unknown = array_diff($headIds, DB::table('fee_heads')->whereIn('id', $headIds)->pluck('id')->all());
+        if ($unknown) {
+            return response()->json(['errors' => ['fee_head_id' => ['Unknown fee head id(s): ' . implode(', ', $unknown) . '.']]], 422);
+        }
 
         $program = DB::table('programs')->where('id', $req->program_id)->first();
         $orgId = $program?->organization_id;
@@ -493,97 +524,145 @@ class MasterSettingsController extends Controller
             'ddu_affiliated' => false,
         ];
 
-        if ($req->has('settings')) {
-            $passOut = (bool) \App\Support\Part6Rules::formType($program);
-            DB::table('fee_structure_head_settings')->updateOrInsert(
-                [
-                    'program_id' => $req->program_id,
-                    'academic_year' => $req->session_year,
-                    'semester_no' => (int) $req->semester_no,
-                    'admission_type' => $baseKey['admission_type'],
-                    'fee_head_id' => $req->fee_head_id,
-                ],
-                [
-                    'sdpgc_exempt' => $passOut && $req->boolean('settings.sdpgc_exempt'),
-                    'ddu_exempt' => $passOut && $req->boolean('settings.ddu_exempt'),
-                    'pay_in_college' => $req->boolean('settings.pay_in_college'),
-                    'updated_at' => now(),
-                ]
-            );
-        }
-
         // Normalize the incoming amounts (e.g. "Male_Gen" -> gender=male,
-        // category=gen) and group by category — drop malformed keys rather
-        // than guessing.
-        $byCategory = [];
-        foreach ($req->amounts as $genderCatKey => $value) {
-            $parts = explode('_', (string) $genderCatKey, 2);
-            if (count($parts) !== 2) {
-                continue;
+        // category=gen) and group by category, across every particular —
+        // drop malformed keys rather than guessing.
+        $byCategory = [];   // category => [gender => [fee_head_id => amount]]
+        foreach ($particulars as $p) {
+            foreach ((array) $p['amounts'] as $genderCatKey => $value) {
+                $parts = explode('_', (string) $genderCatKey, 2);
+                if (count($parts) !== 2) {
+                    continue;
+                }
+                [$gender, $category] = $parts;
+                $gender = strtolower($gender);
+                $category = strtolower($category);
+                if (!in_array($category, self::FEE_CATEGORIES, true)) {
+                    continue; // unknown category code — skip rather than create a stray row
+                }
+                $byCategory[$category][$gender][(string) $p['fee_head_id']] = (float) $value;
             }
-            [$gender, $category] = $parts;
-            $gender = strtolower($gender);
-            $category = strtolower($category);
-            if (!in_array($category, self::FEE_CATEGORIES, true)) {
-                continue; // unknown category code — skip rather than create a stray row
-            }
-            $byCategory[$category][$gender] = (float) $value;
         }
 
         if (empty($byCategory)) {
             return response()->json(['message' => 'No valid gender/category amounts were provided.'], 422);
         }
 
-        // Every category row for this key in one read, then one write per
-        // category (was read → upsert → re-read → update per category).
-        $existingRows = DB::table('fee_structures')
-            ->where($baseKey)
-            ->whereIn('category', array_keys($byCategory))
-            ->get()
-            ->keyBy('category');
+        $now = now();
+        $settingsRows = [];
+        $passOut = null;
+        foreach ($particulars as $p) {
+            if (!array_key_exists('settings', $p)) continue;
+            $passOut ??= (bool) \App\Support\Part6Rules::formType($program);
+            $s = (array) $p['settings'];
+            $settingsRows[] = [
+                'program_id' => $req->program_id,
+                'academic_year' => $req->session_year,
+                'semester_no' => (int) $req->semester_no,
+                'admission_type' => $baseKey['admission_type'],
+                'fee_head_id' => (int) $p['fee_head_id'],
+                'sdpgc_exempt' => $passOut && filter_var($s['sdpgc_exempt'] ?? false, FILTER_VALIDATE_BOOLEAN),
+                'ddu_exempt' => $passOut && filter_var($s['ddu_exempt'] ?? false, FILTER_VALIDATE_BOOLEAN),
+                'pay_in_college' => filter_var($s['pay_in_college'] ?? false, FILTER_VALIDATE_BOOLEAN),
+                'updated_at' => $now,
+            ];
+        }
 
-        $saved = 0;
-        DB::transaction(function () use ($byCategory, $baseKey, $existingRows, $orgId, $req, $program, &$saved) {
-            foreach ($byCategory as $category => $genderValues) {
-                $rowKey = $baseKey + ['category' => $category];
+        $saved = DB::transaction(function () use ($byCategory, $baseKey, $settingsRows, $orgId, $req, $program, $now) {
+            if ($settingsRows) {
+                DB::table('fee_structure_head_settings')->upsert(
+                    $settingsRows,
+                    ['program_id', 'academic_year', 'semester_no', 'admission_type', 'fee_head_id'],
+                    ['sdpgc_exempt', 'ddu_exempt', 'pay_in_college', 'updated_at']
+                );
+            }
 
+            // Locked so a concurrent save of the same structure can't
+            // overwrite these amounts with its own stale copy.
+            $existingRows = DB::table('fee_structures')
+                ->where($baseKey)
+                ->whereIn('category', array_keys($byCategory))
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get()
+                ->groupBy('category')
+                ->map->first();
+
+            $inserts = [];
+            $updates = [];
+            foreach ($byCategory as $category => $genderHeads) {
                 $existing = $existingRows->get($category);
                 $amountJson = $existing && $existing->amount_json ? json_decode($existing->amount_json, true) : [];
                 $amountJson = is_array($amountJson) ? $amountJson : [];
 
-                foreach ($genderValues as $gender => $value) {
-                    $amountJson[$gender][(string) $req->fee_head_id] = $value;
+                foreach ($genderHeads as $gender => $heads) {
+                    foreach ($heads as $feeHeadId => $value) {
+                        $amountJson[$gender][$feeHeadId] = $value;
+                    }
                 }
-
-                $values = [
-                    'organization_id' => $orgId,
-                    'term' => $req->term,
-                    'amount_json' => json_encode($amountJson),
-                    'updated_at' => now(),
-                ];
 
                 // fee_ref_id: a real, DB-backed, unique fee reference — one per
                 // (course + category) row, generated once when the row first
                 // exists, left untouched on later edits. No gender component —
-                // see AdmissionNumberService::feeRefId() header for why.
+                // see AdmissionNumberService::feeRefId() header for why. The
+                // category is part of the prefix, so refs generated for
+                // different categories in this batch can't collide.
                 $feeRefId = !$existing || !$existing->fee_ref_id
                     ? app(\App\Services\AdmissionNumberService::class)
                         ->feeRefId('fee_structures', 'fee_ref_id', $program, $category)
                     : null;
 
                 if ($existing) {
-                    DB::table('fee_structures')->where($rowKey)->update($values);
-                    if ($feeRefId) {
-                        DB::table('fee_structures')->where('id', $existing->id)->update(['fee_ref_id' => $feeRefId]);
-                    }
+                    $updates[] = [$category, json_encode($amountJson), $existing->id, $feeRefId];
                 } else {
-                    DB::table('fee_structures')->insert($rowKey + $values + ['fee_ref_id' => $feeRefId]);
+                    $inserts[] = $baseKey + [
+                        'category' => $category,
+                        'organization_id' => $orgId,
+                        'term' => $req->term,
+                        'amount_json' => json_encode($amountJson),
+                        'fee_ref_id' => $feeRefId,
+                        'updated_at' => $now,
+                    ];
                 }
-                $saved++;
             }
+
+            if ($inserts) {
+                DB::table('fee_structures')->insert($inserts);
+            }
+
+            if ($updates) {
+                // Matched on the full row key + category (as updateOrInsert
+                // did); fee_ref_id is only filled on the first row of a key.
+                $values = implode(', ', array_fill(0, count($updates), '(?::varchar, ?::text, ?::bigint, ?::varchar)'));
+                $bindings = [$orgId, $req->term, $now];
+                foreach ($updates as $u) {
+                    array_push($bindings, ...$u);
+                }
+                array_push($bindings, $baseKey['program_id'], $baseKey['academic_year'], $baseKey['semester_no'],
+                    $baseKey['admission_type'], $baseKey['sdpgc_student'], $baseKey['ddu_affiliated']);
+
+                DB::update(
+                    "UPDATE fee_structures AS f
+                        SET organization_id = ?, term = ?, updated_at = ?,
+                            amount_json = CAST(v.amount_json AS json),
+                            fee_ref_id = CASE WHEN f.id = v.first_id AND f.fee_ref_id IS NULL THEN v.fee_ref_id ELSE f.fee_ref_id END
+                       FROM (VALUES {$values}) AS v(category, amount_json, first_id, fee_ref_id)
+                      WHERE f.program_id = ? AND f.academic_year = ? AND f.semester_no = ?
+                        AND f.admission_type = ? AND f.sdpgc_student = ? AND f.ddu_affiliated = ?
+                        AND f.category = v.category",
+                    $bindings
+                );
+            }
+
+            return count($inserts) + count($updates);
         });
 
-        return response()->json(['message' => "Fee structure saved ({$saved} category row" . ($saved === 1 ? '' : 's') . ")."]);
+        $n = count($particulars);
+        return response()->json([
+            'message' => "Fee structure saved ({$n} particular" . ($n === 1 ? '' : 's') . ", {$saved} category row" . ($saved === 1 ? '' : 's') . ").",
+            'particulars' => $n,
+            'category_rows' => $saved,
+        ]);
     }
 
     // 6. Registration Fee ─────────────────────────────────────────────
