@@ -21,6 +21,9 @@ class Admission extends Model
         'documents_verified', 'approved_by', 'approved_at',
     ];
 
+    // Never serialized (not written by the app any more, but the column exists).
+    protected $hidden = ['temp_password_plain'];
+
     protected $casts = [
         'admission_date' => 'date',
         'cancel_date' => 'date',
