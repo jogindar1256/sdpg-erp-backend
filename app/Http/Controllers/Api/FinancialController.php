@@ -191,17 +191,20 @@ class FinancialController extends Controller
                 'updated_at'      => now(),
             ]);
 
-            foreach ($request->input('items') as $item) {
-                if ((float) $item['amount'] > 0) {
-                    DB::table('fee_transfer_voucher_items')->insert([
-                        'voucher_id'   => $voucherId,
-                        'fee_type'     => $item['fee_type'],
-                        'bank_account' => $item['bank_account'] ?? null,
-                        'amount'       => $item['amount'],
-                        'created_at'   => now(),
-                        'updated_at'   => now(),
-                    ]);
-                }
+            // All items in one INSERT.
+            $now = now();
+            $items = collect($request->input('items'))
+                ->filter(fn ($item) => (float) $item['amount'] > 0)
+                ->map(fn ($item) => [
+                    'voucher_id'   => $voucherId,
+                    'fee_type'     => $item['fee_type'],
+                    'bank_account' => $item['bank_account'] ?? null,
+                    'amount'       => $item['amount'],
+                    'created_at'   => $now,
+                    'updated_at'   => $now,
+                ])->values()->all();
+            if ($items) {
+                DB::table('fee_transfer_voucher_items')->insert($items);
             }
         });
 

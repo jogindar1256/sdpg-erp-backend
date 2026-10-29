@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Http\Concerns\ResolvesStudentIdentity;
+use App\Support\Payments;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
@@ -30,34 +31,67 @@ class RegistrationController extends Controller
     {
         $sessionYear = $req->session_year ?? $this->sessionYear();
 
+        // Every "latest X" aggregate below is limited to rows reachable from
+        // this session's registrations — the outer joins can't match anything
+        // else, so the result is the same, but each GROUP BY no longer scans
+        // every session's history.
+        $sessionRegIds = DB::table('direct_registrations')->select('id')
+            ->where('session_year', $sessionYear)->whereNull('deleted_at');
+        $sessionStudentIds = DB::table('students')->select('id')
+            ->whereIn('user_id', DB::table('direct_registrations')->select('user_id')
+                ->where('session_year', $sessionYear)->whereNull('deleted_at')->whereNotNull('user_id'));
+
         $latestApp = DB::table('student_applications')
             ->select('direct_registration_id', DB::raw('MAX(id) as sa_id'))
-            ->whereNotNull('direct_registration_id')
+            ->whereIn('direct_registration_id', $sessionRegIds)
             ->whereNull('deleted_at')
             ->groupBy('direct_registration_id');
 
         // Latest admission per student
         $latestAdm = DB::table('admissions')
             ->select('student_id', DB::raw('MAX(id) as adm_id'))
+            ->whereIn('student_id', $sessionStudentIds)
             ->whereNull('deleted_at')
             ->groupBy('student_id');
 
         // Latest active fee receipt per admission ("Educational Receipt")
         $latestRcpt = DB::table('fee_receipts')
             ->select('admission_id', DB::raw('MAX(id) as fr_id'))
+            ->whereIn('admission_id', DB::table('admissions')->select('id')->whereIn('student_id', $sessionStudentIds))
             ->where('status', 'active')
             ->groupBy('admission_id');
 
-        $regPaid = DB::table('payments')
-            ->select('direct_registration_id', DB::raw('MAX(id) as id'))
-            ->where('purpose', 'registration')->where('status', 'paid')
-            ->groupBy('direct_registration_id');
-        $appPaid = DB::table('payments')
-            ->select('student_application_id', DB::raw('MAX(id) as id'))
-            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
-            ->groupBy('student_application_id');
+        $regPaid = Payments::latestPaidRegistrationPayments()
+            ->whereIn('direct_registration_id', $sessionRegIds);
+        $appPaid = Payments::latestPaidApplicationPayments()
+            ->whereIn('student_application_id', DB::table('student_applications')->select('id')->whereIn('direct_registration_id', $sessionRegIds));
 
-        $records = DB::table('direct_registrations as dr')
+        // Pipeline flags, computed in SQL so the Live Status counters, the
+        // "Check Statuse" filter and pagination all run in Postgres —
+        // previously every registration of the session was pulled into PHP
+        // on every page / filter change.
+        $flag = [
+            'reg_complete'      => "COALESCE(dr.status = 'registered', false)",
+            'reg_fee_paid'      => 'regpay.id IS NOT NULL',
+            'app_final_submit'  => "COALESCE(sa.status, '') NOT IN ('', 'draft')",
+            'approved'          => "COALESCE(sa.status = 'approved', false)",
+            'edu_fee_paid'      => 'apppay.id IS NOT NULL',
+            'receipt_generated' => "COALESCE(fr.receipt_no, '') <> ''",
+        ];
+        // Scope-wide counters (they ignore check_status), plus the per-filter
+        // totals pagination needs.
+        $counters = [
+            'total'                    => 'TRUE',
+            'complete_registration'    => $flag['reg_complete'],
+            'pending_registration_fee' => "{$flag['reg_complete']} AND NOT ({$flag['reg_fee_paid']})",
+            'paid_educational_fee'     => $flag['edu_fee_paid'],
+            'receipt_generated'        => $flag['receipt_generated'],
+            'application_unpaid'       => "{$flag['app_final_submit']} AND NOT ({$flag['edu_fee_paid']})",
+            'final_submit'             => $flag['app_final_submit'],
+            'approved'                 => $flag['approved'],
+        ];
+
+        $inner = DB::table('direct_registrations as dr')
             ->leftJoin('programs as p', 'p.id', 'dr.program_id')
             ->leftJoin('students as s', 's.user_id', '=', 'dr.user_id')
             ->leftJoinSub($latestApp, 'la', 'la.direct_registration_id', '=', 'dr.id')
@@ -104,69 +138,70 @@ class RegistrationController extends Controller
                 DB::raw("CASE WHEN apppay.id IS NOT NULL THEN 'paid' ELSE NULL END as edu_payment_status"),
                 'apppay.paid_at as edu_paid_at',
                 'fr.receipt_no',
-                'fr.receipt_date'
-            )
-            ->orderByDesc('dr.created_at')
-            ->get();
-
-        // Derive pipeline flags for each row.
-        $rows = $records->map(function ($r) {
-
-        $regComplete = $r->reg_status === 'registered';
-            $regFeePaid = $r->reg_payment_status === 'paid';
-            $appSubmit = $r->app_status && $r->app_status !== 'draft';
-            $approval = match ($r->app_status) {
-                'approved' => 'Approved',
-                'on_hold', 'rejected' => 'Roll Back',
-                'cancelled' => 'Canceled',
-                default => null,
-            };
-            $eduFeePaid = $r->edu_payment_status === 'paid';
-
-            $r->reg_complete = $regComplete;
-            $r->reg_fee_paid = $regFeePaid;
-            $r->app_initiated = !empty($r->application_id);
-            $r->app_final_submit = (bool) $appSubmit;
-            $r->app_approval = $approval;
-            $r->edu_fee_paid = $eduFeePaid;
-            $r->receipt_generated = !empty($r->receipt_no);
-            return $r;
-        });
-
-        // Live Status counters (scope-wide, ignore check_status filter).
-        $summary = [
-            'complete_registration' => $rows->where('reg_complete', true)->count(),
-            // Registered (form saved) but registration fee still unpaid.
-            'pending_registration_fee' => $rows->filter(fn($r) => $r->reg_complete && !$r->reg_fee_paid)->count(),
-            'paid_educational_fee' => $rows->where('edu_fee_paid', true)->count(),
-            'receipt_generated' => $rows->where('receipt_generated', true)->count(),
-            // Application submitted (final) but educational fee not yet paid.
-            'application_unpaid' => $rows->filter(fn($r) => $r->app_final_submit && !$r->edu_fee_paid)->count(),
-            'total' => $rows->count(),
-        ];
+                'fr.receipt_date',
+                DB::raw("{$flag['reg_complete']} AS reg_complete"),
+                DB::raw("{$flag['reg_fee_paid']} AS reg_fee_paid"),
+                DB::raw('sa.id IS NOT NULL AS app_initiated'),
+                DB::raw("{$flag['app_final_submit']} AS app_final_submit"),
+                DB::raw("CASE sa.status WHEN 'approved' THEN 'Approved' WHEN 'on_hold' THEN 'Roll Back'
+                    WHEN 'rejected' THEN 'Roll Back' WHEN 'cancelled' THEN 'Canceled' END AS app_approval"),
+                DB::raw("{$flag['edu_fee_paid']} AS edu_fee_paid"),
+                DB::raw("{$flag['receipt_generated']} AS receipt_generated"),
+                DB::raw("{$flag['approved']} AS is_approved")
+            );
+        // Counters as window aggregates over the whole (unfiltered) set, so the
+        // join + aggregates run once for both the counters and the page.
+        foreach ($counters as $name => $cond) {
+            $inner->selectRaw("COUNT(*) FILTER (WHERE {$cond}) OVER () AS cnt_{$name}");
+        }
 
         // Apply the "Check Statuse" filter to the table rows only.
         $status = $req->check_status ?? 'all';
-        $filtered = $rows->filter(function ($r) use ($status) {
-            return match ($status) {
-                'complete' => $r->reg_complete,
-                'incomplete' => !$r->reg_complete,
-                'final_submit' => $r->app_final_submit,
-                'approved', 'application' => $r->app_approval === 'Approved',
-                default => true,
-            };
-        })->values();
+        [$statusCol, $totalKey] = match ($status) {
+            'complete' => ['reg_complete', 'complete_registration'],
+            'incomplete' => ['NOT reg_complete', null],
+            'final_submit' => ['app_final_submit', 'final_submit'],
+            'approved', 'application' => ['is_approved', 'approved'],
+            default => [null, 'total'],
+        };
 
-        // Manual pagination + serial numbers.
         $perPage = max(1, (int) ($req->per_page ?? 50));
         $page = max(1, (int) ($req->page ?? 1));
-        $total = $filtered->count();
 
-        $data = $filtered->forPage($page, $perPage)->values()
-            ->map(function ($r, $i) use ($page, $perPage) {
-                $r->sr_no = ($page - 1) * $perPage + $i + 1;
-                return $r;
-            });
+        $records = DB::query()->fromSub($inner, 'r')
+            ->when($statusCol, fn($q) => $q->whereRaw($statusCol))
+            // id breaks created_at ties so pages never repeat or skip a row.
+            ->orderByDesc('r.created_at')
+            ->orderByDesc('r.id')
+            ->forPage($page, $perPage)
+            ->get();
+
+        // An empty page carries no window counts — count separately then (rare:
+        // a page past the end, or a filter that matches nothing).
+        $c = $records->first() ?? DB::query()->fromSub($inner, 'r')->first(
+            array_map(fn ($n) => DB::raw("MAX(cnt_{$n}) AS cnt_{$n}"), array_keys($counters))
+        );
+        $cnt = fn (string $n) => (int) ($c->{"cnt_{$n}"} ?? 0);
+
+        $summary = [
+            'complete_registration' => $cnt('complete_registration'),
+            // Registered (form saved) but registration fee still unpaid.
+            'pending_registration_fee' => $cnt('pending_registration_fee'),
+            'paid_educational_fee' => $cnt('paid_educational_fee'),
+            'receipt_generated' => $cnt('receipt_generated'),
+            // Application submitted (final) but educational fee not yet paid.
+            'application_unpaid' => $cnt('application_unpaid'),
+            'total' => $cnt('total'),
+        ];
+        $total = $totalKey ? $cnt($totalKey) : $cnt('total') - $cnt('complete_registration');
+
+        // Drop the helper columns; number rows continuously across pages.
+        $data = $records->values()->map(function ($r, $i) use ($page, $perPage, $counters) {
+            unset($r->is_approved);
+            foreach (array_keys($counters) as $n) unset($r->{"cnt_{$n}"});
+            $r->sr_no = ($page - 1) * $perPage + $i + 1;
+            return $r;
+        });
 
         // Class dropdown options.
         $classes = DB::table('programs')
@@ -207,17 +242,11 @@ class RegistrationController extends Controller
 
         $sessionYear = $req->session_year ?: $this->sessionYear();
         $latestReg = $this->latestRegistrationSub();
-        $sessionApp = DB::table('student_applications')
-            ->select('student_id', DB::raw('MAX(id) as app_id'))
+        $sessionApp = $this->latestApplicationSub()
             ->where('academic_year', $sessionYear)
-            ->whereIn('application_type', ApplicationController::ADMISSION_APP_TYPES)
-            ->whereNull('deleted_at')
-            ->groupBy('student_id');
+            ->whereIn('application_type', ApplicationController::ADMISSION_APP_TYPES);
 
-        $statusAppPaid = DB::table('payments')
-            ->select('student_application_id', DB::raw('MAX(id) as id'))
-            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
-            ->groupBy('student_application_id');
+        $statusAppPaid = Payments::latestPaidApplicationPayments();
 
         $q = DB::table('admissions as a')
             ->join('students as s', 's.id', 'a.student_id')
@@ -292,10 +321,7 @@ class RegistrationController extends Controller
         $student = Student::flat(DB::table('students')->where('user_id', $user->id)->first());
         $pending = $this->pendingRegistrationFor($user);
 
-        $portalAppPaid = DB::table('payments')
-            ->select('student_application_id', DB::raw('MAX(id) as id'))
-            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
-            ->groupBy('student_application_id');
+        $portalAppPaid = Payments::latestPaidApplicationPayments();
 
         $app = DB::table('student_applications as sa')
             ->join('programs as p', 'p.id', 'sa.program_id')
@@ -493,10 +519,7 @@ class RegistrationController extends Controller
     {
         $user = $req->user();
 
-        $dashRegPaid = DB::table('payments')
-            ->select('direct_registration_id', DB::raw('MAX(id) as id'))
-            ->where('purpose', 'registration')->where('status', 'paid')
-            ->groupBy('direct_registration_id');
+        $dashRegPaid = Payments::latestPaidRegistrationPayments();
 
         $reg = DB::table('direct_registrations as dr')
             ->leftJoin('programs as p', 'p.id', '=', 'dr.program_id')

@@ -415,14 +415,13 @@ class SecurityController extends Controller
     {
         $items = $request->validate(['items' => 'required|array'])['items'];
 
-        DB::transaction(function () use ($items) {
-            foreach ($items as $item) {
-                DB::table('menu_shortcodes')->updateOrInsert(
-                    ['menu_path' => $item['menu_path']],
-                    ['shortcode' => strtoupper($item['shortcode']), 'updated_at' => now()]
-                );
-            }
-        });
+        $now = now();
+        DB::transaction(fn () => \App\Support\BulkWrite::updateOrInsertMany('menu_shortcodes', ['menu_path'],
+            array_map(fn ($item) => [
+                'menu_path' => $item['menu_path'],
+                'shortcode' => strtoupper($item['shortcode']),
+                'updated_at' => $now,
+            ], $items)));
 
         return response()->json(['message' => 'Shortcodes saved.']);
     }

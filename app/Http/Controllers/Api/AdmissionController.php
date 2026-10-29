@@ -13,7 +13,13 @@ class AdmissionController extends Controller
 {
     public function index(Request $request): JsonResponse
     {
-        $query = Admission::with(['student', 'program', 'application'])
+        // Only the columns the Manage Admission list shows: each row used to
+        // carry the full students row (~100 expanded fields) and the full
+        // student_applications row (all eight form parts as JSON).
+        $query = Admission::with([
+            'student:id,personal_info,mobile',
+            'program:id,name,short_name,full_name,samarth_code,level',
+        ])
             ->where('organization_id', $request->user()->organization_id);
 
         if ($request->filled('status'))
@@ -33,12 +39,7 @@ class AdmissionController extends Controller
         // filter flags rather than reusing `status` (office instruction,
         // 2026-10-26 notebook batch). Same definitions as pipelineSummary().
         if ($request->boolean('fee_paid')) {
-            $query->whereExists(function ($q) {
-                $q->select(DB::raw(1))->from('payments')
-                    ->whereColumn('payments.student_application_id', 'admissions.application_id')
-                    ->whereIn('payments.purpose', ['admission', 'semester_upgrade', 'back_paper'])
-                    ->where('payments.status', 'paid');
-            });
+            \App\Support\Payments::whereApplicationFeePaid($query, 'admissions.application_id');
         }
         if ($request->boolean('student_id_generated')) {
             $query->whereExists(function ($q) {
@@ -74,17 +75,18 @@ class AdmissionController extends Controller
             ->paginate($request->get('per_page', 20));
 
         // The application view/edit pages need the registration's unique
-        // code in the URL (ApplicationController::rejectIfCodeInvalid()).
-        $regIds = $page->getCollection()
-            ->map(fn($a) => $a->direct_registration_id ?: ($a->application->direct_registration_id ?? null))
-            ->filter()->unique()->values()->all();
-        $codes = $regIds
-            ? DB::table('direct_registrations')->whereIn('id', $regIds)->pluck('unique_code', 'id')
+        // code in the URL (ApplicationController::rejectIfCodeInvalid()):
+        // the admission's own registration, else its application's — one
+        // query for the page.
+        $ids = $page->getCollection()->pluck('id')->all();
+        $codes = $ids
+            ? DB::table('admissions as a')
+                ->leftJoin('student_applications as sa', fn ($j) => $j->on('sa.id', '=', 'a.application_id')->whereNull('sa.deleted_at'))
+                ->join('direct_registrations as dr', 'dr.id', '=', DB::raw('COALESCE(NULLIF(a.direct_registration_id, 0), sa.direct_registration_id)'))
+                ->whereIn('a.id', $ids)
+                ->pluck('dr.unique_code', 'a.id')
             : collect();
-        $page->getCollection()->each(function ($a) use ($codes) {
-            $regId = $a->direct_registration_id ?: ($a->application->direct_registration_id ?? null);
-            $a->setAttribute('code', $regId ? ($codes[$regId] ?? null) : null);
-        });
+        $page->getCollection()->each(fn ($a) => $a->setAttribute('code', $codes[$a->id] ?? null));
 
         return response()->json($page);
     }
@@ -116,38 +118,46 @@ class AdmissionController extends Controller
             ->where('status', 'registered')
             ->when($year, fn($q) => $q->where('session_year', $year))
             ->when($programId, fn($q) => $q->where('program_id', $programId))
-            ->count();
+            ->selectRaw('COUNT(*) AS registration');
 
-        $applications = fn() => DB::table('student_applications')
+        $applications = DB::table('student_applications')
             ->whereNull('deleted_at')
             ->where('organization_id', $orgId)
             ->when($year, fn($q) => $q->where('academic_year', $year))
             ->when($programId, fn($q) => $q->where('program_id', $programId))
-            ->when($semester, fn($q) => $q->where('semester_no', $semester));
+            ->when($semester, fn($q) => $q->where('semester_no', $semester))
+            ->selectRaw("COUNT(*) FILTER (WHERE status <> 'draft') AS complete_fill,
+                COUNT(*) FILTER (WHERE status = 'approved') AS approved_application");
 
-        $admissions = fn() => DB::table('admissions as a')
+        $purposes = \App\Support\Payments::APP_PURPOSES;
+        $admissions = DB::table('admissions as a')
+            ->leftJoin('students as s', 's.id', '=', 'a.student_id')
             ->where('a.organization_id', $orgId)
             ->when($year, fn($q) => $q->where('a.academic_year', $year))
             ->when($programId, fn($q) => $q->where('a.program_id', $programId))
-            ->when($semester, fn($q) => $q->where('a.semester_no', $semester));
+            ->when($semester, fn($q) => $q->where('a.semester_no', $semester))
+            ->selectRaw("COUNT(*) FILTER (WHERE EXISTS (
+                    SELECT 1 FROM payments
+                     WHERE payments.student_application_id = a.application_id
+                       AND payments.purpose IN (" . implode(', ', array_fill(0, count($purposes), '?')) . ") AND payments.status = 'paid'
+                )) AS paid_fee,
+                COUNT(DISTINCT a.student_id) FILTER (WHERE s.student_uid IS NOT NULL AND s.student_uid <> '') AS student_id_generated,
+                COUNT(*) FILTER (WHERE a.status = 'cancelled') AS admission_cancel", $purposes);
+
+        // All six counters in one round trip (was six separate count queries).
+        $c = DB::query()
+            ->fromSub($registration, 'r')
+            ->crossJoinSub($applications, 'ap')
+            ->crossJoinSub($admissions, 'ad')
+            ->first();
 
         return response()->json([
-            'registration' => $registration,
-            'complete_fill' => $applications()->where('status', '!=', 'draft')->count(),
-            'approved_application' => $applications()->where('status', 'approved')->count(),
-            'paid_fee' => $admissions()->whereExists(function ($q) {
-                $q->select(DB::raw(1))->from('payments')
-                    ->whereColumn('payments.student_application_id', 'a.application_id')
-                    ->whereIn('payments.purpose', ['admission', 'semester_upgrade', 'back_paper'])
-                    ->where('payments.status', 'paid');
-            })->count(),
-            'student_id_generated' => $admissions()
-                ->join('students as s', 's.id', 'a.student_id')
-                ->whereNotNull('s.student_uid')
-                ->where('s.student_uid', '!=', '')
-                ->distinct()
-                ->count('a.student_id'),
-            'admission_cancel' => $admissions()->where('a.status', 'cancelled')->count(),
+            'registration' => (int) $c->registration,
+            'complete_fill' => (int) $c->complete_fill,
+            'approved_application' => (int) $c->approved_application,
+            'paid_fee' => (int) $c->paid_fee,
+            'student_id_generated' => (int) $c->student_id_generated,
+            'admission_cancel' => (int) $c->admission_cancel,
         ]);
     }
 

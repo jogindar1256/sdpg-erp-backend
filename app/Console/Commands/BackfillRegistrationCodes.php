@@ -52,19 +52,27 @@ class BackfillRegistrationCodes extends Command
         $this->info("direct_registrations missing unique_code: {$missing->count()}");
 
         $done = 0;
+        $updates = [];
+        $used = [];
         foreach ($missing as $reg) {
-            $code = StudentRegistrationController::generateUniqueCode(
-                $reg->reg_type,
-                $reg->program_id,
-                $reg->session_year,
-            );
+            // Codes are written in one batch at the end, so also avoid codes
+            // already handed out in this run (the generator only checks the DB).
+            do {
+                $code = StudentRegistrationController::generateUniqueCode(
+                    $reg->reg_type,
+                    $reg->program_id,
+                    $reg->session_year,
+                );
+            } while (isset($used[$code]));
+            $used[$code] = true;
 
             $this->line(" - #{$reg->id} ({$reg->registration_no}, {$reg->session_year} {$reg->reg_type}) -> {$code}");
 
-            if (!$dryRun) {
-                DB::table('direct_registrations')->where('id', $reg->id)->update(['unique_code' => $code]);
-            }
+            $updates[] = ['id' => $reg->id, 'unique_code' => $code];
             $done++;
+        }
+        if (!$dryRun) {
+            \App\Support\BulkWrite::updateMany('direct_registrations', ['id'], $updates);
         }
 
         $this->info("unique_code backfilled on {$done} row(s).");
@@ -81,19 +89,23 @@ class BackfillRegistrationCodes extends Command
 
         $this->info("student_applications missing direct_registration_id: {$unlinked->count()}");
 
+        // Same matching rule ApplicationController::store() uses for new
+        // applications — active (non-cancelled) registration for this
+        // exact user + program + session_year, most recent if several.
+        // One query for all of them, matched in PHP.
+        $regs = DB::table('direct_registrations')
+            ->whereIn('user_id', $unlinked->pluck('user_id')->filter()->unique()->values())
+            ->where('status', '!=', 'cancelled')
+            ->orderByDesc('id')
+            ->get()
+            ->groupBy(fn ($r) => "{$r->user_id}|{$r->program_id}|{$r->session_year}")
+            ->map->first();
+
         $linked = 0;
         $skipped = 0;
+        $updates = [];
         foreach ($unlinked as $app) {
-            // Same matching rule ApplicationController::store() uses for new
-            // applications — active (non-cancelled) registration for this
-            // exact user + program + session_year, most recent if several.
-            $reg = DB::table('direct_registrations')
-                ->where('user_id', $app->user_id)
-                ->where('program_id', $app->program_id)
-                ->where('session_year', $app->academic_year)
-                ->where('status', '!=', 'cancelled')
-                ->orderByDesc('id')
-                ->first();
+            $reg = $regs["{$app->user_id}|{$app->program_id}|{$app->academic_year}"] ?? null;
 
             if (!$reg) {
                 $this->line(" - application #{$app->id}: no matching registration found — left unlinked, stays code-exempt.");
@@ -102,10 +114,11 @@ class BackfillRegistrationCodes extends Command
             }
 
             $this->line(" - application #{$app->id} -> registration #{$reg->id} ({$reg->unique_code})");
-            if (!$dryRun) {
-                DB::table('student_applications')->where('id', $app->id)->update(['direct_registration_id' => $reg->id]);
-            }
+            $updates[] = ['id' => $app->id, 'direct_registration_id' => $reg->id];
             $linked++;
+        }
+        if (!$dryRun) {
+            \App\Support\BulkWrite::updateMany('student_applications', ['id'], $updates);
         }
 
         $this->info("Linked: {$linked}. Left unlinked (no match found — will keep opening without a code check): {$skipped}.");

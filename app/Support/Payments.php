@@ -251,5 +251,42 @@ class Payments
     }
 
     /** Fee purposes that settle an application (misc never does). */
-    private const APP_PURPOSES = ['admission', 'semester_upgrade', 'back_paper'];
+    /** Payment purposes that are an application's (education) fee. */
+    public const APP_PURPOSES = ['admission', 'semester_upgrade', 'back_paper'];
+
+    // ── Set-level forms of the lookups above, for list / report queries ──
+
+    /**
+     * Subquery: latest paid application-fee payment per application —
+     * columns student_application_id, id. Join it, then join payments on id.
+     */
+    public static function latestPaidApplicationPayments(): \Illuminate\Database\Query\Builder
+    {
+        return DB::table('payments')
+            ->select('student_application_id', DB::raw('MAX(id) as id'))
+            ->whereIn('purpose', self::APP_PURPOSES)->where('status', 'paid')
+            ->groupBy('student_application_id');
+    }
+
+    /** Subquery: latest paid registration payment per registration — direct_registration_id, id. */
+    public static function latestPaidRegistrationPayments(): \Illuminate\Database\Query\Builder
+    {
+        return DB::table('payments')
+            ->select('direct_registration_id', DB::raw('MAX(id) as id'))
+            ->where('purpose', 'registration')->where('status', 'paid')
+            ->groupBy('direct_registration_id');
+    }
+
+    /**
+     * Keep only rows whose application ($applicationIdColumn, e.g.
+     * 'a.application_id') has a paid application fee — applicationFeePaid()
+     * as a WHERE EXISTS. Works on query and Eloquent builders.
+     */
+    public static function whereApplicationFeePaid($query, string $applicationIdColumn)
+    {
+        return $query->whereExists(fn ($q) => $q->select(DB::raw(1))->from('payments')
+            ->whereColumn('payments.student_application_id', $applicationIdColumn)
+            ->whereIn('payments.purpose', self::APP_PURPOSES)
+            ->where('payments.status', 'paid'));
+    }
 }

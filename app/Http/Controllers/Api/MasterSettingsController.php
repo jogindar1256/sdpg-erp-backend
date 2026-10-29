@@ -282,6 +282,12 @@ class MasterSettingsController extends Controller
 
         $typeNames = DB::table('enclosure_types')->pluck('name', 'id');
 
+        // Typed rows are keyed by enclosure_type_id, the photo row by its
+        // document_name (enclosure_type_id null) — two key shapes, so two
+        // batches; each is a fixed number of statements (BulkWrite).
+        $typed = [];
+        $photo = [];
+        $now = now();
         foreach ($req->rows as $row) {
             $typeId = $row['enclosure_type_id'] ?? null;
 
@@ -291,33 +297,35 @@ class MasterSettingsController extends Controller
                 continue;
             }
 
-            DB::table('enclosure_masters')->updateOrInsert(
-                $typeId
-                    ? [
-                        'program_id' => $req->program_id,
-                        'semester_no' => $req->semester_no,
-                        'admission_mode' => $req->admission_mode,
-                        'enclosure_type_id' => $typeId,
-                    ]
-                    : [
-                        'program_id' => $req->program_id,
-                        'semester_no' => $req->semester_no,
-                        'admission_mode' => $req->admission_mode,
-                        'enclosure_type_id' => null,
-                        'document_name' => 'Attach Color Photographs',
-                    ],
-                [
-                    // Denormalized display copy — see enclosureMasterStore().
-                    'document_name' => $typeId ? ($typeNames[$typeId] ?? null) : 'Attach Color Photographs',
-                    'condition' => $row['condition'] ?? null,
-                    'enclose' => !empty($row['enclose']),
-                    'scan_copy' => !empty($row['scan_copy']),
-                    'photo_count' => $row['photo_count'] ?? null,
-                    'is_required' => (($row['condition'] ?? '') === 'Mandatory'),
-                    'updated_at' => now(),
-                ]
-            );
+            $base = [
+                'program_id' => $req->program_id,
+                'semester_no' => $req->semester_no,
+                'admission_mode' => $req->admission_mode,
+                'enclosure_type_id' => $typeId ?: null,
+            ];
+            $values = [
+                // Denormalized display copy — see enclosureMasterStore().
+                'document_name' => $typeId ? ($typeNames[$typeId] ?? null) : 'Attach Color Photographs',
+                'condition' => $row['condition'] ?? null,
+                'enclose' => !empty($row['enclose']),
+                'scan_copy' => !empty($row['scan_copy']),
+                'photo_count' => $row['photo_count'] ?? null,
+                'is_required' => (($row['condition'] ?? '') === 'Mandatory'),
+                'updated_at' => $now,
+            ];
+            if ($typeId) {
+                $typed[] = $base + $values;
+            } else {
+                $photo[] = $values + $base; // document_name is part of this key
+            }
         }
+
+        DB::transaction(function () use ($typed, $photo) {
+            \App\Support\BulkWrite::updateOrInsertMany('enclosure_masters',
+                ['program_id', 'semester_no', 'admission_mode', 'enclosure_type_id'], $typed);
+            \App\Support\BulkWrite::updateOrInsertMany('enclosure_masters',
+                ['program_id', 'semester_no', 'admission_mode', 'enclosure_type_id', 'document_name'], $photo);
+        });
 
         return response()->json(['message' => 'Saved ' . count($req->rows) . ' document rule(s).']);
     }
@@ -1929,12 +1937,13 @@ class MasterSettingsController extends Controller
 
     public function printPermissionUpdate(Request $req)
     {
-        foreach ($req->permissions as $perm) {
-            DB::table('print_permissions')->updateOrInsert(
-                ['document_type' => $perm['document_type']],
-                ['is_allowed' => $perm['is_allowed'], 'updated_at' => now()]
-            );
-        }
+        $now = now();
+        \App\Support\BulkWrite::updateOrInsertMany('print_permissions', ['document_type'],
+            array_map(fn ($perm) => [
+                'document_type' => $perm['document_type'],
+                'is_allowed' => $perm['is_allowed'],
+                'updated_at' => $now,
+            ], (array) $req->permissions));
         return response()->json(['message' => 'Print permissions updated.']);
     }
 

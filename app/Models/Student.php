@@ -195,6 +195,20 @@ class Student extends Model
      * grouped field as a flat property, so `$row->first_name` keeps working.
      * Mutates and returns the row; null-safe.
      */
+    /**
+     * "First Middle Last" from a row/object carrying first_name /
+     * middle_name / last_name (a flat() students row, a model, or a joined
+     * row); '' when there is none. Callers decide whether '' means null.
+     */
+    public static function fullName(?object $p): string
+    {
+        return $p ? trim(implode(' ', array_filter([
+            $p->first_name ?? null,
+            $p->middle_name ?? null,
+            $p->last_name ?? null,
+        ]))) : '';
+    }
+
     public static function flat(?object $row): ?object
     {
         if (!$row) {

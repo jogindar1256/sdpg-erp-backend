@@ -187,11 +187,16 @@ class AuthorizationController extends Controller
     public function admissionVerificationNext(Request $request)
     {
         $pending = $this->pendingAdmissionQueue($request)->count();
-        $admission = $this->pendingAdmissionQueue($request)
-            ->orderBy('a.updated_at')
-            ->orderBy('a.id')
-            ->select('a.*')
-            ->first();
+        // ?record=0: just the count + list. The full card is the expensive
+        // part, and the page doesn't show it while a specific record it
+        // fetched (?q=…) is on screen.
+        $admission = $request->boolean('record', true)
+            ? $this->pendingAdmissionQueue($request)
+                ->orderBy('a.updated_at')
+                ->orderBy('a.id')
+                ->select('a.*')
+                ->first()
+            : null;
 
         // The next 10 waiting, oldest first — one light query (no per-row card build).
         $list = $this->pendingAdmissionQueue($request)

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Http\Concerns\ResolvesStudentIdentity;
 use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Models\User;
@@ -26,6 +27,8 @@ use Illuminate\Support\Str;
 
 class StudentRegistrationController extends Controller
 {
+    use ResolvesStudentIdentity;
+
     /** Eligibility / qualifying course — the only allowed values (frontend: src/lib/eligibility.ts). */
     public const ELIGIBILITY_COURSES = ['Intermediate/Equivalent', 'Graduation', 'Post Graduation'];
 
@@ -190,10 +193,8 @@ class StudentRegistrationController extends Controller
         // mobile.
         $emailUser = User::where('email', $req->email)->where('portal', 'student')->first();
         if ($emailUser) {
-            $emailUserHasActiveReg = DB::table('direct_registrations')
+            $emailUserHasActiveReg = $this->activeRegistrations()
                 ->where('user_id', $emailUser->id)
-                ->where('status', '!=', 'cancelled')
-                ->whereNull('deleted_at')
                 ->exists();
             if ($emailUserHasActiveReg) {
                 return response()->json([
@@ -369,10 +370,8 @@ class StudentRegistrationController extends Controller
             ->get();
 
         foreach ($matchedUsers as $u) {
-            $hasActiveReg = DB::table('direct_registrations')
+            $hasActiveReg = $this->activeRegistrations()
                 ->where('user_id', $u->id)
-                ->where('status', '!=', 'cancelled')
-                ->whereNull('deleted_at')
                 ->exists();
             if ($hasActiveReg) {
                 $fields = [];
@@ -753,13 +752,11 @@ class StudentRegistrationController extends Controller
             if (strlen($email) > 100 || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
                 $guardErrors['email'] = ['Enter a valid email address.'];
             } elseif ($email !== (string) ($regRow->email ?? '')) {
-                $duplicateEmail = DB::table('direct_registrations')
+                $duplicateEmail = $this->activeRegistrations()
                     ->where('email', $email)
                     ->where('session_year', $regRow->session_year)
                     ->where('reg_type', $regRow->reg_type)
                     ->where('id', '!=', $id)
-                    ->where('status', '!=', 'cancelled')
-                    ->whereNull('deleted_at')
                     ->exists();
                 if ($duplicateEmail) {
                     $guardErrors['email'] = ['This email is already used by an active registration for this session and registration type.'];
@@ -777,8 +774,7 @@ class StudentRegistrationController extends Controller
                     $guardErrors['mobile'] = ['Verify the new mobile number with OTP.'];
                 } else {
                     $ownUserId = DB::table('direct_registrations')->where('id', $id)->value('user_id');
-                    $taken = DB::table('direct_registrations')->where('mobile', $newMobile)->where('id', '!=', $id)
-                        ->where('status', '!=', 'cancelled')->whereNull('deleted_at')->exists()
+                    $taken = $this->activeRegistrations()->where('mobile', $newMobile)->where('id', '!=', $id)->exists()
                         || DB::table('users')->where('portal', 'student')->where('mobile', $newMobile)
                             ->when($ownUserId, fn($q) => $q->where('id', '!=', $ownUserId))->exists();
                     if ($taken) {
@@ -1692,11 +1688,9 @@ class StudentRegistrationController extends Controller
             $user = User::where('mobile', $reg->mobile)->where('portal', 'student')->first();
 
             if ($user && (int) ($reg->user_id ?? 0) !== $user->id) {
-                $hasActiveRegistration = DB::table('direct_registrations')
+                $hasActiveRegistration = $this->activeRegistrations()
                     ->where('mobile', $reg->mobile)
                     ->where('id', '!=', $reg->id)
-                    ->where('status', '!=', 'cancelled')
-                    ->whereNull('deleted_at')
                     ->exists();
 
                 if (!$hasActiveRegistration) {
