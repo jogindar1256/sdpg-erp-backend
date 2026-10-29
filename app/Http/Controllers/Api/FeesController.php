@@ -149,9 +149,10 @@ class FeesController extends Controller
         ]);
     }
 
-    // ─── Final Fee Receipt: GET/POST /fees/generate, GET /fees/generate/{id}/pdf ──
+    // ─── Final Fee Receipt: GET /fees/generate, /fees/generate/preview, /fees/generate/{id}/pdf ──
     // Lists the education-fee receipts already PAID (Applications → Edu. Fee →
-    // Pay) for a type; Generate renders the "Final Fee Receipt" PDF.
+    // Pay) for a type; one student at a time, the PDF route renders the
+    // "Final Fee Receipt" on first print and downloads it.
     private const GENERATE_TYPES = ['regular_admission', 'back_paper', 'semester_upgrade'];
 
     public function generateIndex(Request $request): JsonResponse
@@ -392,34 +393,6 @@ class FeesController extends Controller
     private function generateTypeLabel(string $type): string
     {
         return ['regular_admission' => 'Regular', 'back_paper' => 'Back Paper', 'semester_upgrade' => 'Semester Upgrade'][$type] ?? 'Regular';
-    }
-
-    /** POST /fees/generate {type, receipt_ids[]} — render the PDFs. */
-    public function generateStore(Request $request): JsonResponse
-    {
-        $data = $request->validate([
-            'receipt_ids' => 'required|array|min:1|max:200',
-            'receipt_ids.*' => 'integer',
-        ]);
-
-        $svc = app(\App\Services\FinalFeeReceiptService::class);
-        $ok = 0;
-        $failed = [];
-        foreach (\App\Models\FeeReceipt::whereIn('id', $data['receipt_ids'])->get() as $receipt) {
-            try {
-                $svc->generate($receipt, $request->user()?->id);
-                $ok++;
-            } catch (\Throwable $e) {
-                \Illuminate\Support\Facades\Log::error("Final fee receipt failed for receipt {$receipt->id}: " . $e->getMessage());
-                $failed[] = $receipt->receipt_no;
-            }
-        }
-
-        return response()->json([
-            'count' => $ok,
-            'failed' => $failed,
-            'message' => $failed ? "Generated {$ok}; failed: " . implode(', ', $failed) : "Generated {$ok} receipt(s).",
-        ], $ok ? 200 : 500);
     }
 
     /** GET /fees/generate/{id}/pdf — download final-fee-receipt-[receipt_no].pdf (renders it if needed). */
