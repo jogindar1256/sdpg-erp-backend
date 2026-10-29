@@ -128,20 +128,9 @@ class ApplicationController extends Controller
             $sa->computed_college_fee = 0.0;
         }
 
-        $sa->documents = DB::table('student_application_documents')
-            ->where('application_id', $sa->id)
-            ->get()
-            ->map(function ($doc) {
-
-                try {
-                    $doc->url = Storage::disk('supabase')->exists($doc->path)
-                        ? Storage::disk('supabase')->url($doc->path)
-                        : Storage::disk('public')->url($doc->path);
-                } catch (\Throwable $e) {
-                    $doc->url = Storage::disk('public')->url($doc->path);
-                }
-                return $doc;
-            });
+        $sa->documents = $this->withDocumentUrls(
+            DB::table('student_application_documents')->where('application_id', $sa->id)->get()
+        );
 
         $photoDoc = $sa->documents->firstWhere('document_type', 'photo');
         $sigDoc = $sa->documents->firstWhere('document_type', 'signature');
@@ -954,6 +943,34 @@ class ApplicationController extends Controller
     private const ADMISSION_FINAL_STATUSES = ['active', 'cancelled', 'passed_out', 'transferred'];
 
     /** The registration an application came from (its own link, else the user's latest). */
+    /**
+     * Sets ->url on each document row. Which disk a file lives on is stored
+     * in student_application_documents.disk, so building the URL costs no
+     * network call. Older rows (disk NULL) are checked against Supabase once
+     * — one HTTP HEAD per file — and the answer is saved, so that check never
+     * repeats. (Before, every document was HEAD-checked on every page load.)
+     */
+    private function withDocumentUrls($docs)
+    {
+        $resolved = []; // disk => [document ids]
+        foreach ($docs as $doc) {
+            $disk = $doc->disk ?? null;
+            if ($disk === null) {
+                try {
+                    $disk = Storage::disk('supabase')->exists($doc->path) ? 'supabase' : 'public';
+                    $resolved[$disk][] = $doc->id;
+                } catch (\Throwable $e) {
+                    $disk = 'public'; // storage unreachable — don't save a guess
+                }
+            }
+            $doc->url = Storage::disk($disk)->url($doc->path);
+        }
+        foreach ($resolved as $disk => $ids) {
+            DB::table('student_application_documents')->whereIn('id', $ids)->update(['disk' => $disk]);
+        }
+        return $docs;
+    }
+
     private function registrationForApp(object $app): ?object
     {
         if (!empty($app->direct_registration_id)) {
@@ -4095,6 +4112,7 @@ class ApplicationController extends Controller
             ['application_id' => $id, 'document_type' => $docType],
             [
                 'path' => $path,
+                'disk' => 'supabase',
                 'filename' => $req->file('file')->getClientOriginalName(),
                 'status' => 'uploaded',
                 'updated_at' => now(),
@@ -4137,6 +4155,7 @@ class ApplicationController extends Controller
             ['application_id' => $id, 'document_type' => $docType],
             [
                 'path' => $path,
+                'disk' => 'supabase',
                 'filename' => $req->file('file')->getClientOriginalName(),
                 'status' => 'uploaded',
                 'updated_at' => now(),

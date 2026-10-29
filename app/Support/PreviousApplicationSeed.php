@@ -189,6 +189,7 @@ class PreviousApplicationSeed
                 ['application_id' => $toId, 'document_type' => $doc->document_type],
                 [
                     'path' => $new,
+                    'disk' => $disk,
                     'filename' => $doc->filename,
                     'status' => 'uploaded',
                     'created_at' => now(),
