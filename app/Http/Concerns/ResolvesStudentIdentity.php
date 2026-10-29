@@ -42,12 +42,19 @@ trait ResolvesStudentIdentity
     protected function withComposedName($row)
     {
         if (empty($row->name)) {
-            $row->name = trim(implode(' ', array_filter([
-                $row->first_name ?? null,
-                $row->middle_name ?? null,
-                $row->last_name ?? null,
-            ])));
+            $row->name = \App\Models\Student::fullName($row);
         }
         return $row;
+    }
+
+    /**
+     * Registrations that count as live: not cancelled, not soft-deleted.
+     * Chain the rest (->where('user_id', …), ->exists(), …).
+     */
+    protected function activeRegistrations()
+    {
+        return DB::table('direct_registrations')
+            ->where('status', '!=', 'cancelled')
+            ->whereNull('deleted_at');
     }
 }

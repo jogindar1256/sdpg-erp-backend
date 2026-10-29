@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Http\Concerns\LocksStudentIdentity;
+use App\Http\Concerns\ResolvesStudentIdentity;
 use App\Jobs\GenerateFeeReceiptPdf;
 use App\Models\FeeReceipt;
 use App\Services\AdmissionNumberService;
@@ -28,7 +29,7 @@ class ApplicationController extends Controller
     /** parseApp()'s fee calculation, reused by verificationCardData() right after. */
     private ?array $lastFeePreview = null;
 
-    use LocksStudentIdentity;
+    use LocksStudentIdentity, ResolvesStudentIdentity;
 
     // =========================================================================
     // SHARED HELPER
@@ -58,11 +59,7 @@ class ApplicationController extends Controller
             ->first());
 
         if ($sa->student) {
-            $sa->student->name = trim(implode(' ', array_filter([
-                $sa->student->first_name ?? null,
-                $sa->student->middle_name ?? null,
-                $sa->student->last_name ?? null,
-            ])));
+            $sa->student->name = Student::fullName($sa->student);
             $sa->student->dob = $sa->student->date_of_birth ?? null;
             $sa->student->state = $sa->student->permanent_state ?? null;
         }
@@ -191,20 +188,13 @@ class ApplicationController extends Controller
             ->select('student_id', 'program_id', DB::raw('MAX(id) as admission_id'))
             ->groupBy('student_id', 'program_id');
 
-        $latestReg = DB::table('direct_registrations')
-            ->select('user_id', DB::raw('MAX(id) as reg_id'))
-            ->whereNull('deleted_at')
-            ->groupBy('user_id');
+        $latestReg = $this->latestRegistrationSub();
 
         // Latest paid application-fee payment per student_application_id —
         // used twice below: once keyed to sa.id itself (back_paper's own
         // fee), once keyed to adm.application_id (the admission's own
         // originating application fee).
-        $paidAppFee = DB::table('payments')
-            ->select('student_application_id', DB::raw('MAX(id) as id'))
-            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])
-            ->where('status', 'paid')
-            ->groupBy('student_application_id');
+        $paidAppFee = \App\Support\Payments::latestPaidApplicationPayments();
 
         // students is now a LEFT join — was an inner join, which silently
         // dropped every 'regular' application from this list.
@@ -298,11 +288,7 @@ class ApplicationController extends Controller
             // Fall back to the students-table name parts if no registration
             // snapshot was found for this row (dr.name came back null).
             if (empty($row->name)) {
-                $row->name = trim(implode(' ', array_filter([
-                    $row->first_name ?? null,
-                    $row->middle_name ?? null,
-                    $row->last_name ?? null,
-                ]))) ?: null;
+                $row->name = Student::fullName($row) ?: null;
             }
             $row->dob = $row->dob ?? null;
             $row->status_label = str_replace('_', ' ', ucwords($row->status, '_'));
@@ -343,10 +329,7 @@ class ApplicationController extends Controller
 
         $q = trim($req->q);
 
-        $latestReg = DB::table('direct_registrations')
-            ->select('user_id', DB::raw('MAX(id) as reg_id'))
-            ->whereNull('deleted_at')
-            ->groupBy('user_id');
+        $latestReg = $this->latestRegistrationSub();
 
         $app = DB::table('student_applications as sa')
             ->leftJoin('students as s', 's.id', 'sa.student_id')
@@ -418,10 +401,7 @@ class ApplicationController extends Controller
         }
         $q = trim($req->q);
 
-        $latestReg = DB::table('direct_registrations')
-            ->select('user_id', DB::raw('MAX(id) as reg_id'))
-            ->whereNull('deleted_at')
-            ->groupBy('user_id');
+        $latestReg = $this->latestRegistrationSub();
 
         $student = DB::table('students as s')
             ->leftJoin('student_applications as sa', function ($j) use ($q) {
@@ -480,11 +460,7 @@ class ApplicationController extends Controller
             ->whereNull('deleted_at')
             ->first();
 
-        $student->name = $student->name ?: trim(implode(' ', array_filter([
-            $student->first_name ?? null,
-            $student->middle_name ?? null,
-            $student->last_name ?? null,
-        ])));
+        $student->name = $student->name ?: Student::fullName($student);
 
         return response()->json([
             'student' => $student,
@@ -893,11 +869,7 @@ class ApplicationController extends Controller
         $decidedByName = $decision->decided_by ? DB::table('users')->where('id', $decision->decided_by)->value('name') : null;
         $releasedByName = $decision->released_by ? DB::table('users')->where('id', $decision->released_by)->value('name') : null;
 
-        $studentName = $student ? trim(implode(' ', array_filter([
-            $student->first_name ?? null,
-            $student->middle_name ?? null,
-            $student->last_name ?? null,
-        ]))) : null;
+        $studentName = $student ? Student::fullName($student) : null;
 
         try {
             $pdf = Pdf::loadView('pdf.hold-reject-slip', [
@@ -976,10 +948,8 @@ class ApplicationController extends Controller
         if (!$userId) {
             return null;
         }
-        return DB::table('direct_registrations')
+        return $this->activeRegistrations()
             ->where('user_id', $userId)
-            ->where('status', '!=', 'cancelled')
-            ->whereNull('deleted_at')
             ->orderByDesc('id')
             ->first();
     }
@@ -997,9 +967,7 @@ class ApplicationController extends Controller
             ? (self::loadedRow($app, 'student', $app->student_id)
                 ?? Student::flat(DB::table('students')->where('id', $app->student_id)->first()))
             : null;
-        $studentName = $student
-            ? trim(implode(' ', array_filter([$student->first_name ?? null, $student->middle_name ?? null, $student->last_name ?? null])))
-            : null;
+        $studentName = $student ? Student::fullName($student) : null;
 
         return array_filter([
             'name' => $reg->name ?? ($studentName ?: null),
@@ -1528,10 +1496,8 @@ class ApplicationController extends Controller
 
         $user = DB::table('users')->where('id', $app->user_id)->first();
 
-        $registration = DB::table('direct_registrations')
+        $registration = $this->activeRegistrations()
             ->where('user_id', $app->user_id)
-            ->where('status', '!=', 'cancelled')
-            ->whereNull('deleted_at')
             ->orderByDesc('id')
             ->first();
 
@@ -2125,10 +2091,7 @@ class ApplicationController extends Controller
 
     public function holdRejectSearch(Request $req)
     {
-        $latestReg = DB::table('direct_registrations')
-            ->select('user_id', DB::raw('MAX(id) as reg_id'))
-            ->whereNull('deleted_at')
-            ->groupBy('user_id');
+        $latestReg = $this->latestRegistrationSub();
 
         $latestDecisionIds = DB::table('rejected_applications')
             ->select('student_application_id', DB::raw('MAX(id) as decision_id'))
@@ -2227,11 +2190,7 @@ class ApplicationController extends Controller
 
         $result->getCollection()->transform(function ($row) use ($appDocs, $fallbackUrls) {
             if (empty($row->name)) {
-                $row->name = trim(implode(' ', array_filter([
-                    $row->first_name ?? null,
-                    $row->middle_name ?? null,
-                    $row->last_name ?? null,
-                ]))) ?: null;
+                $row->name = Student::fullName($row) ?: null;
             }
             $row->objections = $row->objections ? json_decode($row->objections, true) : [];
             $row->part_1 = $row->part_1 ? (is_string($row->part_1) ? json_decode($row->part_1, true) : $row->part_1) : null;
@@ -2578,7 +2537,7 @@ class ApplicationController extends Controller
         }
 
         $student = Student::flat(DB::table('students')->where('id', $sa->student_id)->first());
-        $name = $student ? trim(implode(' ', array_filter([$student->first_name ?? null, $student->middle_name ?? null, $student->last_name ?? null]))) : '';
+        $name = Student::fullName($student);
         // A first-time applicant has no students row yet — prefill the
         // checkout from the registration instead.
         $who = $this->applicantSnapshot($sa);
@@ -3295,11 +3254,7 @@ class ApplicationController extends Controller
             ->select('student_application_id', DB::raw('MAX(id) as decision_id'))
             ->groupBy('student_application_id');
 
-        $paidAppFee = DB::table('payments')
-            ->select('student_application_id', DB::raw('MAX(id) as id'))
-            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])
-            ->where('status', 'paid')
-            ->groupBy('student_application_id');
+        $paidAppFee = \App\Support\Payments::latestPaidApplicationPayments();
 
         $apps = DB::table('student_applications as sa')
             ->join('programs as p', 'p.id', 'sa.program_id')
@@ -4263,15 +4218,13 @@ class ApplicationController extends Controller
         $user = $req->user();
         $type = $req->query('type', 'regular');
 
-        $regRows = DB::table('direct_registrations')
+        $regRows = $this->activeRegistrations()
             ->where(function ($q) use ($user) {
                 $q->where('user_id', $user->id);
                 if (!empty($user->mobile))
                     $q->orWhere('mobile', $user->mobile);
             })
             ->where('session_year', $session)
-            ->where('status', '!=', 'cancelled')
-            ->whereNull('deleted_at')
             ->get();
 
         if ($regRows->isEmpty()) {

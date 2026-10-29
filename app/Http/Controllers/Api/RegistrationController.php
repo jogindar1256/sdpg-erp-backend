@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Models\Student;
 use App\Http\Controllers\Controller;
 use App\Http\Concerns\ResolvesStudentIdentity;
+use App\Support\Payments;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
@@ -60,16 +61,10 @@ class RegistrationController extends Controller
             ->where('status', 'active')
             ->groupBy('admission_id');
 
-        $regPaid = DB::table('payments')
-            ->select('direct_registration_id', DB::raw('MAX(id) as id'))
-            ->whereIn('direct_registration_id', $sessionRegIds)
-            ->where('purpose', 'registration')->where('status', 'paid')
-            ->groupBy('direct_registration_id');
-        $appPaid = DB::table('payments')
-            ->select('student_application_id', DB::raw('MAX(id) as id'))
-            ->whereIn('student_application_id', DB::table('student_applications')->select('id')->whereIn('direct_registration_id', $sessionRegIds))
-            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
-            ->groupBy('student_application_id');
+        $regPaid = Payments::latestPaidRegistrationPayments()
+            ->whereIn('direct_registration_id', $sessionRegIds);
+        $appPaid = Payments::latestPaidApplicationPayments()
+            ->whereIn('student_application_id', DB::table('student_applications')->select('id')->whereIn('direct_registration_id', $sessionRegIds));
 
         // Pipeline flags, computed in SQL so the Live Status counters, the
         // "Check Statuse" filter and pagination all run in Postgres —
@@ -247,17 +242,11 @@ class RegistrationController extends Controller
 
         $sessionYear = $req->session_year ?: $this->sessionYear();
         $latestReg = $this->latestRegistrationSub();
-        $sessionApp = DB::table('student_applications')
-            ->select('student_id', DB::raw('MAX(id) as app_id'))
+        $sessionApp = $this->latestApplicationSub()
             ->where('academic_year', $sessionYear)
-            ->whereIn('application_type', ApplicationController::ADMISSION_APP_TYPES)
-            ->whereNull('deleted_at')
-            ->groupBy('student_id');
+            ->whereIn('application_type', ApplicationController::ADMISSION_APP_TYPES);
 
-        $statusAppPaid = DB::table('payments')
-            ->select('student_application_id', DB::raw('MAX(id) as id'))
-            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
-            ->groupBy('student_application_id');
+        $statusAppPaid = Payments::latestPaidApplicationPayments();
 
         $q = DB::table('admissions as a')
             ->join('students as s', 's.id', 'a.student_id')
@@ -332,10 +321,7 @@ class RegistrationController extends Controller
         $student = Student::flat(DB::table('students')->where('user_id', $user->id)->first());
         $pending = $this->pendingRegistrationFor($user);
 
-        $portalAppPaid = DB::table('payments')
-            ->select('student_application_id', DB::raw('MAX(id) as id'))
-            ->whereIn('purpose', ['admission', 'semester_upgrade', 'back_paper'])->where('status', 'paid')
-            ->groupBy('student_application_id');
+        $portalAppPaid = Payments::latestPaidApplicationPayments();
 
         $app = DB::table('student_applications as sa')
             ->join('programs as p', 'p.id', 'sa.program_id')
@@ -533,10 +519,7 @@ class RegistrationController extends Controller
     {
         $user = $req->user();
 
-        $dashRegPaid = DB::table('payments')
-            ->select('direct_registration_id', DB::raw('MAX(id) as id'))
-            ->where('purpose', 'registration')->where('status', 'paid')
-            ->groupBy('direct_registration_id');
+        $dashRegPaid = Payments::latestPaidRegistrationPayments();
 
         $reg = DB::table('direct_registrations as dr')
             ->leftJoin('programs as p', 'p.id', '=', 'dr.program_id')

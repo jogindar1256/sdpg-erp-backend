@@ -39,12 +39,7 @@ class AdmissionController extends Controller
         // filter flags rather than reusing `status` (office instruction,
         // 2026-10-26 notebook batch). Same definitions as pipelineSummary().
         if ($request->boolean('fee_paid')) {
-            $query->whereExists(function ($q) {
-                $q->select(DB::raw(1))->from('payments')
-                    ->whereColumn('payments.student_application_id', 'admissions.application_id')
-                    ->whereIn('payments.purpose', ['admission', 'semester_upgrade', 'back_paper'])
-                    ->where('payments.status', 'paid');
-            });
+            \App\Support\Payments::whereApplicationFeePaid($query, 'admissions.application_id');
         }
         if ($request->boolean('student_id_generated')) {
             $query->whereExists(function ($q) {
@@ -134,7 +129,7 @@ class AdmissionController extends Controller
             ->selectRaw("COUNT(*) FILTER (WHERE status <> 'draft') AS complete_fill,
                 COUNT(*) FILTER (WHERE status = 'approved') AS approved_application");
 
-        $paidPurposes = "'admission', 'semester_upgrade', 'back_paper'";
+        $purposes = \App\Support\Payments::APP_PURPOSES;
         $admissions = DB::table('admissions as a')
             ->leftJoin('students as s', 's.id', '=', 'a.student_id')
             ->where('a.organization_id', $orgId)
@@ -144,10 +139,10 @@ class AdmissionController extends Controller
             ->selectRaw("COUNT(*) FILTER (WHERE EXISTS (
                     SELECT 1 FROM payments
                      WHERE payments.student_application_id = a.application_id
-                       AND payments.purpose IN ({$paidPurposes}) AND payments.status = 'paid'
+                       AND payments.purpose IN (" . implode(', ', array_fill(0, count($purposes), '?')) . ") AND payments.status = 'paid'
                 )) AS paid_fee,
                 COUNT(DISTINCT a.student_id) FILTER (WHERE s.student_uid IS NOT NULL AND s.student_uid <> '') AS student_id_generated,
-                COUNT(*) FILTER (WHERE a.status = 'cancelled') AS admission_cancel");
+                COUNT(*) FILTER (WHERE a.status = 'cancelled') AS admission_cancel", $purposes);
 
         // All six counters in one round trip (was six separate count queries).
         $c = DB::query()

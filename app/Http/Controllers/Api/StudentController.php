@@ -145,11 +145,7 @@ class StudentController extends Controller
             ]);
         }
 
-        $fullName = trim(implode(' ', array_filter([
-            $student->first_name ?? null,
-            $student->middle_name ?? null,
-            $student->last_name ?? null,
-        ])));
+        $fullName = Student::fullName($student);
         $name = $registration->name ?? ($fullName !== '' ? $fullName : null);
 
         return response()->json(['data' => [
