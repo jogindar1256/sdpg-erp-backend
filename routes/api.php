@@ -603,7 +603,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
             // Final Fee Receipt — list paid receipts by type, generate PDF
             Route::get('generate', [FeesController::class, 'generateIndex']);
-            Route::post('generate', [FeesController::class, 'generateStore']);
+            Route::get('generate/preview', [FeesController::class, 'generatePreview']);
             Route::get('generate/{id}/pdf', [FeesController::class, 'generatePdf'])->whereNumber('id');
 
             // Verify Fee Receipts — list pending, verify/reject

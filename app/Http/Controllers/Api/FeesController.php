@@ -149,9 +149,10 @@ class FeesController extends Controller
         ]);
     }
 
-    // ─── Final Fee Receipt: GET/POST /fees/generate, GET /fees/generate/{id}/pdf ──
+    // ─── Final Fee Receipt: GET /fees/generate, /fees/generate/preview, /fees/generate/{id}/pdf ──
     // Lists the education-fee receipts already PAID (Applications → Edu. Fee →
-    // Pay) for a type; Generate renders the "Final Fee Receipt" PDF.
+    // Pay) for a type; one student at a time, the PDF route renders the
+    // "Final Fee Receipt" on first print and downloads it.
     private const GENERATE_TYPES = ['regular_admission', 'back_paper', 'semester_upgrade'];
 
     public function generateIndex(Request $request): JsonResponse
@@ -161,7 +162,8 @@ class FeesController extends Controller
         $rows = DB::table('fee_receipts as fr')
             ->leftJoin('admissions as a', 'a.id', '=', 'fr.admission_id')
             ->leftJoin('student_applications as sa', 'sa.id', '=', 'a.application_id')
-            ->leftJoin('direct_registrations as dr', 'dr.id', '=', 'a.direct_registration_id')
+            // The admission's own registration, else its application's.
+            ->leftJoin('direct_registrations as dr', 'dr.id', '=', DB::raw('COALESCE(a.direct_registration_id, sa.direct_registration_id)'))
             ->leftJoin('students as s', 's.id', '=', 'fr.student_id')
             ->leftJoin('programs as p', 'p.id', '=', 'a.program_id')
             ->whereNull('fr.deleted_at')
@@ -172,11 +174,14 @@ class FeesController extends Controller
             ->when($request->search, function ($q, $v) {
                 $q->where(function ($w) use ($v) {
                     $w->where('dr.name', 'ilike', "%{$v}%")
+                        ->orWhere('dr.registration_no', 'ilike', "%{$v}%")
                         ->orWhere('fr.receipt_no', 'ilike', "%{$v}%")
                         ->orWhere('sa.application_no', 'ilike', "%{$v}%")
                         ->orWhere('a.admission_no', 'ilike', "%{$v}%")
                         ->orWhere('sa.student_uid', 'ilike', "%{$v}%")
-                        ->orWhere('dr.mobile', 'ilike', "%{$v}%");
+                        ->orWhere('s.student_uid', 'ilike', "%{$v}%")
+                        ->orWhere('dr.mobile', 'ilike', "%{$v}%")
+                        ->orWhere('s.mobile', 'ilike', "%{$v}%");
                 });
             })
             ->orderByDesc('fr.id')
@@ -184,6 +189,7 @@ class FeesController extends Controller
             ->get([
                 'fr.id', 'fr.receipt_no', 'fr.semester_no', 'fr.net_amount', 'fr.receipt_date',
                 'fr.final_receipt_generated_at',
+                'dr.registration_no',
                 'a.admission_no', 'sa.application_no', 'sa.student_uid as app_student_uid',
                 's.student_uid as student_student_uid', 's.university_roll_no',
                 'dr.name as reg_name', 's.personal_info as s_info',
@@ -198,6 +204,7 @@ class FeesController extends Controller
                     'student' => ['name' => $name ?: null],
                     'roll_no' => $r->university_roll_no,
                     'student_uid' => $r->student_student_uid ?: $r->app_student_uid,
+                    'registration_no' => $r->registration_no,
                     'application_no' => $r->application_no,
                     'admission_no' => $r->admission_no,
                     'program' => ['id' => $r->program_id, 'short_name' => $r->short_name, 'full_name' => $r->full_name, 'samarth_code' => $r->samarth_code, 'level' => $r->level],
@@ -211,32 +218,181 @@ class FeesController extends Controller
         return response()->json(['data' => $rows, 'total' => $rows->count()]);
     }
 
-    /** POST /fees/generate {type, receipt_ids[]} — render the PDFs. */
-    public function generateStore(Request $request): JsonResponse
+    /**
+     * GET /fees/generate/preview?q=&type=&session_year=
+     * One student's Final Fee Receipt preview — the record behind the
+     * Generate link. q is an exact registration no. / application no. /
+     * student ID / mobile (also admission no. or receipt no.); the latest
+     * paid receipt of the type (and session, when given) is used.
+     */
+    public function generatePreview(Request $request): JsonResponse
     {
-        $data = $request->validate([
-            'receipt_ids' => 'required|array|min:1|max:200',
-            'receipt_ids.*' => 'integer',
-        ]);
+        $q = trim((string) $request->query('q', ''));
+        if ($q === '') {
+            return response()->json(['message' => 'Enter a Registration No., Application No., Student ID or Mobile No.'], 422);
+        }
+        $type = in_array($request->type, self::GENERATE_TYPES, true) ? $request->type : 'regular_admission';
+        $lower = mb_strtolower($q);
 
-        $svc = app(\App\Services\FinalFeeReceiptService::class);
-        $ok = 0;
-        $failed = [];
-        foreach (\App\Models\FeeReceipt::whereIn('id', $data['receipt_ids'])->get() as $receipt) {
-            try {
-                $svc->generate($receipt, $request->user()?->id);
-                $ok++;
-            } catch (\Throwable $e) {
-                \Illuminate\Support\Facades\Log::error("Final fee receipt failed for receipt {$receipt->id}: " . $e->getMessage());
-                $failed[] = $receipt->receipt_no;
-            }
+        $hit = DB::table('fee_receipts as fr')
+            ->join('admissions as a', 'a.id', '=', 'fr.admission_id')
+            ->leftJoin('student_applications as sa', 'sa.id', '=', 'a.application_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', '=', DB::raw('COALESCE(a.direct_registration_id, sa.direct_registration_id)'))
+            ->leftJoin('students as s', 's.id', '=', 'a.student_id')
+            ->whereNull('fr.deleted_at')
+            ->where('fr.status', '!=', 'cancelled')
+            ->where('fr.receipt_type', $type)
+            ->when($request->session_year, fn($w, $v) => $w->where('fr.academic_year', $v))
+            ->where(function ($w) use ($lower, $q) {
+                $w->whereRaw('LOWER(dr.registration_no) = ?', [$lower])
+                    ->orWhereRaw('LOWER(sa.application_no) = ?', [$lower])
+                    ->orWhereRaw('LOWER(s.student_uid) = ?', [$lower])
+                    ->orWhereRaw('LOWER(sa.student_uid) = ?', [$lower])
+                    ->orWhereRaw('LOWER(a.admission_no) = ?', [$lower])
+                    ->orWhereRaw('LOWER(fr.receipt_no) = ?', [$lower])
+                    ->orWhere('dr.mobile', $q)
+                    ->orWhere('s.mobile', $q);
+            })
+            ->orderByDesc('fr.id')
+            ->first(['fr.id as receipt_id', 'a.id as admission_id', 'dr.id as registration_id']);
+
+        if (!$hit) {
+            return response()->json(['message' => "No paid {$this->generateTypeLabel($type)} fee receipt found for \"{$q}\"."], 404);
+        }
+
+        $receipt = DB::table('fee_receipts')->where('id', $hit->receipt_id)->first();
+        $admission = DB::table('admissions')->where('id', $hit->admission_id)->first();
+        $card = app(ApplicationController::class)->verificationCardData($admission) ?? [];
+        $reg = $hit->registration_id ? DB::table('direct_registrations')->where('id', $hit->registration_id)->first() : null;
+        $student = $admission->student_id ? \App\Models\Student::flat(DB::table('students')->where('id', $admission->student_id)->first()) : null;
+        $app = $admission->application_id ? DB::table('student_applications')->where('id', $admission->application_id)->first(['id', 'part_2', 'part_6', 'program_id', 'academic_year', 'semester_no', 'student_uid']) : null;
+
+        $part2 = $app && $app->part_2 ? (json_decode($app->part_2, true) ?: []) : [];
+        $part6 = $app && $app->part_6 ? (json_decode($app->part_6, true) ?: []) : [];
+        $line = fn(string $label, $v) => ($v = trim((string) $v)) !== '' ? "{$label} - {$v}" : null;
+        $address = array_values(array_filter([
+            implode(', ', array_filter([
+                $line('Vill.', $part2['perm_house_no'] ?? $part2['perm_mohalla'] ?? null),
+                $line('Post', $part2['perm_post_office'] ?? null),
+            ])),
+            implode(', ', array_filter([
+                $line('Tehsil', $part2['perm_sub_district'] ?? null),
+                $line('Dist.', $part2['perm_district'] ?? null),
+            ])),
+            trim(implode(' - ', array_filter([$part2['perm_state'] ?? null, $part2['perm_pin_code'] ?? null]))),
+        ]));
+
+        $userNames = DB::table('users')->whereIn('id', array_filter([$receipt->verified_by ?? null, $receipt->generated_by ?? null]))->pluck('name', 'id');
+        $regPay = $reg ? \App\Support\Payments::paidRegistrationPayment((int) $reg->id) : null;
+        $payments = [];
+        if ($regPay) {
+            $payments[] = ['description' => 'Registration Fee', 'ref_no' => $regPay->gateway_payment_id, 'amount' => (float) $regPay->amount, 'date' => $regPay->paid_at, 'approved_by' => null];
+        }
+        $payments[] = [
+            'description' => 'Educational Fee',
+            'ref_no' => $receipt->transaction_id ?: $receipt->bank_ref_no,
+            'amount' => (float) $receipt->net_amount,
+            'date' => $receipt->receipt_date,
+            'approved_by' => $userNames[$receipt->verified_by] ?? null,
+        ];
+        $misc = DB::table('fee_receipts')
+            ->where('admission_id', $admission->id)
+            ->where('receipt_type', 'miscellaneous')
+            ->whereNull('deleted_at')
+            ->where('status', '!=', 'cancelled')
+            ->orderBy('id')
+            ->get(['id', 'receipt_no', 'net_amount', 'receipt_date', 'transaction_id', 'fee_breakdown']);
+        foreach ($misc as $m) {
+            $heads = collect(json_decode($m->fee_breakdown ?? '[]', true) ?: [])->pluck('fee_head_name')->filter()->implode(', ');
+            $payments[] = ['description' => $heads ?: 'Miscellaneous Fee', 'ref_no' => $m->transaction_id, 'amount' => (float) $m->net_amount, 'date' => $m->receipt_date, 'approved_by' => null];
         }
 
         return response()->json([
-            'count' => $ok,
-            'failed' => $failed,
-            'message' => $failed ? "Generated {$ok}; failed: " . implode(', ', $failed) : "Generated {$ok} receipt(s).",
-        ], $ok ? 200 : 500);
+            'receipt' => [
+                'id' => $receipt->id,
+                'receipt_no' => $receipt->receipt_no,
+                'type' => $type,
+                'generated' => !empty($receipt->final_receipt_generated_at),
+            ],
+            'registration_no' => $reg->registration_no ?? ($card['registration_no'] ?? null),
+            'application_no' => $card['application_no'] ?? null,
+            'admission_mode' => $this->generateTypeLabel($type),
+            'course' => [
+                'short_name' => $card['course'] ?? null,
+                'full_name' => $card['course_full_name'] ?? null,
+                'samarth_code' => $card['samarth_code'] ?? null,
+            ],
+            'semester_no' => $receipt->semester_no ?: ($admission->semester_no ?: 1),
+            'course_year' => $receipt->academic_year,
+            'enrolled' => [
+                'student_uid' => ($student->student_uid ?? null) ?: ($app->student_uid ?? null),
+                'receipt_no' => $receipt->receipt_no,
+                'account_no' => $admission->account_no ?? null,
+                'file_no' => $admission->file_no ?? null,
+                'record_no' => $admission->record_no ?? null,
+            ],
+            'ids' => [
+                'abc_id' => ($student->abc_id ?? null) ?: ($reg->abc_id ?? null),
+                'ddurn_no' => $reg->ddurn_no ?? null,
+                'aadhar_no' => ($student->aadhar_no ?? null) ?: ($reg->aadhar_no ?? ($card['aadhar_no'] ?? null)),
+                'family_id' => $reg->family_id ?? null,
+                'enrollment_no' => $student->enrollment_no ?? null,
+                'univ_roll_no' => $student->university_roll_no ?? null,
+                'tc_status' => $card['tc_status'] ?? null,
+                'migration' => $card['migration'] ?? null,
+            ],
+            'personal' => [
+                'name' => $card['name'] ?? ($reg->name ?? null),
+                'father_name' => $card['father_name'] ?? null,
+                'mother_name' => $card['mother_name'] ?? null,
+                'spouse_name' => $reg->spouse_name_english ?? null,
+                'dob' => $card['dob'] ?? null,
+                'category' => $card['category'] ?? null,
+                'gender' => $card['gender'] ?? null,
+                'domestic_state' => ($reg->domestic_state ?? null) ?: ($card['state'] ?? null),
+            ],
+            'photo_url' => $card['photo_url'] ?? null,
+            'signature_url' => $card['signature_url'] ?? null,
+            'address' => $address,
+            'mobile' => $card['mobile'] ?? ($reg->mobile ?? null),
+            'email' => $card['email'] ?? ($reg->email ?? null),
+            'subjects' => $app ? $this->previewSubjects($app, $part6) : [],
+            'payments' => $payments,
+            'misc_receipts' => $misc->map(fn($m) => ['id' => $m->id, 'receipt_no' => $m->receipt_no])->values(),
+        ]);
+    }
+
+    /**
+     * Subject | nature (Theory / Practical) | paper codes, from Part 6:
+     * PG / B.Ed. pick papers, UG picks subjects (all their papers for the
+     * course / session / semester).
+     */
+    private function previewSubjects(object $app, array $part6): array
+    {
+        $paperIds = collect([$part6['compulsory_paper_ids'] ?? [], $part6['optional_paper_ids'] ?? [], $part6['teaching_paper_ids'] ?? []])
+            ->flatten()->filter()->map(fn($v) => (int) $v)->unique()->values()->all();
+
+        $papers = DB::table('subject_papers as sp')
+            ->leftJoin('subjects as sub', 'sub.id', '=', 'sp.subject_id')
+            ->when($paperIds,
+                fn($w) => $w->whereIn('sp.id', $paperIds),
+                fn($w) => $w->whereIn('sp.subject_id', \App\Support\Part6Rules::subjectSlots($part6) ?: [0])
+                    ->where('sp.program_id', $app->program_id)
+                    ->where('sp.session_year', $app->academic_year)
+                    ->where('sp.semester_no', (string) ($app->semester_no ?: 1)))
+            ->orderBy('sp.subject_id')->orderBy('sp.paper_code')
+            ->get(['sp.subject_id', 'sub.name as subject_name', 'sp.paper_code', 'sp.paper_type']);
+
+        return $papers->groupBy('subject_id')->map(fn($ps) => [
+            'subject' => $ps->first()->subject_name,
+            'nature' => $ps->contains(fn($p) => strtolower((string) $p->paper_type) === 'practical') ? 'Practical' : 'Theory',
+            'paper_codes' => $ps->pluck('paper_code')->filter()->unique()->implode(', '),
+        ])->values()->all();
+    }
+
+    private function generateTypeLabel(string $type): string
+    {
+        return ['regular_admission' => 'Regular', 'back_paper' => 'Back Paper', 'semester_upgrade' => 'Semester Upgrade'][$type] ?? 'Regular';
     }
 
     /** GET /fees/generate/{id}/pdf — download final-fee-receipt-[receipt_no].pdf (renders it if needed). */
