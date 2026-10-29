@@ -491,8 +491,10 @@ class ExaminationController extends Controller
         $rooms = DB::table('exam_rooms')->where('is_active', true)->orderBy('building_name')->orderBy('room_no')->get();
 
         $seats = [];
+        $seatRows = [];
         $roomIdx = 0;
         $seatIdx = 0;
+        $now = now();
 
         foreach ($students as $student) {
             if ($roomIdx >= $rooms->count()) break;
@@ -502,17 +504,31 @@ class ExaminationController extends Controller
             $row = intdiv($seatIdx, $room->columns) + 1;
             $col = ($seatIdx % $room->columns) + 1;
 
-            DB::table('exam_seating')->updateOrInsert(
-                ['session_year' => $req->session_year, 'exam_date' => $req->exam_date,
-                 'student_id' => $student->student_id, 'paper_code' => $student->paper_code],
-                ['room_id' => $room->id, 'row_no' => $row, 'col_no' => $col,
-                 'updated_at' => now(), 'created_at' => now()]
-            );
+            // Keyed by the exam_seating_unique columns: a repeated student+paper
+            // keeps the last allocation (as the old per-row updateOrInsert did),
+            // and one upsert statement can't touch the same row twice anyway.
+            $seatRows[$student->student_id . '|' . $student->paper_code] = [
+                'session_year' => $req->session_year, 'exam_date' => $req->exam_date,
+                'student_id' => $student->student_id, 'paper_code' => $student->paper_code,
+                'room_id' => $room->id, 'row_no' => $row, 'col_no' => $col,
+                'created_at' => $now, 'updated_at' => $now,
+            ];
             $seats[] = ['roll' => $student->roll_no, 'room' => $room->room_no, 'row' => $row, 'col' => $col];
 
             $seatIdx++;
             if ($seatIdx >= $capacity) { $roomIdx++; $seatIdx = 0; }
         }
+
+        // One upsert per 500 seats instead of two queries per student.
+        DB::transaction(function () use ($seatRows) {
+            foreach (array_chunk(array_values($seatRows), 500) as $chunk) {
+                DB::table('exam_seating')->upsert(
+                    $chunk,
+                    ['session_year', 'exam_date', 'student_id', 'paper_code'],
+                    ['room_id', 'row_no', 'col_no', 'updated_at']
+                );
+            }
+        });
 
         return response()->json(['message' => count($seats) . ' seats allocated.', 'count' => count($seats)]);
     }
@@ -802,15 +818,19 @@ class ExaminationController extends Controller
             ->when(!$req->filled('ids') && $req->exam_type, fn($q) => $q->where('ef.exam_type', $req->exam_type))
             ->get(['ef.id', 'ef.session_year', 'ef.semester_no', 'ef.exam_type', 'a.program_id']);
 
+        $now = now();
+        $userId = $req->user()?->id;
+        $rows = $forms->map(fn ($f) => [
+            'exam_form_id' => $f->id, 'session_year' => $f->session_year, 'program_id' => $f->program_id,
+            'semester_no' => $f->semester_no, 'exam_type' => $f->exam_type,
+            'created_by' => $userId, 'created_at' => $now, 'updated_at' => $now,
+        ])->all();
+
+        // exam_form_id is unique: forms already on the roll are skipped by
+        // ON CONFLICT DO NOTHING, and the affected-row count is what was added.
         $n = 0;
-        foreach ($forms as $f) {
-            if (DB::table('exam_nominal_roll_entries')->where('exam_form_id', $f->id)->exists()) continue;
-            DB::table('exam_nominal_roll_entries')->insert([
-                'exam_form_id' => $f->id, 'session_year' => $f->session_year, 'program_id' => $f->program_id,
-                'semester_no' => $f->semester_no, 'exam_type' => $f->exam_type,
-                'created_by' => $req->user()?->id, 'created_at' => now(), 'updated_at' => now(),
-            ]);
-            $n++;
+        foreach (array_chunk($rows, 500) as $chunk) {
+            $n += DB::table('exam_nominal_roll_entries')->insertOrIgnore($chunk);
         }
         return response()->json(['message' => "{$n} record(s) added to the nominal roll.", 'count' => $n]);
     }
@@ -859,10 +879,25 @@ class ExaminationController extends Controller
     public function resultBulkUpdate(Request $req)
     {
         $req->validate(['results' => 'required|array', 'results.*.id' => 'required|integer', 'results.*.result' => 'required|string']);
-        foreach ($req->results as $item) {
-            DB::table('exam_forms')->where('id', $item['id'])
-                ->update(['result' => $item['result'], 'updated_at' => now()]);
-        }
+        // Last entry wins for a repeated id, as with the old one-update-per-row loop.
+        $byId = collect($req->results)->keyBy(fn ($item) => (int) $item['id']);
+
+        // One UPDATE … FROM (VALUES …) per 500 rows, all-or-nothing.
+        DB::transaction(function () use ($byId) {
+            foreach ($byId->chunk(500) as $chunk) {
+                $values = implode(', ', array_fill(0, $chunk->count(), '(?::bigint, ?::varchar)'));
+                $bindings = [now()];
+                foreach ($chunk as $id => $item) {
+                    array_push($bindings, $id, $item['result']);
+                }
+                DB::update(
+                    "UPDATE exam_forms SET result = v.result, updated_at = ?
+                       FROM (VALUES {$values}) AS v(id, result)
+                      WHERE exam_forms.id = v.id",
+                    $bindings
+                );
+            }
+        });
         return response()->json(['message' => count($req->results) . ' records updated.']);
     }
 

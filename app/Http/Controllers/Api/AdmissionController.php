@@ -429,8 +429,15 @@ class AdmissionController extends Controller
         if ($year)
             $query->where('academic_year', $year);
 
+        // total / verified / unverified in one query instead of three.
+        $counts = (clone $query)->toBase()
+            ->selectRaw('COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE is_verified) AS verified,
+                COUNT(*) FILTER (WHERE NOT is_verified) AS unverified')
+            ->first();
+
         return response()->json([
-            'total' => $query->count(),
+            'total' => (int) $counts->total,
             'by_status' => (clone $query)->selectRaw('status, count(*) as count')
                 ->groupBy('status')->pluck('count', 'status'),
             'by_program' => (clone $query)->with('program:id,short_name,samarth_code,level')
@@ -443,8 +450,8 @@ class AdmissionController extends Controller
                 ->groupBy('admission_type')->pluck('count', 'admission_type'),
             'by_month' => (clone $query)->selectRaw("to_char(admission_date,'Mon YYYY') as month, count(*) as count")
                 ->groupBy('month')->orderBy('month')->pluck('count', 'month'),
-            'verified_count' => (clone $query)->where('is_verified', true)->count(),
-            'unverified_count' => (clone $query)->where('is_verified', false)->count(),
+            'verified_count' => (int) $counts->verified,
+            'unverified_count' => (int) $counts->unverified,
         ]);
     }
 

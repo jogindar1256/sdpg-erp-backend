@@ -120,16 +120,25 @@ class FeesController extends Controller
             : $q->orderByDesc('fr.created_at');
 
         $perPage = 20;
-        $total   = $q->count();
         $data    = $q->forPage($request->page ?? 1, $perPage)->get()
             ->map(fn ($r) => $this->decorate($r));
 
-        $summaryRows = $this->baseReceiptQuery($request)->get();
+        // Aggregated in Postgres over the same filtered join — previously every
+        // matching receipt was loaded into PHP just to count it. Its total is
+        // the pagination total too, so no separate count() query.
+        $agg = $this->baseReceiptQuery($request)
+            ->select([])
+            ->selectRaw("COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE fr.is_verified) AS verified,
+                COUNT(*) FILTER (WHERE NOT fr.is_verified AND fr.status IS DISTINCT FROM 'cancelled') AS pending,
+                COALESCE(SUM(fr.net_amount) FILTER (WHERE fr.is_verified), 0) AS total_amount")
+            ->first();
+        $total   = (int) $agg->total;
         $summary = [
-            'total'        => $summaryRows->count(),
-            'verified'     => $summaryRows->where('is_verified', true)->count(),
-            'pending'      => $summaryRows->where('is_verified', false)->where('status', '!=', 'cancelled')->count(),
-            'total_amount' => (float) $summaryRows->where('is_verified', true)->sum('amount'),
+            'total'        => $total,
+            'verified'     => (int) $agg->verified,
+            'pending'      => (int) $agg->pending,
+            'total_amount' => (float) $agg->total_amount,
         ];
 
         return response()->json([
@@ -261,14 +270,20 @@ class FeesController extends Controller
 
         $data = $q->get()->map(fn ($r) => $this->decorate($r));
 
-        $todayRows = DB::table('fee_receipts as fr')
+        // Aggregated in Postgres — previously every receipt of the session
+        // (all columns) was loaded into PHP for these three numbers.
+        $agg = DB::table('fee_receipts as fr')
             ->when($request->session, fn ($w, $s) => $w->where('fr.academic_year', $s))
-            ->get();
+            ->selectRaw("COUNT(*) FILTER (WHERE NOT fr.is_verified AND fr.status IS DISTINCT FROM 'cancelled') AS pending,
+                COUNT(*) FILTER (WHERE fr.is_verified AND fr.verified_at::date = ?::date) AS verified_today,
+                COALESCE(SUM(fr.net_amount) FILTER (WHERE NOT fr.is_verified AND fr.status IS DISTINCT FROM 'cancelled'), 0) AS pending_amount",
+                [now()->toDateString()])
+            ->first();
 
         $summary = [
-            'pending'        => $todayRows->where('is_verified', false)->where('status', '!=', 'cancelled')->count(),
-            'verified_today' => $todayRows->where('is_verified', true)->filter(fn ($r) => $r->verified_at && substr($r->verified_at, 0, 10) === now()->toDateString())->count(),
-            'pending_amount' => (float) $todayRows->where('is_verified', false)->where('status', '!=', 'cancelled')->sum('net_amount'),
+            'pending'        => (int) $agg->pending,
+            'verified_today' => (int) $agg->verified_today,
+            'pending_amount' => (float) $agg->pending_amount,
         ];
 
         return response()->json([
