@@ -27,7 +27,6 @@ return new class extends Migration {
         ['admissions_student_id_index',            'admissions',           ['student_id']],
         ['admissions_program_id_index',            'admissions',           ['program_id']],
         ['admissions_application_id_index',        'admissions',           ['application_id']],
-        ['admissions_direct_registration_id_index', 'admissions',          ['direct_registration_id']],
         ['admissions_academic_year_semester_no_index', 'admissions',       ['academic_year', 'semester_no']],
         ['fee_receipts_admission_id_index',        'fee_receipts',         ['admission_id']],
         ['fee_receipts_academic_year_is_verified_index', 'fee_receipts',   ['academic_year', 'is_verified']],
