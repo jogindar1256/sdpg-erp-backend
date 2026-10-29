@@ -161,7 +161,8 @@ class PreviousApplicationSeed
     /** Duplicate each uploaded enclosure into the new application's own storage folder. */
     private static function copyDocuments(int $fromId, int $toId): int
     {
-        $n = 0;
+        $rows = [];
+        $now = now();
         $docs = DB::table('student_application_documents')->where('application_id', $fromId)->get();
         foreach ($docs as $doc) {
             // The recorded disk when there is one; older rows are probed.
@@ -186,20 +187,20 @@ class PreviousApplicationSeed
             } catch (\Throwable $e) {
                 continue;
             }
-            DB::table('student_application_documents')->updateOrInsert(
-                ['application_id' => $toId, 'document_type' => $doc->document_type],
-                [
-                    'path' => $new,
-                    'disk' => $disk,
-                    'filename' => $doc->filename,
-                    'status' => 'uploaded',
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ]
-            );
-            $n++;
+            $rows[] = [
+                'application_id' => $toId,
+                'document_type' => $doc->document_type,
+                'path' => $new,
+                'disk' => $disk,
+                'filename' => $doc->filename,
+                'status' => 'uploaded',
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
         }
-        return $n;
+        // The rows for every copied file in one batch (files are copied above).
+        \App\Support\BulkWrite::updateOrInsertMany('student_application_documents', ['application_id', 'document_type'], $rows);
+        return count($rows);
     }
 
     private static function decode($v): array
