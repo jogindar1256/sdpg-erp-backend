@@ -43,115 +43,98 @@ class DashboardController extends Controller
         // PG group includes BEd per the original dashboard's own comment/labeling.
         $pgLevels = ['PG', 'BEd'];
 
-        $filterLevel = function ($q, array $levels) {
-            return $q->whereIn('p.level', $levels);
-        };
-
         // ─────────────────────────────────────────────────────────────────────
         // 1-2. NEW REGISTERED — UG / PG, from direct_registrations.
         // A registration has no semester field — it only exists at all as a
         // "semester 1" event, so an explicit non-1 semester filter zeroes it.
+        // Both counts come from one query (COUNT … FILTER).
         // ─────────────────────────────────────────────────────────────────────
-        $regCount = function (array $regTypes) use ($session, $semNo) {
-            if ($semNo !== '' && $semNo !== null && (int) $semNo !== 1) return 0;
+        $in = fn (array $values) => implode(', ', array_fill(0, count($values), '?'));
+        $ugRegTypes = ['UG'];
+        $pgRegTypes = ['PG', 'BED'];
 
+        $ugRegisteredNew = 0;
+        $pgRegisteredNew = 0;
+        if (!($semNo !== '' && $semNo !== null && (int) $semNo !== 1)) {
             $q = DB::table('direct_registrations')
                 ->whereNull('deleted_at')
-                ->where('status', '!=', 'cancelled')
-                ->whereIn('reg_type', $regTypes);
+                ->where('status', '!=', 'cancelled');
             if ($session) $q->where('session_year', $session);
-            return $q->count();
-        };
-
-        $ugRegisteredNew = $regCount(['UG']);
-        $pgRegisteredNew = $regCount(['PG', 'BED']);
-
-        // ─────────────────────────────────────────────────────────────────────
-        // 3. NEW ADMISSION — UG (1st sem)
-        // ─────────────────────────────────────────────────────────────────────
-        $ugAdmissionNew = $filterLevel(
-            $applySemNo($admBase()->where('a.semester_no', 1), $semNo === '' ? '' : $semNo),
-            $ugLevels
-        )->count();
-
-        // 4. NEW ADMISSION — PG (1st sem)
-        $pgAdmissionNew = $filterLevel(
-            $applySemNo($admBase()->where('a.semester_no', 1), $semNo === '' ? '' : $semNo),
-            $pgLevels
-        )->count();
+            $regs = $q->selectRaw(
+                'COUNT(*) FILTER (WHERE reg_type IN (' . $in($ugRegTypes) . ')) AS ug,
+                 COUNT(*) FILTER (WHERE reg_type IN (' . $in($pgRegTypes) . ')) AS pg',
+                [...$ugRegTypes, ...$pgRegTypes]
+            )->first();
+            $ugRegisteredNew = (int) $regs->ug;
+            $pgRegisteredNew = (int) $regs->pg;
+        }
 
         // ─────────────────────────────────────────────────────────────────────
-        // 5. UPGRADED ADMISSION — UG (3rd & 5th sem)
+        // 3-6. NEW ADMISSION (1st sem) and UPGRADED ADMISSION (UG 3rd & 5th,
+        // PG 3rd sem), UG / PG — all four from one query.
         // ─────────────────────────────────────────────────────────────────────
-        $ugAdmissionUpgrade = $filterLevel(
-            $applySemNo(
-                $admBase()->whereIn('a.semester_no', [3, 5]),
-                $semNo === '' ? '' : $semNo
-            ),
-            $ugLevels
-        )->count();
+        $adm = $applySemNo($admBase(), $semNo)->selectRaw(
+            'COUNT(*) FILTER (WHERE a.semester_no = 1 AND p.level IN (' . $in($ugLevels) . ')) AS ug_new,
+             COUNT(*) FILTER (WHERE a.semester_no = 1 AND p.level IN (' . $in($pgLevels) . ')) AS pg_new,
+             COUNT(*) FILTER (WHERE a.semester_no IN (3, 5) AND p.level IN (' . $in($ugLevels) . ')) AS ug_upgrade,
+             COUNT(*) FILTER (WHERE a.semester_no = 3 AND p.level IN (' . $in($pgLevels) . ')) AS pg_upgrade',
+            [...$ugLevels, ...$pgLevels, ...$ugLevels, ...$pgLevels]
+        )->first();
 
-        // 6. UPGRADED ADMISSION — PG (3rd sem)
-        $pgAdmissionUpgrade = $filterLevel(
-            $applySemNo(
-                $admBase()->where('a.semester_no', 3),
-                $semNo === '' ? '' : $semNo
-            ),
-            $pgLevels
-        )->count();
+        $ugAdmissionNew     = (int) $adm->ug_new;
+        $pgAdmissionNew     = (int) $adm->pg_new;
+        $ugAdmissionUpgrade = (int) $adm->ug_upgrade;
+        $pgAdmissionUpgrade = (int) $adm->pg_upgrade;
 
         // ─────────────────────────────────────────────────────────────────────
         // 7-9. Gender breakdown — New / Upgraded / Total Admission
-        //      Joins with students table to get gender
+        //      Joins with students table to get gender. One grouped query:
+        //      new = semester 1, upgraded = any other (non-null) semester,
+        //      total = every row.
         // ─────────────────────────────────────────────────────────────────────
-        $genderCount = function (string $type) use ($applySemNo, $semNo, $session) {
-            $q = DB::table('admissions as a')
-                ->join('students as s', 's.id', '=', 'a.student_id')
-                ->whereNull('a.deleted_at');
-
-            if ($session) $q->where('a.academic_year', $session);
-
-            // type filter
-            if ($type === 'new')      $q->where('a.semester_no', 1);
-            if ($type === 'upgraded') $q->whereNotIn('a.semester_no', [1]);
-
-            // semester filter
-            $q = $applySemNo($q, $semNo);
-
-            $rows = $q->select(
+        $q = DB::table('admissions as a')
+            ->join('students as s', 's.id', '=', 'a.student_id')
+            ->whereNull('a.deleted_at');
+        if ($session) $q->where('a.academic_year', $session);
+        $genderRows = $applySemNo($q, $semNo)
+            ->select(
                 DB::raw("LOWER(s.personal_info->>'gender') as gender"),
-                DB::raw("COUNT(*) as total")
+                DB::raw('COUNT(*) FILTER (WHERE a.semester_no = 1) as new_total'),
+                DB::raw('COUNT(*) FILTER (WHERE a.semester_no <> 1) as upgraded_total'),
+                DB::raw('COUNT(*) as all_total')
             )
             ->groupBy('s.personal_info->gender')
             ->get();
 
+        $genderCount = function (string $column) use ($genderRows) {
             $male   = 0; $female = 0; $trans = 0;
-            foreach ($rows as $r) {
+            foreach ($genderRows as $r) {
                 $g = strtolower($r->gender ?? '');
-                if (str_starts_with($g, 'm'))      $male   += $r->total;
-                elseif (str_starts_with($g, 'f'))  $female += $r->total;
-                else                                $trans  += $r->total;
+                if (str_starts_with($g, 'm'))      $male   += $r->{$column};
+                elseif (str_starts_with($g, 'f'))  $female += $r->{$column};
+                else                                $trans  += $r->{$column};
             }
             return ['male' => $male, 'female' => $female, 'trans' => $trans, 'total' => $male + $female + $trans];
         };
 
-        $newGender      = $genderCount('new');
-        $upgradedGender = $genderCount('upgraded');
-        $allGender      = $genderCount('all');
+        $newGender      = $genderCount('new_total');
+        $upgradedGender = $genderCount('upgraded_total');
+        $allGender      = $genderCount('all_total');
 
         // ── Sessions list for filter dropdown ─────────────────────────────────
         // Union with registration sessions so a session with registrations but
-        // no admission yet is still selectable.
+        // no admission yet is still selectable. UNION de-duplicates in
+        // Postgres instead of pulling one value per admission row into PHP.
         $sessions = DB::table('admissions')
             ->whereNotNull('academic_year')
-            ->pluck('academic_year')
-            ->merge(
+            ->select('academic_year as session')
+            ->union(
                 DB::table('direct_registrations')
                     ->whereNull('deleted_at')
                     ->whereNotNull('session_year')
-                    ->pluck('session_year')
+                    ->select('session_year as session')
             )
-            ->unique()
+            ->pluck('session')
             ->sortDesc()
             ->values();
 

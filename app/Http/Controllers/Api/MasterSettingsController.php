@@ -480,8 +480,8 @@ class MasterSettingsController extends Controller
         if ($v->fails())
             return response()->json(['errors' => $v->errors()], 422);
 
-        $orgId = DB::table('programs')->where('id', $req->program_id)->value('organization_id');
         $program = DB::table('programs')->where('id', $req->program_id)->first();
+        $orgId = $program?->organization_id;
 
         $baseKey = [
             'program_id' => $req->program_id,
@@ -534,40 +534,54 @@ class MasterSettingsController extends Controller
             return response()->json(['message' => 'No valid gender/category amounts were provided.'], 422);
         }
 
+        // Every category row for this key in one read, then one write per
+        // category (was read → upsert → re-read → update per category).
+        $existingRows = DB::table('fee_structures')
+            ->where($baseKey)
+            ->whereIn('category', array_keys($byCategory))
+            ->get()
+            ->keyBy('category');
+
         $saved = 0;
-        foreach ($byCategory as $category => $genderValues) {
-            $rowKey = $baseKey + ['category' => $category];
+        DB::transaction(function () use ($byCategory, $baseKey, $existingRows, $orgId, $req, $program, &$saved) {
+            foreach ($byCategory as $category => $genderValues) {
+                $rowKey = $baseKey + ['category' => $category];
 
-            $existing = DB::table('fee_structures')->where($rowKey)->first();
-            $amountJson = $existing && $existing->amount_json ? json_decode($existing->amount_json, true) : [];
-            $amountJson = is_array($amountJson) ? $amountJson : [];
+                $existing = $existingRows->get($category);
+                $amountJson = $existing && $existing->amount_json ? json_decode($existing->amount_json, true) : [];
+                $amountJson = is_array($amountJson) ? $amountJson : [];
 
-            foreach ($genderValues as $gender => $value) {
-                $amountJson[$gender][(string) $req->fee_head_id] = $value;
-            }
+                foreach ($genderValues as $gender => $value) {
+                    $amountJson[$gender][(string) $req->fee_head_id] = $value;
+                }
 
-            DB::table('fee_structures')->updateOrInsert(
-                $rowKey,
-                [
+                $values = [
                     'organization_id' => $orgId,
                     'term' => $req->term,
                     'amount_json' => json_encode($amountJson),
                     'updated_at' => now(),
-                ]
-            );
+                ];
 
-            // fee_ref_id: a real, DB-backed, unique fee reference — one per
-            // (course + category) row, generated once when the row first
-            // exists, left untouched on later edits. No gender component —
-            // see AdmissionNumberService::feeRefId() header for why.
-            $row = DB::table('fee_structures')->where($rowKey)->first();
-            if ($row && !$row->fee_ref_id) {
-                $feeRefId = app(\App\Services\AdmissionNumberService::class)
-                    ->feeRefId('fee_structures', 'fee_ref_id', $program, $category);
-                DB::table('fee_structures')->where('id', $row->id)->update(['fee_ref_id' => $feeRefId]);
+                // fee_ref_id: a real, DB-backed, unique fee reference — one per
+                // (course + category) row, generated once when the row first
+                // exists, left untouched on later edits. No gender component —
+                // see AdmissionNumberService::feeRefId() header for why.
+                $feeRefId = !$existing || !$existing->fee_ref_id
+                    ? app(\App\Services\AdmissionNumberService::class)
+                        ->feeRefId('fee_structures', 'fee_ref_id', $program, $category)
+                    : null;
+
+                if ($existing) {
+                    DB::table('fee_structures')->where($rowKey)->update($values);
+                    if ($feeRefId) {
+                        DB::table('fee_structures')->where('id', $existing->id)->update(['fee_ref_id' => $feeRefId]);
+                    }
+                } else {
+                    DB::table('fee_structures')->insert($rowKey + $values + ['fee_ref_id' => $feeRefId]);
+                }
+                $saved++;
             }
-            $saved++;
-        }
+        });
 
         return response()->json(['message' => "Fee structure saved ({$saved} category row" . ($saved === 1 ? '' : 's') . ")."]);
     }

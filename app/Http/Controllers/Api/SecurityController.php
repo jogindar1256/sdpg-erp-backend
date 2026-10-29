@@ -22,6 +22,7 @@ class SecurityController extends Controller
     public function users(Request $request)
     {
         $query = User::where('portal', 'college')
+            ->with('roles')
             ->orderBy('name');
 
         if ($search = $request->query('search')) {
@@ -125,7 +126,7 @@ class SecurityController extends Controller
      */
     public function searchAllUsers(Request $request)
     {
-        $query = User::query()->orderBy('name');
+        $query = User::query()->with('roles')->orderBy('name');
 
         if ($search = $request->query('search')) {
             $query->where(function ($q) use ($search) {
@@ -297,7 +298,12 @@ class SecurityController extends Controller
             )
             ->addBinding($cutoff, 'select')
             ->orderByDesc('t.last_used_at')
-            ->get()
+            ->get();
+
+        // One query for every listed user's roles, not one per token row.
+        $usersById = User::with('roles')->whereIn('id', $sessions->pluck('id')->unique())->get()->keyBy('id');
+
+        $sessions = $sessions
             ->map(fn ($r) => [
                 'id'            => $r->id,
                 'name'          => $r->name,
@@ -306,7 +312,7 @@ class SecurityController extends Controller
                 'last_activity' => $r->last_used_at,
                 'is_online'     => (bool) $r->is_online,
                 'ip_address'    => null, // Sanctum doesn't store IP by default
-                'role'          => User::find($r->id)?->getRoleNames()->first(),
+                'role'          => $usersById->get($r->id)?->getRoleNames()->first(),
             ]);
 
         $totalUsers  = User::where('portal', 'college')->count();
