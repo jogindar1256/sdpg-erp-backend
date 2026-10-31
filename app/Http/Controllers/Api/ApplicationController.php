@@ -2359,50 +2359,119 @@ class ApplicationController extends Controller
         [$gender, $category] = $this->feeGenderCategory($sa->student_id, $sa);
         // A first-time 'regular' admission has no semester_no on the row — it is semester 1.
         // (0 only matches structures saved as "every semester", which is why the fee read ₹0.)
-        $semesterNos = array_values(array_unique([0, max(1, (int) $sa->semester_no)]));
+        $semester = max(1, (int) $sa->semester_no);
+        $semesterNos = array_values(array_unique([0, $semester]));
 
         $result = \App\Models\FeeStructure::breakdownFor(
-            $sa->program_id,
-            $sa->academic_year,
-            $semesterNos,
-            $admissionType,
-            $gender,
-            $category
+            $sa->program_id, $sa->academic_year, $semesterNos, $admissionType, $gender, $category
+        );
+        $misc = \App\Models\FeeStructure::breakdownFor(
+            $sa->program_id, $sa->academic_year, $semesterNos, $admissionType, $gender, $category, null, true
         );
 
+        // Fee rule 1: the practical fee comes from the subjects the applicant
+        // chose (Course → Allotted Subjects), not from a flat "Practical Fee"
+        // particular in the fee structure — that one is no longer charged here.
+        $pfHeadId = DB::table('fee_heads')->where('code', 'PF')->value('id');
+        $structureLines = array_values(array_filter($result['breakdown'],
+            fn($b) => !$pfHeadId || (int) $b['fee_head_id'] !== (int) $pfHeadId));
+
+        // Fee rule 4: only B.Ed. / "Through Counselling" first-semester
+        // admissions paid part of the fee at the counselling centre — the
+        // particulars set "Pay in College = No" are not collected again.
+        // Everyone else pays every particular except the exempt ones.
+        $program = self::loadedRow($sa, 'program', $sa->program_id)
+            ?? DB::table('programs')->where('id', $sa->program_id)->first();
+        $counsellingFirstSem = $semester === 1
+            && ($sa->application_type ?? 'regular') === 'regular'
+            && (Part6Rules::isBed($program) || DB::table('admission_conditions')
+                ->where('program_id', $sa->program_id)
+                ->where('session_year', $sa->academic_year)
+                ->where('semester_no', '1')
+                ->where('condition_type', 'Through Counselling')
+                ->exists());
+
         // Per-particular rules (Fee Structure → SDPGC Student / DDU-Affiliated
-        // College / Pay in College): exempt particulars are dropped, counter
-        // particulars ticked "Pay in College" are the ones collected now; the rest
-        // were already paid at the counselling centre ('college_*' keys = already paid).
+        // College / Pay in College).
         $settings = \App\Support\FeeHeadSettings::forConfig((int) $sa->program_id, (string) $sa->academic_year, $semesterNos, $admissionType);
         $who = \App\Support\FeeHeadSettings::passOutStatus($sa);
         $online = [];
         $college = [];
         $exempt = [];
-        foreach ($result['breakdown'] as $b) {
+        foreach ($structureLines as $b) {
             $setting = $settings[(int) $b['fee_head_id']] ?? null;
             if (\App\Support\FeeHeadSettings::isExempt($setting, $who)) {
                 $exempt[] = $b;
-            } elseif ($setting && $setting->pay_in_college) {
-                // "Pay in College" ticked = collected NOW, at this payment.
-                $online[] = $b;
+            } elseif ($counsellingFirstSem && $setting && !$setting->pay_in_college) {
+                $college[] = $b; // already paid at the counselling centre
             } else {
-                // Not ticked = already paid at the counselling centre; nothing to collect.
-                $college[] = $b;
+                $online[] = $b;
             }
         }
-        $total = (float) collect($online)->sum('amount');
+        foreach ($this->practicalFeeLines($sa, $pfHeadId) as $b) {
+            $online[] = $b;
+        }
+        // Fee rule 5: term "Misc" particulars are collected with the fee but
+        // get their own Misc. receipt (doApplicationPayVerify()).
+        $miscLines = [];
+        foreach ($misc['breakdown'] as $b) {
+            if (\App\Support\FeeHeadSettings::isExempt($settings[(int) $b['fee_head_id']] ?? null, $who)) {
+                $exempt[] = $b;
+            } else {
+                $miscLines[] = $b + ['misc' => true];
+            }
+        }
+
+        $miscTotal = (float) collect($miscLines)->sum('amount');
+        $total = (float) collect($online)->sum('amount') + $miscTotal;
 
         return [
             'base_amount' => $total,
-            'total' => $total,                 // online (Razorpay) amount
-            'breakdown' => $online,
+            'total' => $total,                 // online (Razorpay) amount, Misc included
+            'breakdown' => array_merge($online, $miscLines),
+            'misc_total' => $miscTotal,        // part of total; receipted separately
             'college_total' => (float) collect($college)->sum('amount'),
             'college_breakdown' => $college,   // already paid at the counselling centre (not collected)
             'exempt_breakdown' => $exempt,     // waived (SDPGC / DDU pass-out)
             'pass_out' => $who,
-            'missing_structure' => $result['total'] <= 0,
+            'counselling_first_semester' => $counsellingFirstSem,
+            'missing_structure' => $result['total'] <= 0 && $miscTotal <= 0,
         ];
+    }
+
+    /**
+     * Practical fee lines (fee rule 1): one per subject the applicant chose
+     * that is allotted to the course with a practical fee (Course → Allotted
+     * Subjects shows subjects.has_practical / practical_fee). U.G. chooses
+     * subjects; P.G. / B.Ed. choose papers, whose subjects count.
+     */
+    private function practicalFeeLines(object $sa, $pfHeadId): array
+    {
+        $part6 = is_array($sa->part_6 ?? null) ? $sa->part_6 : (json_decode($sa->part_6 ?? '{}', true) ?: []);
+        $paperIds = collect([$part6['compulsory_paper_ids'] ?? [], $part6['optional_paper_ids'] ?? [], $part6['teaching_paper_ids'] ?? []])
+            ->flatten()->filter()->map(fn($v) => (int) $v)->unique()->values()->all();
+        $subjectIds = $paperIds
+            ? DB::table('subject_papers')->whereIn('id', $paperIds)->pluck('subject_id')->map(fn($v) => (int) $v)->unique()->values()->all()
+            : array_map('intval', Part6Rules::subjectSlots($part6));
+        if (!$subjectIds) {
+            return [];
+        }
+
+        return DB::table('allotted_subjects as al')
+            ->join('subjects as s', 's.id', '=', 'al.subject_id')
+            ->where('al.program_id', $sa->program_id)
+            ->whereIn('al.subject_id', $subjectIds)
+            ->where('s.has_practical', true)
+            ->where('s.practical_fee', '>', 0)
+            ->orderBy('s.name')
+            ->get(['s.id', 's.name', 's.practical_fee'])
+            ->unique('id')
+            ->map(fn($r) => [
+                'fee_head_id' => $pfHeadId ? (int) $pfHeadId : null,
+                'label' => "Practical Fee ({$r->name})",
+                'amount' => (float) $r->practical_fee,
+            ])
+            ->values()->all();
     }
 
     /**
@@ -2433,6 +2502,21 @@ class ApplicationController extends Controller
 
         $category = strtolower(trim((string) ($category ?: 'general')));
         $category = in_array($category, ['general', 'gen', 'ur', 'unreserved'], true) ? 'gen' : $category;
+
+        // Fee rule 2: SC / ST applicants from a Domestic State marked
+        // "deposit not required" in Master → State Security Deposit (that
+        // state sends no security fee) pay the General Male fee. Only an
+        // explicit row counts — a state missing from the master is unchanged.
+        if ($app && in_array($category, ['sc', 'st'], true)) {
+            $part1 = is_array($app->part_1 ?? null) ? $app->part_1 : (json_decode($app->part_1 ?? '{}', true) ?: []);
+            $state = trim((string) (($this->registrationForApp($app)->domestic_state ?? null) ?: ($part1['domestic_state'] ?? '')));
+            if ($state !== '' && DB::table('state_security_deposits')
+                ->whereRaw('LOWER(TRIM(state_name)) = ?', [mb_strtolower($state)])
+                ->where('deposit_required', false)
+                ->exists()) {
+                return ['male', 'gen'];
+            }
+        }
 
         return [$gender, $category];
     }
@@ -2526,7 +2610,7 @@ class ApplicationController extends Controller
 
         $rupees = (int) round($fee['total']);
         if ($rupees <= 0) {
-            return response()->json(['message' => 'Nothing to collect — no fee particular of this application is marked "Pay in College" (the rest was already paid at the counselling centre).'], 422);
+            return response()->json(['message' => 'Nothing to collect — every fee particular of this application is exempt or was already paid at the counselling centre.'], 422);
         }
         $amount = $rupees * 100; // paise
 
@@ -2649,14 +2733,20 @@ class ApplicationController extends Controller
         $isSelfFinance = (bool) DB::table('programs')->where('id', $sa->program_id)->value('is_self_finance');
 
         $feeHeadNames = DB::table('fee_heads')->whereIn('id', collect($fee['breakdown'])->pluck('fee_head_id')->filter()->all() ?: [0])->pluck('name', 'id');
-        $breakdown = collect($fee['breakdown'])->map(fn($b) => [
+        $line = fn($b) => [
             'fee_head_id' => $b['fee_head_id'],
             'fee_head_name' => $b['label'] ?? ($feeHeadNames[$b['fee_head_id']] ?? 'Fee'),
             'amount' => $b['amount'],
-        ])->values()->all();
+        ];
+        // Fee rule 5: Misc-term particulars are paid with the fee but go on
+        // their own Misc. receipt; the main receipt keeps everything else.
+        $breakdown = collect($fee['breakdown'])->reject(fn($b) => !empty($b['misc']))->map($line)->values()->all();
+        $miscBreakdown = collect($fee['breakdown'])->filter(fn($b) => !empty($b['misc']))->map($line)->values()->all();
+        $mainTotal = (float) collect($breakdown)->sum('amount');
+        $miscTotal = (float) collect($miscBreakdown)->sum('amount');
 
         $feeRefId = null;
-        $receipt = DB::transaction(function () use ($sa, $fee, $breakdown, $isSelfFinance, $req, &$feeRefId, $payment) {
+        $receipt = DB::transaction(function () use ($sa, $fee, $breakdown, $miscBreakdown, $mainTotal, $miscTotal, $isSelfFinance, $req, &$feeRefId, $payment) {
             // The admissions row exists since submit; make sure of it.
             $admissionId = $this->syncAdmissionForApplication((int) $sa->id);
 
@@ -2682,16 +2772,40 @@ class ApplicationController extends Controller
                 'receipt_type' => 'regular_admission',
                 'receipt_no' => FeeReceipt::feeReceiptNo($sa->academic_year, 'regular_admission', $isSelfFinance),
                 'receipt_date' => now()->toDateString(),
-                'total_amount' => $fee['base_amount'],
+                'total_amount' => $mainTotal,
                 'late_fine' => 0,
                 'concession' => 0,
-                'net_amount' => $fee['total'],
+                'net_amount' => $mainTotal,
                 'payment_mode' => 'online',
                 'transaction_id' => $req->razorpay_payment_id,
                 'fee_breakdown' => $breakdown,
                 'generated_by' => $req->user()->id,
                 'status' => 'active',
             ]);
+            if ($miscTotal > 0) {
+                $misc = FeeReceipt::create([
+                    'organization_id' => $sa->organization_id,
+                    'student_id' => $sa->student_id,
+                    'admission_id' => $admissionId,
+                    'academic_year' => $sa->academic_year,
+                    'semester_no' => $sa->semester_no,
+                    'receipt_type' => 'miscellaneous',
+                    'receipt_no' => FeeReceipt::feeReceiptNo($sa->academic_year, 'miscellaneous'),
+                    'receipt_date' => now()->toDateString(),
+                    'total_amount' => $miscTotal,
+                    'late_fine' => 0,
+                    'concession' => 0,
+                    'net_amount' => $miscTotal,
+                    'payment_mode' => 'online',
+                    'transaction_id' => $req->razorpay_payment_id,
+                    'fee_breakdown' => $miscBreakdown,
+                    'generated_by' => $req->user()->id,
+                    'status' => 'active',
+                ]);
+                if (\Illuminate\Support\Facades\Schema::hasColumn('fee_receipts', 'payment_id')) {
+                    DB::table('fee_receipts')->where('id', $misc->id)->update(['payment_id' => $payment->id]);
+                }
+            }
 
             $program = DB::table('programs')->where('id', $sa->program_id)->first();
             $student = $sa->student_id
