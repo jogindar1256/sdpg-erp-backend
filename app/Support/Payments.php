@@ -23,7 +23,7 @@ use Illuminate\Support\Facades\DB;
  */
 class Payments
 {
-    public const PURPOSES = ['registration', 'admission', 'semester_upgrade', 'back_paper', 'misc'];
+    public const PURPOSES = ['registration', 'admission', 'semester_upgrade', 'back_paper', 'misc', 'fee_balance'];
     public const MODES = ['online', 'cash', 'dd', 'cheque', 'neft', 'voucher'];
 
     /** purpose of an application's fee */

@@ -8,10 +8,11 @@ use Illuminate\Support\Facades\DB;
  * Per-particular fee rules (fee_structure_head_settings) and the applicant
  * facts they depend on.
  *
- *  - SDPGC pass-out: exempt from particulars marked "SDPGC Student".
- *  - Pass-out of another DDU-affiliated college: exempt from particulars
- *    marked "DDU / Affiliated College". An SDPGC pass-out is judged by the
- *    SDPGC column only, even though SDPGC is itself DDU-affiliated.
+ *  - SDPGC pass-out: exempt from particulars marked "SDPGC Student" (fee
+ *    rule 8 — Security Money) and, since SDPGC is itself DDU-affiliated,
+ *    from those marked "DDU / Affiliated College" too (rule 7 — Enrollment).
+ *  - Pass-out of DDU or another DDU-affiliated college: exempt from
+ *    particulars marked "DDU / Affiliated College".
  *  - "Pay in College" particulars are collected at the counter and kept
  *    out of the online (Razorpay) amount.
  *
@@ -20,7 +21,8 @@ use Illuminate\Support\Facades\DB;
 class FeeHeadSettings
 {
     /** Institute names that mean "this college". */
-    private const SDPGC_RE = '/\bS\.?\s*D\.?\s*P\.?\s*G\b|SWAMI\s+DE?WA?NAND/i';
+    // "Swami Devanand" / "Dewanand" — the V spelling never matched before.
+    private const SDPGC_RE = '/\bS\.?\s*D\.?\s*P\.?\s*G\b|SWAMI\s+DE?[VW]A?NAND/i';
     /** Board / university names that mean DDU Gorakhpur University. */
     private const DDU_RE = '/DEEN\s*DAYAL|\bD\.?\s*D\.?\s*U\b|GORAKHPUR\s+UNIVERSITY|UNIVERSITY\s+OF\s+GORAKHPUR/i';
 
@@ -85,7 +87,7 @@ class FeeHeadSettings
     public static function isExempt(?object $setting, array $who): bool
     {
         if (!$setting) return false;
-        if ($who['sdpgc']) return (bool) $setting->sdpgc_exempt;
+        if ($who['sdpgc'] && ($setting->sdpgc_exempt || $setting->ddu_exempt)) return true;
         return $who['ddu'] && (bool) $setting->ddu_exempt;
     }
 }

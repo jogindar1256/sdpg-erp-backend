@@ -390,4 +390,93 @@ class FinancialController extends Controller
             'ref_no'  => $refNo,
         ]);
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // 4. RETURN TO STUDENT — fee re-calculated lower than what was paid
+    //    (fee rule 10). Rows are raised from Fee Receipt Generate's
+    //    "Regenerate Fee" (FeesController::generateReturn) and settled here.
+    // ══════════════════════════════════════════════════════════════
+    public function returnToStudentIndex(Request $request)
+    {
+        $base = DB::table('return_payments as rp')
+            ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'rp.fee_receipt_id')
+            ->leftJoin('admissions as a', 'a.id', '=', 'rp.admission_id')
+            ->leftJoin('student_applications as sa', 'sa.id', '=', 'rp.student_application_id')
+            ->leftJoin('direct_registrations as dr', 'dr.id', '=', DB::raw('COALESCE(a.direct_registration_id, sa.direct_registration_id)'))
+            ->leftJoin('students as s', 's.id', '=', 'rp.student_id')
+            ->leftJoin('programs as p', 'p.id', '=', 'a.program_id')
+            ->when($request->status, fn($q, $v) => $q->where('rp.status', $v))
+            ->when($request->session, fn($q, $v) => $q->where('rp.academic_year', $v))
+            ->when($request->search, function ($q, $v) {
+                $q->where(function ($w) use ($v) {
+                    $w->where('dr.name', 'ilike', "%{$v}%")
+                        ->orWhere('dr.registration_no', 'ilike', "%{$v}%")
+                        ->orWhere('sa.application_no', 'ilike', "%{$v}%")
+                        ->orWhere('fr.receipt_no', 'ilike', "%{$v}%")
+                        ->orWhere('s.student_uid', 'ilike', "%{$v}%")
+                        ->orWhere('dr.mobile', 'ilike', "%{$v}%");
+                });
+            });
+
+        $totals = (clone $base)->selectRaw("
+            COUNT(*) FILTER (WHERE rp.status = 'pending') AS pending_count,
+            COALESCE(SUM(rp.amount) FILTER (WHERE rp.status = 'pending'), 0) AS pending_amount,
+            COUNT(*) FILTER (WHERE rp.status = 'returned') AS returned_count,
+            COALESCE(SUM(rp.amount) FILTER (WHERE rp.status = 'returned'), 0) AS returned_amount
+        ")->first();
+
+        $page = (clone $base)
+            ->leftJoin('users as cu', 'cu.id', '=', 'rp.created_by')
+            ->leftJoin('users as ru', 'ru.id', '=', 'rp.returned_by')
+            ->select(
+                'rp.id', 'rp.amount', 'rp.paid_amount', 'rp.revised_amount', 'rp.revised_breakdown', 'rp.reason',
+                'rp.status', 'rp.mode', 'rp.ref_no', 'rp.returned_on', 'rp.created_at', 'rp.academic_year', 'rp.semester_no',
+                'fr.receipt_no', 'sa.application_no', 'dr.registration_no', 'dr.name as reg_name', 'dr.mobile',
+                's.student_uid', 's.personal_info as s_info', 'p.short_name as course', 'p.full_name as course_full_name', 'p.samarth_code',
+                'cu.name as raised_by', 'ru.name as returned_by_name'
+            )
+            ->orderByRaw("CASE WHEN rp.status = 'pending' THEN 0 ELSE 1 END")
+            ->orderByDesc('rp.id')
+            ->paginate(20);
+
+        $page->getCollection()->transform(function ($r) {
+            $info = is_string($r->s_info) ? (json_decode($r->s_info, true) ?: []) : [];
+            $r->name = $r->reg_name ?: (\App\Models\Student::fullName((object) $info) ?: null);
+            $r->revised_breakdown = $r->revised_breakdown ? json_decode($r->revised_breakdown, true) : [];
+            unset($r->s_info, $r->reg_name);
+            return $r;
+        });
+
+        return response()->json([
+            'data' => $page->items(),
+            'meta' => ['total' => $page->total(), 'current_page' => $page->currentPage(), 'last_page' => $page->lastPage()],
+            'totals' => [
+                'pending_count' => (int) $totals->pending_count,
+                'pending_amount' => (float) $totals->pending_amount,
+                'returned_count' => (int) $totals->returned_count,
+                'returned_amount' => (float) $totals->returned_amount,
+            ],
+        ]);
+    }
+
+    /** POST /financial/return-to-student/{id}/returned {mode, ref_no?, returned_on?} */
+    public function returnToStudentMarkReturned(Request $request, int $id)
+    {
+        $data = $request->validate([
+            'mode' => 'required|in:cash,neft,upi,cheque',
+            'ref_no' => 'nullable|string|max:100|required_unless:mode,cash',
+            'returned_on' => 'nullable|date',
+        ], ['ref_no.required_unless' => 'Enter the UTR / UPI / cheque reference for a non-cash return.']);
+        $updated = DB::table('return_payments')->where('id', $id)->where('status', 'pending')->update([
+            'status' => 'returned',
+            'mode' => $data['mode'],
+            'ref_no' => $data['ref_no'] ?? null,
+            'returned_on' => $data['returned_on'] ?? now()->toDateString(),
+            'returned_by' => $request->user()?->id,
+            'updated_at' => now(),
+        ]);
+        return $updated
+            ? response()->json(['message' => 'Marked as returned.'])
+            : response()->json(['message' => 'Only a pending return can be marked returned.'], 409);
+    }
 }

@@ -404,6 +404,8 @@ class MasterSettingsController extends Controller
             // SDPGC / DDU are per-particular settings now, not separate structures.
             ->where('fs.sdpgc_student', false)
             ->where('fs.ddu_affiliated', false)
+            // ?term=Misc loads the Misc structure; anything else the education fee.
+            ->where(fn ($w) => \App\Models\FeeStructure::whereMiscTerm($w, $req->term === \App\Models\FeeStructure::MISC_TERM))
             ->get();
 
         // fee_head_id -> { sdpgc_exempt, ddu_exempt, pay_in_college }
@@ -487,7 +489,8 @@ class MasterSettingsController extends Controller
             'session_year' => 'required|string',
             'semester_no' => 'required|string',
             'exam_mode' => 'required|in:Regular,Back Paper,Upgrade',
-            'term' => 'required|in:Admission,Semester Registration',
+            // Misc: a separate fee with its own Misc. receipt (fee rule 5).
+            'term' => 'required|in:Admission,Semester Registration,Misc',
             'particulars' => 'required_without:fee_head_id|array|min:1',
             'particulars.*.fee_head_id' => 'required|integer|distinct',
             'particulars.*.amounts' => 'required|array',
@@ -531,6 +534,7 @@ class MasterSettingsController extends Controller
             'sdpgc_student' => false,
             'ddu_affiliated' => false,
         ];
+        $isMisc = $req->term === \App\Models\FeeStructure::MISC_TERM;
 
         // Normalize the incoming amounts (e.g. "Male_Gen" -> gender=male,
         // category=gen) and group by category, across every particular —
@@ -576,7 +580,7 @@ class MasterSettingsController extends Controller
             ];
         }
 
-        $saved = DB::transaction(function () use ($byCategory, $baseKey, $settingsRows, $orgId, $req, $program, $now) {
+        $saved = DB::transaction(function () use ($byCategory, $baseKey, $settingsRows, $orgId, $req, $program, $now, $isMisc) {
             if ($settingsRows) {
                 DB::table('fee_structure_head_settings')->upsert(
                     $settingsRows,
@@ -590,6 +594,8 @@ class MasterSettingsController extends Controller
             $existingRows = DB::table('fee_structures')
                 ->where($baseKey)
                 ->whereIn('category', array_keys($byCategory))
+                // A Misc structure sits beside the education-fee one for the same key.
+                ->where(fn ($w) => \App\Models\FeeStructure::whereMiscTerm($w, $isMisc))
                 ->orderBy('id')
                 ->lockForUpdate()
                 ->get()
@@ -647,7 +653,7 @@ class MasterSettingsController extends Controller
                     array_push($bindings, ...$u);
                 }
                 array_push($bindings, $baseKey['program_id'], $baseKey['academic_year'], $baseKey['semester_no'],
-                    $baseKey['admission_type'], $baseKey['sdpgc_student'], $baseKey['ddu_affiliated']);
+                    $baseKey['admission_type'], $baseKey['sdpgc_student'], $baseKey['ddu_affiliated'], $isMisc);
 
                 DB::update(
                     "UPDATE fee_structures AS f
@@ -657,6 +663,7 @@ class MasterSettingsController extends Controller
                        FROM (VALUES {$values}) AS v(category, amount_json, first_id, fee_ref_id)
                       WHERE f.program_id = ? AND f.academic_year = ? AND f.semester_no = ?
                         AND f.admission_type = ? AND f.sdpgc_student = ? AND f.ddu_affiliated = ?
+                        AND (COALESCE(f.term, '') = 'Misc') = ?
                         AND f.category = v.category",
                     $bindings
                 );

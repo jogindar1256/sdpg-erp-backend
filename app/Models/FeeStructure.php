@@ -140,6 +140,16 @@ class FeeStructure extends Model
      * every particular in the row(s). Particulars with a zero amount for
      * this gender are omitted.
      */
+    public const MISC_TERM = 'Misc';
+
+    /** Limit a fee_structures query to Misc-term rows ($misc) or to every other row. */
+    public static function whereMiscTerm($query, bool $misc)
+    {
+        return $misc
+            ? $query->where('term', self::MISC_TERM)
+            : $query->where(fn ($w) => $w->whereNull('term')->orWhere('term', '!=', self::MISC_TERM));
+    }
+
     public static function breakdownFor(
         int $programId,
         string $academicYear,
@@ -147,7 +157,8 @@ class FeeStructure extends Model
         string $admissionType,
         string $gender,
         string $category,
-        ?array $feeHeadIds = null
+        ?array $feeHeadIds = null,
+        bool $misc = false
     ): array {
         $rows = DB::table('fee_structures')
             ->where('program_id', $programId)
@@ -156,6 +167,9 @@ class FeeStructure extends Model
             ->where('admission_type', $admissionType)
             ->where('category', $category)
             ->where('is_active', true)
+            // Term "Misc" structures are a separate fee with their own receipt;
+            // $misc picks them, otherwise only the education-fee structures.
+            ->where(fn ($w) => self::whereMiscTerm($w, $misc))
             // SDPGC / DDU are per-particular settings now; only the plain structure counts.
             ->where('sdpgc_student', false)
             ->where('ddu_affiliated', false)
@@ -200,6 +214,7 @@ class FeeStructure extends Model
             ->where('is_active', true)
             ->where('sdpgc_student', false)
             ->where('ddu_affiliated', false)
+            ->where(fn ($w) => self::whereMiscTerm($w, false))
             ->when($programId, fn ($q) => $q->where('program_id', $programId))
             ->get(['program_id', 'semester_no', 'admission_type', 'category', 'amount_json'])
             ->each(function ($row) use (&$map) {
