@@ -2355,7 +2355,10 @@ class ApplicationController extends Controller
 
     private function computeApplicationFee(object $sa): array
     {
-        $admissionType = 'regular';
+        // Fee Structure → Exam Mode: "Regular" for admissions, "Upgrade" for
+        // semester-upgrade applications (no fallback to Regular — a missing
+        // Upgrade structure must show as not configured, not as a wrong fee).
+        $admissionType = ($sa->application_type ?? 'regular') === 'semester_upgrade' ? 'upgrade' : 'regular';
         [$gender, $category] = $this->feeGenderCategory($sa->student_id, $sa);
         // A first-time 'regular' admission has no semester_no on the row — it is semester 1.
         // (0 only matches structures saved as "every semester", which is why the fee read ₹0.)
@@ -2440,20 +2443,50 @@ class ApplicationController extends Controller
     }
 
     /**
-     * The fee this application would be charged now, from its current data
-     * (fee rules 1–5) — Fee Receipt Generate's "Regenerate Fee" (rule 9/10).
+     * The fee this application should have paid on its main receipt, worked
+     * out now from the fee structure and the student's data — Fee Receipt
+     * Generate's "Generate ID" compares it with what was paid. Misc
+     * particulars have their own receipt and are left out; so is a back
+     * paper's late fine (it depends on the payment date, not the student).
      * Lines carry a readable fee_head_name.
      */
-    public function currentApplicationFee(object $sa): array
+    public function actualFeeFor(object $sa): array
     {
-        $fee = $this->computeApplicationFee($sa);
+        if (($sa->application_type ?? null) === 'back_paper') {
+            $part7 = is_array($sa->part_7 ?? null) ? $sa->part_7 : (json_decode($sa->part_7 ?? '{}', true) ?: []);
+            $efId = $this->feeHeadId('EF', $sa->organization_id);
+            $pfId = $this->feeHeadId('PF', $sa->organization_id);
+            $paperRows = DB::table('subjects')->whereIn('id', ($part7['paper_ids'] ?? []) ?: [0])->get()
+                ->map(function ($p) use ($efId, $pfId) {
+                    $p->fee_head_id = $p->type === 'practical' ? $pfId : $efId;
+                    return $p;
+                });
+            $bp = $this->computeBackPaperFee($sa, $paperRows);
+            $fee = [
+                'total' => (float) $bp['base_amount'],
+                'breakdown' => $bp['breakdown'],
+                'college_breakdown' => [],
+                'exempt_breakdown' => [],
+                'missing_structure' => $bp['missing_structure'] || !$paperRows->count(),
+            ];
+        } else {
+            $full = $this->computeApplicationFee($sa);
+            $lines = array_values(array_filter($full['breakdown'], fn($b) => empty($b['misc'])));
+            $fee = [
+                'total' => (float) collect($lines)->sum('amount'),
+                'breakdown' => $lines,
+                'college_breakdown' => $full['college_breakdown'],
+                'exempt_breakdown' => $full['exempt_breakdown'],
+                'missing_structure' => $full['missing_structure'],
+            ];
+        }
         $names = DB::table('fee_heads')
             ->whereIn('id', collect($fee['breakdown'])->merge($fee['college_breakdown'])->merge($fee['exempt_breakdown'])->pluck('fee_head_id')->filter()->all() ?: [0])
             ->pluck('name', 'id');
         $label = fn(array $lines) => array_map(fn($b) => $b + ['fee_head_name' => $b['label'] ?? ($names[$b['fee_head_id']] ?? 'Fee')], $lines);
-        $fee['breakdown'] = $label($fee['breakdown']);
-        $fee['college_breakdown'] = $label($fee['college_breakdown']);
-        $fee['exempt_breakdown'] = $label($fee['exempt_breakdown']);
+        foreach (['breakdown', 'college_breakdown', 'exempt_breakdown'] as $k) {
+            $fee[$k] = $label($fee[$k]);
+        }
         return $fee;
     }
 
@@ -2938,6 +2971,140 @@ class ApplicationController extends Controller
             return $sa;
         \App\Support\Payments::failOpenOrders('student_application_id', (int) $sa->id);
         Log::info("Education fee payment reported failed/abandoned for application {$id} by student {$req->user()->id}.");
+        return response()->json(['message' => 'Payment marked as failed. You can retry.']);
+    }
+
+    // =========================================================================
+    // FEE BALANCE — the rest of the fee, after Fee Receipt Generate → Generate
+    // ID found the student paid less than the fee structure asks
+    // (student_applications.fee_due_amount). Paid online from the student
+    // portal; recorded as its own 'fee_balance' receipt, which Generate ID
+    // counts towards what was paid.
+    // =========================================================================
+
+    /** POST /student/applications/{id}/balance/pay/initiate */
+    public function studentBalancePayInitiate(Request $req, $id)
+    {
+        $sa = $this->ownedStudentApp($req, $id);
+        if ($sa instanceof \Illuminate\Http\JsonResponse)
+            return $sa;
+        $rupees = (int) ceil((float) ($sa->fee_due_amount ?? 0));
+        if ($rupees <= 0) {
+            return response()->json(['message' => 'No fee is pending for this application.'], 422);
+        }
+        $key = config('services.razorpay.key');
+        $secret = config('services.razorpay.secret');
+        if (!$key || !$secret) {
+            return response()->json(['message' => 'Payment gateway not configured. Contact the office.'], 503);
+        }
+        $who = $this->applicantSnapshot($sa);
+        try {
+            $resp = Http::withBasicAuth($key, $secret)->asJson()->post('https://api.razorpay.com/v1/orders', [
+                'amount' => $rupees * 100,
+                'currency' => 'INR',
+                'receipt' => 'BAL_' . $sa->application_no,
+                'payment_capture' => 1,
+                'notes' => ['application_id' => (string) $sa->id, 'application_no' => $sa->application_no, 'purpose' => 'fee_balance'],
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Razorpay order request failed (fee balance): ' . $e->getMessage());
+            return response()->json(['message' => 'Could not reach the payment gateway.'], 502);
+        }
+        if ($resp->failed()) {
+            Log::error('Razorpay order error (fee balance): ' . $resp->body());
+            return response()->json(['message' => 'Could not create the payment order.'], 502);
+        }
+        $order = $resp->json();
+        \App\Support\Payments::openOrder(['purpose' => 'fee_balance'] + \App\Support\Payments::forApplication($sa), (float) $rupees, $order['id']);
+
+        return response()->json([
+            'order_id' => $order['id'],
+            'amount' => $rupees * 100,
+            'amount_rupees' => $rupees,
+            'currency' => 'INR',
+            'key' => $key,
+            'name' => $who['name'] ?? '',
+            'email' => $who['email'] ?? '',
+            'mobile' => $who['mobile'] ?? '',
+            'application_id' => $sa->id,
+        ]);
+    }
+
+    /** POST /student/applications/{id}/balance/pay/verify */
+    public function studentBalancePayVerify(Request $req, $id)
+    {
+        $sa = $this->ownedStudentApp($req, $id);
+        if ($sa instanceof \Illuminate\Http\JsonResponse)
+            return $sa;
+        $req->validate([
+            'razorpay_order_id' => 'required|string',
+            'razorpay_payment_id' => 'required|string',
+            'razorpay_signature' => 'required|string',
+        ]);
+        $secret = config('services.razorpay.secret');
+        $expected = hash_hmac('sha256', $req->razorpay_order_id . '|' . $req->razorpay_payment_id, (string) $secret);
+        if (!$secret || !hash_equals($expected, $req->razorpay_signature)) {
+            return response()->json(['message' => 'Payment could not be verified.'], 422);
+        }
+        $payment = DB::table('payments')->where('gateway_order_id', (string) $req->razorpay_order_id)
+            ->where('student_application_id', $sa->id)->where('purpose', 'fee_balance')->first();
+        if (!$payment || $payment->status === 'paid') {
+            return response()->json(['message' => $payment ? 'This payment is already recorded.' : 'This payment does not belong to this application.'], $payment ? 409 : 422);
+        }
+        $main = DB::table('fee_receipts')->where('id', \App\Support\Payments::applicationFeeReceiptId((int) $sa->id))->first();
+        if (!$main) {
+            return response()->json(['message' => 'The education fee receipt for this application was not found. Contact the office.'], 422);
+        }
+        $isSelfFinance = (bool) DB::table('programs')->where('id', $sa->program_id)->value('is_self_finance');
+        $amount = (float) $payment->amount;
+
+        $receipt = DB::transaction(function () use ($sa, $main, $payment, $amount, $isSelfFinance, $req) {
+            // A replayed / concurrent verify of the same order records it once.
+            if (DB::table('payments')->where('id', $payment->id)->lockForUpdate()->value('status') === 'paid') {
+                return null;
+            }
+            $receipt = FeeReceipt::create([
+                'organization_id' => $main->organization_id,
+                'student_id' => $main->student_id,
+                'admission_id' => $main->admission_id,
+                'academic_year' => $main->academic_year,
+                'semester_no' => $main->semester_no,
+                'receipt_type' => 'fee_balance',
+                'receipt_no' => FeeReceipt::feeReceiptNo($main->academic_year, $main->receipt_type, $isSelfFinance),
+                'receipt_date' => now()->toDateString(),
+                'total_amount' => $amount,
+                'late_fine' => 0,
+                'concession' => 0,
+                'net_amount' => $amount,
+                'payment_mode' => 'online',
+                'transaction_id' => $req->razorpay_payment_id,
+                'fee_breakdown' => [['fee_head_id' => null, 'fee_head_name' => 'Fee Balance (receipt ' . $main->receipt_no . ')', 'amount' => $amount]],
+                'generated_by' => $req->user()->id,
+                'status' => 'active',
+            ]);
+            \App\Support\Payments::markOnlinePaid((int) $payment->id, (string) $req->razorpay_payment_id, (string) $req->razorpay_signature,
+                $amount, (int) $receipt->id, $receipt->receipt_no, ['admission_id' => $main->admission_id, 'student_id' => $main->student_id]);
+            DB::table('student_applications')->where('id', $sa->id)->update(['fee_due_amount' => null, 'updated_at' => now()]);
+            return $receipt;
+        });
+        if (!$receipt) {
+            return response()->json(['message' => 'This payment is already recorded.'], 409);
+        }
+
+        return response()->json([
+            'message' => 'Remaining fee paid. The college will now prepare your final fee receipt.',
+            'receipt_no' => $receipt->receipt_no,
+        ]);
+    }
+
+    /** POST /student/applications/{id}/balance/pay/failed */
+    public function studentBalancePayFailed(Request $req, $id)
+    {
+        $sa = $this->ownedStudentApp($req, $id);
+        if ($sa instanceof \Illuminate\Http\JsonResponse)
+            return $sa;
+        DB::table('payments')->where('student_application_id', $sa->id)->where('purpose', 'fee_balance')->where('status', 'created')
+            ->update(['status' => 'failed', 'failed_at' => now(), 'updated_at' => now()]);
         return response()->json(['message' => 'Payment marked as failed. You can retry.']);
     }
 

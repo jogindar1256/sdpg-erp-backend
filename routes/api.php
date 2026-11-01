@@ -610,9 +610,7 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('generate', [FeesController::class, 'generateIndex']);
             Route::get('generate/preview', [FeesController::class, 'generatePreview']);
             Route::get('generate/{id}/pdf', [FeesController::class, 'generatePdf'])->whereNumber('id');
-            Route::get('generate/{id}/recalculate', [FeesController::class, 'generateRecalculate'])->whereNumber('id');
-            Route::post('generate/{id}/notify-due', [FeesController::class, 'generateNotifyDue'])->whereNumber('id');
-            Route::post('generate/{id}/return', [FeesController::class, 'generateReturn'])->whereNumber('id');
+            Route::post('generate/{id}/generate-id', [FeesController::class, 'generateId'])->whereNumber('id');
 
             // Verify Fee Receipts — list pending, verify/reject
             Route::get('verify', [FeesController::class, 'verifyIndex']);
@@ -857,6 +855,11 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::post('/{id}/pay/initiate', [ApplicationController::class, 'studentApplicationPayInitiate']);
             Route::post('/{id}/pay/verify', [ApplicationController::class, 'studentApplicationPayVerify']);
             Route::post('/{id}/pay/failed', [ApplicationController::class, 'studentApplicationPayFailed']);
+
+            // Fee balance — the rest of the fee after Fee Receipt Generate → Generate ID
+            Route::post('/{id}/balance/pay/initiate', [ApplicationController::class, 'studentBalancePayInitiate']);
+            Route::post('/{id}/balance/pay/verify', [ApplicationController::class, 'studentBalancePayVerify']);
+            Route::post('/{id}/balance/pay/failed', [ApplicationController::class, 'studentBalancePayFailed']);
 
             Route::put('/{id}/back-paper', [ApplicationController::class, 'studentSaveBackPaperSelection']);
             Route::post('/{id}/back-paper/pay/initiate', [ApplicationController::class, 'studentBackPaperPayInitiate']);

@@ -295,6 +295,16 @@ class FeesController extends Controller
             'date' => $receipt->receipt_date,
             'approved_by' => $userNames[$receipt->verified_by] ?? null,
         ];
+        $balances = DB::table('fee_receipts')
+            ->where('admission_id', $admission->id)
+            ->where('academic_year', $receipt->academic_year)
+            ->where('semester_no', $receipt->semester_no)
+            ->where('receipt_type', self::BALANCE_RECEIPT)
+            ->whereNull('deleted_at')->where('status', '!=', 'cancelled')
+            ->orderBy('id')->get();
+        foreach ($balances as $b) {
+            $payments[] = ['description' => 'Fee Balance', 'ref_no' => $b->transaction_id ?: $b->bank_ref_no, 'amount' => (float) $b->net_amount, 'date' => $b->receipt_date, 'approved_by' => null];
+        }
         $misc = DB::table('fee_receipts')
             ->where('admission_id', $admission->id)
             ->where('receipt_type', 'miscellaneous')
@@ -359,6 +369,7 @@ class FeesController extends Controller
             'subjects' => $app ? $this->previewSubjects($app, $part6) : [],
             'payments' => $payments,
             'misc_receipts' => $misc->map(fn($m) => ['id' => $m->id, 'receipt_no' => $m->receipt_no])->values(),
+            'fee_check' => ($check = $this->feeCheck((int) $receipt->id)[0]) ? $this->feeCheckSummary($check) : null,
         ]);
     }
 
@@ -395,155 +406,251 @@ class FeesController extends Controller
         return ['regular_admission' => 'Regular', 'back_paper' => 'Back Paper', 'semester_upgrade' => 'Semester Upgrade'][$type] ?? 'Regular';
     }
 
-    // ─── Fee rule 9 / 10: re-calculate after payment ──────────────────────────
-    // GET  /fees/generate/{id}/recalculate   the fee as it stands now vs paid
-    // POST /fees/generate/{id}/notify-due     higher: email / SMS the student
-    // POST /fees/generate/{id}/return         lower: raise a return_payments row
+    // ─── Generate ID: the fee check before the Final Fee Receipt ─────────────
+    // POST /fees/generate/{id}/generate-id
+    //
+    // The fee the student should have paid is worked out from the fee
+    // structure (class, gender, category, SDPGC / DDU pass-out, subjects)
+    // and compared with what was paid on this receipt:
+    //   equal  → fresh admission: Student ID + Admission No; every type: the
+    //            Final Fee Receipt is prepared (fresh: admission_receipt).
+    //   less   → student is told to pay the rest (admission_fee_pending) and
+    //            the student portal shows "Fee Pending" with a Pay button.
+    //   more   → the excess goes to Return to Student.
+    // Clicking again re-checks: once the balance is paid, or the return is
+    // marked returned (or cancelled by the office), the receipt is prepared.
+
+    private const BALANCE_RECEIPT = 'fee_balance';
 
     /**
-     * The receipt's fee re-calculated from the application's current data,
-     * against what was paid. Paid = this admission's non-cancelled
-     * education-fee and misc receipts of the same session / semester (a
-     * balance collected later counts), less returns already raised.
-     * Returns [revision, null] or [null, error response].
+     * Fee check for a main receipt. Misc receipts are a separate fee and
+     * never counted; a back paper's late fine is left out on both sides.
+     * Returns [check, null] or [null, error response].
      */
-    private function feeRevision(int $receiptId): array
+    private function feeCheck(int $receiptId): array
     {
         $receipt = DB::table('fee_receipts')->where('id', $receiptId)->whereNull('deleted_at')->first();
         if (!$receipt) {
             return [null, response()->json(['message' => 'Receipt not found.'], 404)];
         }
-        if (!in_array($receipt->receipt_type, ['regular_admission', 'semester_upgrade'], true)) {
-            return [null, response()->json(['message' => 'Only education-fee receipts can be re-calculated.'], 422)];
+        if (!in_array($receipt->receipt_type, self::GENERATE_TYPES, true) || $receipt->status === 'cancelled') {
+            return [null, response()->json(['message' => 'Only an active Regular / Semester Upgrade / Back Paper fee receipt can be generated.'], 422)];
         }
-        $admission = $receipt->admission_id ? DB::table('admissions')->where('id', $receipt->admission_id)->first() : null;
-        $sa = $admission && $admission->application_id ? DB::table('student_applications')->where('id', $admission->application_id)->first() : null;
+        $sa = $receipt->admission_id
+            ? DB::table('student_applications as sa')
+                ->join('admissions as a', 'a.application_id', '=', 'sa.id')
+                ->where('a.id', $receipt->admission_id)->whereNull('sa.deleted_at')
+                ->first(['sa.*'])
+            : null;
         if (!$sa) {
             return [null, response()->json(['message' => 'No application found for this receipt.'], 422)];
         }
 
-        $fee = app(ApplicationController::class)->currentApplicationFee($sa);
-        $scope = fn($q) => $q->where('admission_id', $receipt->admission_id)
+        $fee = app(ApplicationController::class)->actualFeeFor($sa);
+        $balance = DB::table('fee_receipts')
+            ->where('admission_id', $receipt->admission_id)
             ->where('academic_year', $receipt->academic_year)
-            ->where('semester_no', $receipt->semester_no);
-        $paid = (float) DB::table('fee_receipts')->where($scope)
-            ->whereIn('receipt_type', [$receipt->receipt_type, 'miscellaneous'])
+            ->where('semester_no', $receipt->semester_no)
+            ->where('receipt_type', self::BALANCE_RECEIPT)
             ->whereNull('deleted_at')->where('status', '!=', 'cancelled')
             ->sum('net_amount');
-        $returned = (float) DB::table('return_payments')->where($scope)->where('status', '!=', 'cancelled')->sum('amount');
-        $netPaid = round($paid - $returned, 2);
-        $revised = round((float) $fee['total'], 2);
+        $paid = round((float) $receipt->net_amount - (float) $receipt->late_fine + (float) $balance, 2);
+        $actual = round((float) $fee['total'], 2);
+        $returns = DB::table('return_payments')->where('fee_receipt_id', $receipt->id)->orderBy('id')
+            ->get(['id', 'amount', 'status', 'mode', 'ref_no', 'reason', 'created_at', 'returned_on']);
+        $excess = max(0, round($paid - $actual, 2));
+        $settledReturns = round((float) $returns->whereIn('status', ['returned', 'cancelled'])->sum('amount'), 2);
+        $pendingReturn = round((float) $returns->where('status', 'pending')->sum('amount'), 2);
+
+        if ($receipt->final_receipt_generated_at) {
+            $status = 'generated';
+        } elseif ($fee['missing_structure']) {
+            $status = 'no_structure';
+        } elseif ($actual - $paid > 0.009) {
+            $status = 'fee_pending';
+        } elseif ($excess > 0.009 && $pendingReturn > 0) {
+            $status = 'return_pending';
+        } elseif ($excess - $settledReturns > 0.009) {
+            $status = 'return_due';
+        } else {
+            $status = 'ready';
+        }
 
         return [[
             'receipt' => $receipt,
-            'admission' => $admission,
             'application' => $sa,
             'fee' => $fee,
-            'paid' => round($paid, 2),
-            'returned' => round($returned, 2),
-            'net_paid' => $netPaid,
-            'revised' => $revised,
-            'difference' => round($revised - $netPaid, 2), // > 0 due from student, < 0 owed back
+            'actual' => $actual,
+            'paid' => $paid,
+            'balance_paid' => round((float) $balance, 2),
+            'due' => max(0, round($actual - $paid, 2)),
+            'excess' => $excess,
+            'to_raise' => max(0, round($excess - $settledReturns - $pendingReturn, 2)),
+            'returns' => $returns,
+            'status' => $status,
         ], null];
     }
 
-    public function generateRecalculate(int $id): JsonResponse
+    /** What the preview page shows about the fee check. */
+    private function feeCheckSummary(array $c): array
     {
-        [$r, $error] = $this->feeRevision($id);
-        if ($error) return $error;
-
-        $line = fn($b) => ['fee_head' => $b['fee_head_name'], 'amount' => (float) $b['amount'], 'misc' => !empty($b['misc'])];
-        $target = app(ApplicationController::class)->notifyTargetFor($r['application']);
-        return response()->json([
-            'receipt_id' => $r['receipt']->id,
-            'receipt_no' => $r['receipt']->receipt_no,
-            'revised_breakdown' => array_map($line, $r['fee']['breakdown']),
-            'paid_at_counselling' => array_map($line, $r['fee']['college_breakdown']),
-            'exempt' => array_map($line, $r['fee']['exempt_breakdown']),
-            'revised_total' => $r['revised'],
-            'paid' => $r['paid'],
-            'returned' => $r['returned'],
-            'net_paid' => $r['net_paid'],
-            'difference' => $r['difference'],
-            'status' => $r['difference'] > 0 ? 'due' : ($r['difference'] < 0 ? 'return' : 'settled'),
-            'can_notify' => (bool) ($target && (!empty($target->email) || !empty($target->mobile))),
-            'returns' => DB::table('return_payments')
-                ->where('admission_id', $r['receipt']->admission_id)
-                ->where('academic_year', $r['receipt']->academic_year)
-                ->where('semester_no', $r['receipt']->semester_no)
-                ->orderByDesc('id')
-                ->get(['id', 'amount', 'status', 'reason', 'created_at', 'returned_on']),
-        ]);
+        $line = fn($b) => ['fee_head' => $b['fee_head_name'], 'amount' => (float) $b['amount']];
+        return [
+            'status' => $c['status'],
+            'actual' => $c['actual'],
+            'paid' => $c['paid'],
+            'balance_paid' => $c['balance_paid'],
+            'due' => $c['due'],
+            'excess' => $c['excess'],
+            'breakdown' => array_map($line, $c['fee']['breakdown']),
+            'paid_at_counselling' => array_map($line, $c['fee']['college_breakdown']),
+            'exempt' => array_map($line, $c['fee']['exempt_breakdown']),
+            'returns' => $c['returns'],
+        ];
     }
 
-    public function generateNotifyDue(int $id): JsonResponse
+    public function generateId(Request $request, int $id): JsonResponse
     {
-        [$r, $error] = $this->feeRevision($id);
+        [$c, $error] = $this->feeCheck($id);
         if ($error) return $error;
-        if ($r['difference'] <= 0) {
-            return response()->json(['message' => 'Nothing is due — the re-calculated fee is not higher than what was paid.'], 422);
-        }
-        $target = app(ApplicationController::class)->notifyTargetFor($r['application']);
-        if (!$target || (empty($target->email) && empty($target->mobile))) {
-            return response()->json(['message' => 'No email or mobile on file for this student.'], 422);
-        }
-        $amount = number_format($r['difference'], 2, '.', '');
-        app(\App\Services\NotificationService::class)->sendByTrigger(
-            $target, 'fee_due', [$r['application']->application_no, $amount], 'Fee balance due'
-        );
-        $sms = !empty($target->mobile) && DB::table('sms_templates')
-            ->where('organization_id', $target->organization_id ?? $r['application']->organization_id)
-            ->where('event_trigger', 'fee_due')->where('is_active', true)
-            ->whereNotNull('dlt_template_id')->where('dlt_template_id', '!=', '')->exists();
-        $channels = array_values(array_filter([!empty($target->email) ? 'email' : null, $sms ? 'SMS' : null]));
+        $receipt = $c['receipt'];
+        $sa = $c['application'];
+        $appCtl = app(ApplicationController::class);
+        $notify = app(\App\Services\NotificationService::class);
+        $target = $appCtl->notifyTargetFor($sa);
+        // By reference: answers sent after a re-check carry the fresh state.
+        $respond = function (string $message, int $code = 200, array $extra = []) use (&$c) {
+            return response()->json(['message' => $message, 'status' => $c['status'], 'fee_check' => $this->feeCheckSummary($c)] + $extra, $code);
+        };
 
-        return response()->json([
-            'message' => $channels
-                ? "Student notified by " . implode(' and ', $channels) . " to pay Rs {$amount}."
-                : 'Not sent — the fee_due template has no DLT id for SMS and the student has no email.',
-            'channels' => $channels,
-            'amount' => $r['difference'],
-        ], $channels ? 200 : 422);
+        switch ($c['status']) {
+            case 'generated':
+                return $respond('The Final Fee Receipt is already generated — use Print Fee Receipt.', 200, $this->ids($sa, $receipt));
+
+            case 'no_structure':
+                return $respond('No fee structure is set for this course / session / semester / category — set it in Fee Structure first.', 422);
+
+            case 'fee_pending':
+                $due = number_format($c['due'], 2, '.', '');
+                DB::table('student_applications')->where('id', $sa->id)->update(['fee_due_amount' => $c['due'], 'updated_at' => now()]);
+                $channels = $this->notifyChannels($target, $sa, 'admission_fee_pending');
+                if ($channels) {
+                    $notify->sendByTrigger($target, 'admission_fee_pending', [$sa->application_no], 'Admission fee pending');
+                }
+                return $respond("Rs {$due} is still to be paid. "
+                    . ($channels ? 'The student was told by ' . implode(' and ', $channels) . ' and can pay it from the student portal.' : 'The student could NOT be told (no email / mobile on file, or the admission_fee_pending template is missing) — they can still pay it from the student portal.')
+                    . ' Click Generate ID again once it is paid.', 200, ['channels' => $channels]);
+
+            case 'return_pending':
+                return $respond('Rs ' . number_format($c['excess'], 2) . ' paid in excess is waiting in Return to Student. Mark it returned there, then click Generate ID again.');
+
+            case 'return_due':
+                // Locked and re-checked, so a double click raises one row.
+                $amount = DB::transaction(function () use ($id, $request) {
+                    DB::table('fee_receipts')->where('id', $id)->lockForUpdate()->first();
+                    [$c] = $this->feeCheck($id);
+                    if ($c['status'] !== 'return_due') {
+                        return 0.0;
+                    }
+                    $receipt = $c['receipt'];
+                    $sa = $c['application'];
+                    DB::table('return_payments')->insert([
+                        'organization_id' => $receipt->organization_id,
+                        'fee_receipt_id' => $receipt->id,
+                        'admission_id' => $receipt->admission_id,
+                        'student_application_id' => $sa->id,
+                        'student_id' => $receipt->student_id,
+                        'academic_year' => $receipt->academic_year,
+                        'semester_no' => $receipt->semester_no,
+                        'amount' => $c['to_raise'],
+                        'paid_amount' => $c['paid'],
+                        'revised_amount' => $c['actual'],
+                        'revised_breakdown' => json_encode(array_map(fn($b) => ['fee_head' => $b['fee_head_name'], 'amount' => (float) $b['amount']], $c['fee']['breakdown'])),
+                        'reason' => 'Paid Rs ' . number_format($c['paid'], 2, '.', '') . ' against a fee of Rs ' . number_format($c['actual'], 2, '.', '') . ' (Fee Structure)',
+                        'status' => 'pending',
+                        'created_by' => $request->user()?->id,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ]);
+                    return (float) $c['to_raise'];
+                });
+                [$c] = $this->feeCheck($id);
+                if ($amount <= 0) {
+                    return $respond('The excess is already waiting in Return to Student. Mark it returned there, then click Generate ID again.');
+                }
+                return $respond('Rs ' . number_format($amount, 2) . " was paid in excess and is added to Return to Student. Return it, mark it returned there, then click Generate ID again.", 201);
+        }
+
+        // ready — the fee matches (or every difference is settled)
+        try {
+            app(\App\Services\FinalFeeReceiptService::class)->generate(\App\Models\FeeReceipt::findOrFail($receipt->id), $request->user()?->id);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::error("Generate ID: final fee receipt failed for receipt {$receipt->id}: " . $e->getMessage());
+            return $respond('The fee matches, but the Final Fee Receipt could not be prepared. Try again.', 500);
+        }
+        DB::table('student_applications')->where('id', $sa->id)->update(['fee_due_amount' => null, 'updated_at' => now()]);
+        $sa = DB::table('student_applications')->where('id', $sa->id)->first();
+        $ids = $this->ids($sa, $receipt);
+
+        // Fresh admissions get the Student ID / receipt message.
+        $channels = [];
+        if ($receipt->receipt_type === 'regular_admission' && ($channels = $this->notifyChannels($target, $sa, 'admission_receipt'))) {
+            $who = \App\Models\Student::fullName($target)
+                ?: (string) DB::table('direct_registrations')->where('id', $sa->direct_registration_id)->value('name');
+            $notify->sendByTrigger($target, 'admission_receipt', [$who ?: 'Student', $ids['student_uid'] ?? '-', $receipt->receipt_no], 'Final admission fee receipt');
+        }
+        [$c] = $this->feeCheck($id);
+        return $respond(($receipt->receipt_type === 'regular_admission' && !empty($ids['student_uid'])
+                ? "Student ID {$ids['student_uid']} generated. " : '')
+            . "Final Fee Receipt {$receipt->receipt_no} is ready to print."
+            . ($channels ? ' The student was told by ' . implode(' and ', $channels) . '.' : ''),
+            200, $ids + ['channels' => $channels]);
     }
 
-    public function generateReturn(Request $request, int $id): JsonResponse
+    /** Student ID / Admission No to show after Generate ID. */
+    private function ids(object $sa, object $receipt): array
     {
-        $data = $request->validate(['reason' => 'nullable|string|max:500']);
-        [$r, $error] = $this->feeRevision($id);
-        if ($error) return $error;
-        if ($r['difference'] >= 0) {
-            return response()->json(['message' => 'Nothing to return — the re-calculated fee is not lower than what was paid.'], 422);
-        }
-        $receipt = $r['receipt'];
-        $amount = round(-$r['difference'], 2); // server-side figure, never the client's
-        $returnId = DB::table('return_payments')->insertGetId([
-            'organization_id' => $receipt->organization_id,
-            'fee_receipt_id' => $receipt->id,
-            'admission_id' => $receipt->admission_id,
-            'student_application_id' => $r['application']->id,
-            'student_id' => $receipt->student_id,
-            'academic_year' => $receipt->academic_year,
-            'semester_no' => $receipt->semester_no,
-            'amount' => $amount,
-            'paid_amount' => $r['net_paid'],
-            'revised_amount' => $r['revised'],
-            'revised_breakdown' => json_encode(array_map(fn($b) => ['fee_head' => $b['fee_head_name'], 'amount' => (float) $b['amount']], $r['fee']['breakdown'])),
-            'reason' => $data['reason'] ?? null,
-            'status' => 'pending',
-            'created_by' => $request->user()?->id,
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        return response()->json(['message' => "Rs {$amount} added to Return to Student.", 'id' => $returnId, 'amount' => $amount], 201);
+        $studentUid = ($sa->student_uid ?? null)
+            ?: ($receipt->student_id ? DB::table('students')->where('id', $receipt->student_id)->value('student_uid') : null);
+        return [
+            'student_uid' => $studentUid,
+            'admission_no' => DB::table('admissions')->where('id', $receipt->admission_id)->value('admission_no'),
+            'receipt_no' => $receipt->receipt_no,
+        ];
     }
 
-    /** GET /fees/generate/{id}/pdf — download final-fee-receipt-[receipt_no].pdf (renders it if needed). */
+    /**
+     * Channels a trigger will actually go out on — mirrors
+     * NotificationService::sendByTrigger(): nothing without an active
+     * template; SMS needs a DLT id and a mobile, email needs an address.
+     */
+    private function notifyChannels(?object $target, object $sa, string $trigger): array
+    {
+        $template = $target ? DB::table('sms_templates')
+            ->where('organization_id', $target->organization_id ?? $sa->organization_id)
+            ->where('event_trigger', $trigger)->where('is_active', true)
+            ->first(['dlt_template_id']) : null;
+        if (!$template) {
+            return [];
+        }
+        return array_values(array_filter([
+            !empty($target->email) ? 'email' : null,
+            !empty($target->mobile) && !empty($template->dlt_template_id) ? 'SMS' : null,
+        ]));
+    }
+
+    /**
+     * GET /fees/generate/{id}/pdf — download final-fee-receipt-[receipt_no].pdf.
+     * Generate ID prepares it once the fee checks out; printing never does.
+     */
     public function generatePdf(Request $request, int $id)
     {
         $receipt = \App\Models\FeeReceipt::find($id);
         if (!$receipt) {
             return response()->json(['message' => 'Receipt not found.'], 404);
+        }
+        if (!$receipt->final_receipt_generated_at) {
+            return response()->json(['message' => 'Click Generate ID first — it checks the fee against the Fee Structure and prepares the Final Fee Receipt.'], 422);
         }
         $svc = app(\App\Services\FinalFeeReceiptService::class);
         if (!$receipt->final_receipt_path || !\Illuminate\Support\Facades\Storage::exists($receipt->final_receipt_path)) {

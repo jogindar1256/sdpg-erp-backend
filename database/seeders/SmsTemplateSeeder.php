@@ -118,11 +118,6 @@ class SmsTemplateSeeder extends Seeder
             'college_notice' => ['College Notice', '1207166455373096399',
                 'Dear Student, Your {#var#} will be start from {#var#} to {#var#}, for more information please contact your subject teacher. Swami Devanand P. G. College, Math Lar'],
 
-            // Fee rule 10 — re-calculated fee higher than paid. Email-only
-            // until a DLT id is registered (set it via the templates admin).
-            'fee_due' => ['Fee Balance Due', null,
-                'Your revised fee for Application No {#var#} is Rs {#var#} more than the fee paid. Please pay the balance at the college office. Swami Devanand Post Graduate College'],
-
             'college_closed' => ['College Closed', '1207167774996272277',
                 'College will be closed from {#var#} to {#var#} due to vacation of {#var#}. Swami Devendra Post Graduate College Math lar'],
 
