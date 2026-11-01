@@ -598,7 +598,6 @@ Route::middleware('auth:sanctum')->group(function () {
             // 4. Return to Student (fee re-calculated lower than paid)
             Route::get('/return-to-student', [FinancialController::class, 'returnToStudentIndex']);
             Route::post('/return-to-student/{id}/returned', [FinancialController::class, 'returnToStudentMarkReturned'])->whereNumber('id');
-            Route::post('/return-to-student/{id}/cancel', [FinancialController::class, 'returnToStudentCancel'])->whereNumber('id');
         });
 
         Route::prefix('fees')->group(function () {

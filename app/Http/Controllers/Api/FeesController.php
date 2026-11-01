@@ -418,7 +418,9 @@ class FeesController extends Controller
     //            the student portal shows "Fee Pending" with a Pay button.
     //   more   → the excess goes to Return to Student.
     // Clicking again re-checks: once the balance is paid, or the return is
-    // marked returned (or cancelled by the office), the receipt is prepared.
+    // marked returned, the receipt is prepared. Every click re-calculates,
+    // so a still-pending return is kept equal to what is owed now (raised,
+    // corrected, or removed when nothing is owed any more).
 
     private const BALANCE_RECEIPT = 'fee_balance';
 
@@ -454,24 +456,24 @@ class FeesController extends Controller
             ->where('receipt_type', self::BALANCE_RECEIPT)
             ->whereNull('deleted_at')->where('status', '!=', 'cancelled')
             ->sum('net_amount');
-        $paid = round((float) $receipt->net_amount - (float) $receipt->late_fine + (float) $balance, 2);
+        $paidGross = round((float) $receipt->net_amount - (float) $receipt->late_fine + (float) $balance, 2);
         $actual = round((float) $fee['total'], 2);
         $returns = DB::table('return_payments')->where('fee_receipt_id', $receipt->id)->orderBy('id')
             ->get(['id', 'amount', 'status', 'mode', 'ref_no', 'reason', 'created_at', 'returned_on']);
-        $excess = max(0, round($paid - $actual, 2));
-        $settledReturns = round((float) $returns->whereIn('status', ['returned', 'cancelled'])->sum('amount'), 2);
+        $returned = round((float) $returns->where('status', 'returned')->sum('amount'), 2);
         $pendingReturn = round((float) $returns->where('status', 'pending')->sum('amount'), 2);
+        $netPaid = round($paidGross - $returned, 2);   // money handed back no longer counts as paid
+        $due = max(0, round($actual - $netPaid, 2));
+        $owed = max(0, round($netPaid - $actual, 2));  // still to be handed back
 
         if ($receipt->final_receipt_generated_at) {
             $status = 'generated';
         } elseif ($fee['missing_structure']) {
             $status = 'no_structure';
-        } elseif ($actual - $paid > 0.009) {
+        } elseif ($due > 0.009) {
             $status = 'fee_pending';
-        } elseif ($excess > 0.009 && $pendingReturn > 0) {
-            $status = 'return_pending';
-        } elseif ($excess - $settledReturns > 0.009) {
-            $status = 'return_due';
+        } elseif ($owed > 0.009) {
+            $status = abs($pendingReturn - $owed) <= 0.009 ? 'return_pending' : 'return_due';
         } else {
             $status = 'ready';
         }
@@ -481,11 +483,13 @@ class FeesController extends Controller
             'application' => $sa,
             'fee' => $fee,
             'actual' => $actual,
-            'paid' => $paid,
+            'paid' => $netPaid,
+            'paid_gross' => $paidGross,
+            'returned' => $returned,
+            'pending_return' => $pendingReturn,
             'balance_paid' => round((float) $balance, 2),
-            'due' => max(0, round($actual - $paid, 2)),
-            'excess' => $excess,
-            'to_raise' => max(0, round($excess - $settledReturns - $pendingReturn, 2)),
+            'due' => $due,
+            'excess' => $owed,
             'returns' => $returns,
             'status' => $status,
         ], null];
@@ -500,6 +504,7 @@ class FeesController extends Controller
             'actual' => $c['actual'],
             'paid' => $c['paid'],
             'balance_paid' => $c['balance_paid'],
+            'returned' => $c['returned'],
             'due' => $c['due'],
             'excess' => $c['excess'],
             'breakdown' => array_map($line, $c['fee']['breakdown']),
@@ -523,6 +528,62 @@ class FeesController extends Controller
             return response()->json(['message' => $message, 'status' => $c['status'], 'fee_check' => $this->feeCheckSummary($c)] + $extra, $code);
         };
 
+        // Re-calculation keeps Return to Student in step with the fee: a
+        // pending return is raised, corrected to what is owed now, or
+        // removed when nothing is owed (there is no manual cancel).
+        $sync = null;
+        if (!in_array($c['status'], ['generated', 'no_structure'], true) && abs($c['pending_return'] - $c['excess']) > 0.009) {
+            $sync = DB::transaction(function () use ($id, $request) {
+                DB::table('fee_receipts')->where('id', $id)->lockForUpdate()->first();
+                [$c] = $this->feeCheck($id); // re-read under the lock: a double click syncs once
+                $was = $c['pending_return'];
+                $owed = $c['excess'];
+                if (abs($was - $owed) <= 0.009) {
+                    return null;
+                }
+                $pendingIds = $c['returns']->where('status', 'pending')->pluck('id')->all();
+                if ($owed <= 0.009) {
+                    DB::table('return_payments')->whereIn('id', $pendingIds ?: [0])->delete();
+                    return ['removed', $was, 0.0];
+                }
+                $receipt = $c['receipt'];
+                $row = [
+                    'amount' => $owed,
+                    'paid_amount' => $c['paid_gross'],
+                    'revised_amount' => $c['actual'],
+                    'revised_breakdown' => json_encode(array_map(fn($b) => ['fee_head' => $b['fee_head_name'], 'amount' => (float) $b['amount']], $c['fee']['breakdown'])),
+                    'reason' => 'Paid Rs ' . number_format($c['paid_gross'], 2, '.', '') . ' against a fee of Rs ' . number_format($c['actual'], 2, '.', '') . ' (Fee Structure)'
+                        . ($c['returned'] > 0 ? '; Rs ' . number_format($c['returned'], 2, '.', '') . ' already returned' : ''),
+                    'updated_at' => now(),
+                ];
+                if ($pendingIds) {
+                    DB::table('return_payments')->where('id', $pendingIds[0])->update($row);
+                    DB::table('return_payments')->whereIn('id', array_slice($pendingIds, 1) ?: [0])->delete();
+                    return ['corrected', $was, $owed];
+                }
+                DB::table('return_payments')->insert($row + [
+                    'organization_id' => $receipt->organization_id,
+                    'fee_receipt_id' => $receipt->id,
+                    'admission_id' => $receipt->admission_id,
+                    'student_application_id' => $c['application']->id,
+                    'student_id' => $receipt->student_id,
+                    'academic_year' => $receipt->academic_year,
+                    'semester_no' => $receipt->semester_no,
+                    'status' => 'pending',
+                    'created_by' => $request->user()?->id,
+                    'created_at' => now(),
+                ]);
+                return ['raised', 0.0, $owed];
+            });
+            [$c] = $this->feeCheck($id);
+        }
+        $rs = fn(float $v) => 'Rs ' . number_format($v, 2);
+        $syncNote = match ($sync[0] ?? null) {
+            'removed' => "The pending return of {$rs($sync[1])} was removed — nothing is owed back after re-calculating. ",
+            'corrected' => "The pending return was corrected from {$rs($sync[1])} to {$rs($sync[2])} after re-calculating. ",
+            default => '',
+        };
+
         switch ($c['status']) {
             case 'generated':
                 return $respond('The Final Fee Receipt is already generated — use Print Fee Receipt.', 200, $this->ids($sa, $receipt));
@@ -532,53 +593,27 @@ class FeesController extends Controller
 
             case 'fee_pending':
                 $due = number_format($c['due'], 2, '.', '');
+                // The student is told once per amount: a click while the same
+                // amount is already pending doesn't message them again.
+                $alreadyTold = $sa->fee_due_amount !== null && abs((float) $sa->fee_due_amount - $c['due']) < 0.01;
                 DB::table('student_applications')->where('id', $sa->id)->update(['fee_due_amount' => $c['due'], 'updated_at' => now()]);
-                $channels = $this->notifyChannels($target, $sa, 'admission_fee_pending');
-                if ($channels) {
+                $channels = [];
+                if (!$alreadyTold && ($channels = $this->notifyChannels($target, $sa, 'admission_fee_pending'))) {
                     $notify->sendByTrigger($target, 'admission_fee_pending', [$sa->application_no], 'Admission fee pending');
                 }
-                return $respond("Rs {$due} is still to be paid. "
-                    . ($channels ? 'The student was told by ' . implode(' and ', $channels) . ' and can pay it from the student portal.' : 'The student could NOT be told (no email / mobile on file, or the admission_fee_pending template is missing) — they can still pay it from the student portal.')
-                    . ' Click Generate ID again once it is paid.', 200, ['channels' => $channels]);
+                $told = $alreadyTold
+                    ? 'The student was already told and can pay it from the student portal.'
+                    : ($channels ? 'The student was told by ' . implode(' and ', $channels) . ' and can pay it from the student portal.'
+                        : 'The student could NOT be told (no email / mobile on file, or the admission_fee_pending template is missing) — they can still pay it from the student portal.');
+                return $respond($syncNote . "Rs {$due} is still to be paid. {$told} Click Generate ID again once it is paid.", 200, ['channels' => $channels]);
 
+            case 'return_due':     // never left over after the sync above — never falls through to generating
             case 'return_pending':
-                return $respond('Rs ' . number_format($c['excess'], 2) . ' paid in excess is waiting in Return to Student. Mark it returned there, then click Generate ID again.');
-
-            case 'return_due':
-                // Locked and re-checked, so a double click raises one row.
-                $amount = DB::transaction(function () use ($id, $request) {
-                    DB::table('fee_receipts')->where('id', $id)->lockForUpdate()->first();
-                    [$c] = $this->feeCheck($id);
-                    if ($c['status'] !== 'return_due') {
-                        return 0.0;
-                    }
-                    $receipt = $c['receipt'];
-                    $sa = $c['application'];
-                    DB::table('return_payments')->insert([
-                        'organization_id' => $receipt->organization_id,
-                        'fee_receipt_id' => $receipt->id,
-                        'admission_id' => $receipt->admission_id,
-                        'student_application_id' => $sa->id,
-                        'student_id' => $receipt->student_id,
-                        'academic_year' => $receipt->academic_year,
-                        'semester_no' => $receipt->semester_no,
-                        'amount' => $c['to_raise'],
-                        'paid_amount' => $c['paid'],
-                        'revised_amount' => $c['actual'],
-                        'revised_breakdown' => json_encode(array_map(fn($b) => ['fee_head' => $b['fee_head_name'], 'amount' => (float) $b['amount']], $c['fee']['breakdown'])),
-                        'reason' => 'Paid Rs ' . number_format($c['paid'], 2, '.', '') . ' against a fee of Rs ' . number_format($c['actual'], 2, '.', '') . ' (Fee Structure)',
-                        'status' => 'pending',
-                        'created_by' => $request->user()?->id,
-                        'created_at' => now(),
-                        'updated_at' => now(),
-                    ]);
-                    return (float) $c['to_raise'];
-                });
-                [$c] = $this->feeCheck($id);
-                if ($amount <= 0) {
-                    return $respond('The excess is already waiting in Return to Student. Mark it returned there, then click Generate ID again.');
+                if (($sync[0] ?? null) === 'raised') {
+                    return $respond("{$rs($c['excess'])} was paid in excess and is added to Return to Student. Return it, mark it returned there, then click Generate ID again.", 201);
                 }
-                return $respond('Rs ' . number_format($amount, 2) . " was paid in excess and is added to Return to Student. Return it, mark it returned there, then click Generate ID again.", 201);
+                return $respond(($syncNote ?: "{$rs($c['excess'])} paid in excess is waiting in Return to Student. ")
+                    . 'Mark it returned there, then click Generate ID again.');
         }
 
         // ready — the fee matches (or every difference is settled)
@@ -600,7 +635,7 @@ class FeesController extends Controller
             $notify->sendByTrigger($target, 'admission_receipt', [$who ?: 'Student', $ids['student_uid'] ?? '-', $receipt->receipt_no], 'Final admission fee receipt');
         }
         [$c] = $this->feeCheck($id);
-        return $respond(($receipt->receipt_type === 'regular_admission' && !empty($ids['student_uid'])
+        return $respond($syncNote . ($receipt->receipt_type === 'regular_admission' && !empty($ids['student_uid'])
                 ? "Student ID {$ids['student_uid']} generated. " : '')
             . "Final Fee Receipt {$receipt->receipt_no} is ready to print."
             . ($channels ? ' The student was told by ' . implode(' and ', $channels) . '.' : ''),

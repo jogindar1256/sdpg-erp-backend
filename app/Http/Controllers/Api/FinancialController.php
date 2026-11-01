@@ -479,19 +479,4 @@ class FinancialController extends Controller
             ? response()->json(['message' => 'Marked as returned.'])
             : response()->json(['message' => 'Only a pending return can be marked returned.'], 409);
     }
-
-    /** POST /financial/return-to-student/{id}/cancel — raised by mistake. */
-    public function returnToStudentCancel(Request $request, int $id)
-    {
-        $data = $request->validate(['reason' => 'nullable|string|max:500']);
-        $row = DB::table('return_payments')->where('id', $id)->first();
-        $updated = DB::table('return_payments')->where('id', $id)->where('status', 'pending')->update([
-            'status' => 'cancelled',
-            'reason' => trim(($row->reason ?? '') . ($data['reason'] ?? null ? "\nCancelled: {$data['reason']}" : '')) ?: null,
-            'updated_at' => now(),
-        ]);
-        return $updated
-            ? response()->json(['message' => 'Return cancelled.'])
-            : response()->json(['message' => 'Only a pending return can be cancelled.'], 409);
-    }
 }

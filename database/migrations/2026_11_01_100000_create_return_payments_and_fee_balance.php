@@ -34,7 +34,7 @@ return new class extends Migration {
                 $t->decimal('revised_amount', 10, 2);                    // the fee per Fee Structure
                 $t->jsonb('revised_breakdown')->nullable();
                 $t->text('reason')->nullable();
-                $t->string('status', 20)->default('pending')->index();   // pending | returned | cancelled
+                $t->string('status', 20)->default('pending')->index();   // pending | returned
                 $t->string('mode', 30)->nullable();                      // cash | neft | upi | cheque
                 $t->string('ref_no', 100)->nullable();
                 $t->date('returned_on')->nullable();
