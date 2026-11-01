@@ -2440,6 +2440,30 @@ class ApplicationController extends Controller
     }
 
     /**
+     * The fee this application would be charged now, from its current data
+     * (fee rules 1–5) — Fee Receipt Generate's "Regenerate Fee" (rule 9/10).
+     * Lines carry a readable fee_head_name.
+     */
+    public function currentApplicationFee(object $sa): array
+    {
+        $fee = $this->computeApplicationFee($sa);
+        $names = DB::table('fee_heads')
+            ->whereIn('id', collect($fee['breakdown'])->merge($fee['college_breakdown'])->merge($fee['exempt_breakdown'])->pluck('fee_head_id')->filter()->all() ?: [0])
+            ->pluck('name', 'id');
+        $label = fn(array $lines) => array_map(fn($b) => $b + ['fee_head_name' => $b['label'] ?? ($names[$b['fee_head_id']] ?? 'Fee')], $lines);
+        $fee['breakdown'] = $label($fee['breakdown']);
+        $fee['college_breakdown'] = $label($fee['college_breakdown']);
+        $fee['exempt_breakdown'] = $label($fee['exempt_breakdown']);
+        return $fee;
+    }
+
+    /** Who to email / SMS about this application (students row, else the registration). */
+    public function notifyTargetFor(object $sa): ?object
+    {
+        return $this->resolveNotifyTarget($sa);
+    }
+
+    /**
      * Practical fee lines (fee rule 1): one per subject the applicant chose
      * that is allotted to the course with a practical fee (Course → Allotted
      * Subjects shows subjects.has_practical / practical_fee). U.G. chooses

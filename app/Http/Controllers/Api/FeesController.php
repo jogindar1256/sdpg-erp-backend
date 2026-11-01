@@ -395,6 +395,149 @@ class FeesController extends Controller
         return ['regular_admission' => 'Regular', 'back_paper' => 'Back Paper', 'semester_upgrade' => 'Semester Upgrade'][$type] ?? 'Regular';
     }
 
+    // ─── Fee rule 9 / 10: re-calculate after payment ──────────────────────────
+    // GET  /fees/generate/{id}/recalculate   the fee as it stands now vs paid
+    // POST /fees/generate/{id}/notify-due     higher: email / SMS the student
+    // POST /fees/generate/{id}/return         lower: raise a return_payments row
+
+    /**
+     * The receipt's fee re-calculated from the application's current data,
+     * against what was paid. Paid = this admission's non-cancelled
+     * education-fee and misc receipts of the same session / semester (a
+     * balance collected later counts), less returns already raised.
+     * Returns [revision, null] or [null, error response].
+     */
+    private function feeRevision(int $receiptId): array
+    {
+        $receipt = DB::table('fee_receipts')->where('id', $receiptId)->whereNull('deleted_at')->first();
+        if (!$receipt) {
+            return [null, response()->json(['message' => 'Receipt not found.'], 404)];
+        }
+        if (!in_array($receipt->receipt_type, ['regular_admission', 'semester_upgrade'], true)) {
+            return [null, response()->json(['message' => 'Only education-fee receipts can be re-calculated.'], 422)];
+        }
+        $admission = $receipt->admission_id ? DB::table('admissions')->where('id', $receipt->admission_id)->first() : null;
+        $sa = $admission && $admission->application_id ? DB::table('student_applications')->where('id', $admission->application_id)->first() : null;
+        if (!$sa) {
+            return [null, response()->json(['message' => 'No application found for this receipt.'], 422)];
+        }
+
+        $fee = app(ApplicationController::class)->currentApplicationFee($sa);
+        $scope = fn($q) => $q->where('admission_id', $receipt->admission_id)
+            ->where('academic_year', $receipt->academic_year)
+            ->where('semester_no', $receipt->semester_no);
+        $paid = (float) DB::table('fee_receipts')->where($scope)
+            ->whereIn('receipt_type', [$receipt->receipt_type, 'miscellaneous'])
+            ->whereNull('deleted_at')->where('status', '!=', 'cancelled')
+            ->sum('net_amount');
+        $returned = (float) DB::table('return_payments')->where($scope)->where('status', '!=', 'cancelled')->sum('amount');
+        $netPaid = round($paid - $returned, 2);
+        $revised = round((float) $fee['total'], 2);
+
+        return [[
+            'receipt' => $receipt,
+            'admission' => $admission,
+            'application' => $sa,
+            'fee' => $fee,
+            'paid' => round($paid, 2),
+            'returned' => round($returned, 2),
+            'net_paid' => $netPaid,
+            'revised' => $revised,
+            'difference' => round($revised - $netPaid, 2), // > 0 due from student, < 0 owed back
+        ], null];
+    }
+
+    public function generateRecalculate(int $id): JsonResponse
+    {
+        [$r, $error] = $this->feeRevision($id);
+        if ($error) return $error;
+
+        $line = fn($b) => ['fee_head' => $b['fee_head_name'], 'amount' => (float) $b['amount'], 'misc' => !empty($b['misc'])];
+        $target = app(ApplicationController::class)->notifyTargetFor($r['application']);
+        return response()->json([
+            'receipt_id' => $r['receipt']->id,
+            'receipt_no' => $r['receipt']->receipt_no,
+            'revised_breakdown' => array_map($line, $r['fee']['breakdown']),
+            'paid_at_counselling' => array_map($line, $r['fee']['college_breakdown']),
+            'exempt' => array_map($line, $r['fee']['exempt_breakdown']),
+            'revised_total' => $r['revised'],
+            'paid' => $r['paid'],
+            'returned' => $r['returned'],
+            'net_paid' => $r['net_paid'],
+            'difference' => $r['difference'],
+            'status' => $r['difference'] > 0 ? 'due' : ($r['difference'] < 0 ? 'return' : 'settled'),
+            'can_notify' => (bool) ($target && (!empty($target->email) || !empty($target->mobile))),
+            'returns' => DB::table('return_payments')
+                ->where('admission_id', $r['receipt']->admission_id)
+                ->where('academic_year', $r['receipt']->academic_year)
+                ->where('semester_no', $r['receipt']->semester_no)
+                ->orderByDesc('id')
+                ->get(['id', 'amount', 'status', 'reason', 'created_at', 'returned_on']),
+        ]);
+    }
+
+    public function generateNotifyDue(int $id): JsonResponse
+    {
+        [$r, $error] = $this->feeRevision($id);
+        if ($error) return $error;
+        if ($r['difference'] <= 0) {
+            return response()->json(['message' => 'Nothing is due — the re-calculated fee is not higher than what was paid.'], 422);
+        }
+        $target = app(ApplicationController::class)->notifyTargetFor($r['application']);
+        if (!$target || (empty($target->email) && empty($target->mobile))) {
+            return response()->json(['message' => 'No email or mobile on file for this student.'], 422);
+        }
+        $amount = number_format($r['difference'], 2, '.', '');
+        app(\App\Services\NotificationService::class)->sendByTrigger(
+            $target, 'fee_due', [$r['application']->application_no, $amount], 'Fee balance due'
+        );
+        $sms = !empty($target->mobile) && DB::table('sms_templates')
+            ->where('organization_id', $target->organization_id ?? $r['application']->organization_id)
+            ->where('event_trigger', 'fee_due')->where('is_active', true)
+            ->whereNotNull('dlt_template_id')->where('dlt_template_id', '!=', '')->exists();
+        $channels = array_values(array_filter([!empty($target->email) ? 'email' : null, $sms ? 'SMS' : null]));
+
+        return response()->json([
+            'message' => $channels
+                ? "Student notified by " . implode(' and ', $channels) . " to pay Rs {$amount}."
+                : 'Not sent — the fee_due template has no DLT id for SMS and the student has no email.',
+            'channels' => $channels,
+            'amount' => $r['difference'],
+        ], $channels ? 200 : 422);
+    }
+
+    public function generateReturn(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['reason' => 'nullable|string|max:500']);
+        [$r, $error] = $this->feeRevision($id);
+        if ($error) return $error;
+        if ($r['difference'] >= 0) {
+            return response()->json(['message' => 'Nothing to return — the re-calculated fee is not lower than what was paid.'], 422);
+        }
+        $receipt = $r['receipt'];
+        $amount = round(-$r['difference'], 2); // server-side figure, never the client's
+        $returnId = DB::table('return_payments')->insertGetId([
+            'organization_id' => $receipt->organization_id,
+            'fee_receipt_id' => $receipt->id,
+            'admission_id' => $receipt->admission_id,
+            'student_application_id' => $r['application']->id,
+            'student_id' => $receipt->student_id,
+            'academic_year' => $receipt->academic_year,
+            'semester_no' => $receipt->semester_no,
+            'amount' => $amount,
+            'paid_amount' => $r['net_paid'],
+            'revised_amount' => $r['revised'],
+            'revised_breakdown' => json_encode(array_map(fn($b) => ['fee_head' => $b['fee_head_name'], 'amount' => (float) $b['amount']], $r['fee']['breakdown'])),
+            'reason' => $data['reason'] ?? null,
+            'status' => 'pending',
+            'created_by' => $request->user()?->id,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        return response()->json(['message' => "Rs {$amount} added to Return to Student.", 'id' => $returnId, 'amount' => $amount], 201);
+    }
+
     /** GET /fees/generate/{id}/pdf — download final-fee-receipt-[receipt_no].pdf (renders it if needed). */
     public function generatePdf(Request $request, int $id)
     {

@@ -594,6 +594,11 @@ Route::middleware('auth:sanctum')->group(function () {
             // 3. Update Transaction
             Route::get('/update-transaction', [FinancialController::class, 'updateTransactionSearch']);
             Route::post('/update-transaction', [FinancialController::class, 'updateTransactionStore']);
+
+            // 4. Return to Student (fee re-calculated lower than paid)
+            Route::get('/return-to-student', [FinancialController::class, 'returnToStudentIndex']);
+            Route::post('/return-to-student/{id}/returned', [FinancialController::class, 'returnToStudentMarkReturned'])->whereNumber('id');
+            Route::post('/return-to-student/{id}/cancel', [FinancialController::class, 'returnToStudentCancel'])->whereNumber('id');
         });
 
         Route::prefix('fees')->group(function () {
@@ -605,6 +610,9 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('generate', [FeesController::class, 'generateIndex']);
             Route::get('generate/preview', [FeesController::class, 'generatePreview']);
             Route::get('generate/{id}/pdf', [FeesController::class, 'generatePdf'])->whereNumber('id');
+            Route::get('generate/{id}/recalculate', [FeesController::class, 'generateRecalculate'])->whereNumber('id');
+            Route::post('generate/{id}/notify-due', [FeesController::class, 'generateNotifyDue'])->whereNumber('id');
+            Route::post('generate/{id}/return', [FeesController::class, 'generateReturn'])->whereNumber('id');
 
             // Verify Fee Receipts — list pending, verify/reject
             Route::get('verify', [FeesController::class, 'verifyIndex']);
