@@ -145,6 +145,23 @@ class AdmissionNumberService
         return str_pad(((int) $max) + 1, 2, '0', STR_PAD_LEFT);
     }
 
+    /**
+     * Give an active admission its Class A/C No if it has none (odd semesters only — a semester
+     * upgrade to an even semester keeps the one it had). Safe to call repeatedly.
+     */
+    public function ensureClassAcNo(int $admissionId): void
+    {
+        $a = DB::table('admissions')->where('id', $admissionId)->first(['id', 'program_id', 'academic_year', 'semester_no', 'account_no', 'status']);
+        if (!$a || $a->status !== 'active' || !$a->program_id || !$a->academic_year) return;
+        if ($a->account_no !== null && $a->account_no !== '') return;
+        $sem = (int) $a->semester_no;
+        if ($sem > 0 && $sem % 2 === 0) return; // even semester
+        DB::table('admissions')->where('id', $a->id)->update([
+            'account_no' => $this->classAcNo((int) $a->program_id, (string) $a->academic_year),
+            'updated_at' => now(),
+        ]);
+    }
+
     // ── 5. Record No (global, never resets) ────────────────────────────────
     public function recordNo(): int
     {

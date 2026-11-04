@@ -63,7 +63,7 @@ class FeesController extends Controller
             ->leftJoin('student_applications as sa', 'sa.id', '=', 'adm.application_id')
             ->leftJoin('fee_refunds as rf', 'rf.fee_receipt_id', '=', 'fr.id')
             ->select([
-                'sa.application_no', 'dr.category',
+                'sa.application_no', 'sa.id as application_id', 'dr.category', 'dr.gender', 'dr.domestic_state', 'dr.mobile',
                 'fr.id', 'fr.receipt_no', 'fr.receipt_type as fee_type', 'fr.net_amount as amount',
                 'fr.transaction_id as utr_no', 'fr.bank_ref_no', 'fr.receipt_date as payment_date',
                 'fr.is_verified', 'fr.status', 'fr.created_at',
@@ -85,6 +85,11 @@ class FeesController extends Controller
             elseif ($st === 'Pending')   $q->where('fr.is_verified', false)->where('fr.status', '!=', 'cancelled');
             elseif ($st === 'Rejected')  $q->where('fr.status', 'cancelled');
         }
+        if ($g = $request->gender)       $q->whereRaw('LOWER(dr.gender) = ?', [mb_strtolower($g)]);
+        if ($ss = $request->state_scope) {
+            if ($ss === 'up')            $q->whereRaw("LOWER(TRIM(dr.domestic_state)) = 'uttar pradesh'");
+            elseif ($ss === 'non_up')    $q->whereRaw("LOWER(TRIM(COALESCE(dr.domestic_state, ''))) <> 'uttar pradesh'")->whereNotNull('dr.domestic_state');
+        }
         if ($df = $request->date_from)   $q->whereDate('fr.receipt_date', '>=', $df);
         if ($dt = $request->date_to)     $q->whereDate('fr.receipt_date', '<=', $dt);
 
@@ -95,6 +100,10 @@ class FeesController extends Controller
                   ->orWhere('dr.name', 'ilike', "%$search%")
                   ->orWhere('adm.applicant_info->name', 'ilike', "%$search%")
                   ->orWhere('adm.admission_no', 'ilike', "%$search%")
+                  ->orWhere('sa.application_no', 'ilike', "%$search%")
+                  ->orWhere('dr.registration_no', 'ilike', "%$search%")
+                  ->orWhere('dr.mobile', 'ilike', "%$search%")
+                  ->orWhere('sa.student_uid', 'ilike', "%$search%")
                   ->orWhere('fr.transaction_id', 'ilike', "%$search%")
                   ->orWhere('fr.receipt_no', 'ilike', "%$search%");
             });
@@ -120,8 +129,13 @@ class FeesController extends Controller
             : $q->orderByDesc('fr.created_at');
 
         $perPage = 20;
+        $appCtl  = app(ApplicationController::class);
         $data    = $q->forPage($request->page ?? 1, $perPage)->get()
-            ->map(fn ($r) => $this->decorate($r));
+            ->map(function ($r) use ($appCtl) {
+                $r = $this->decorate($r);
+                $r->practical_count = $r->application_id ? $appCtl->practicalSubjectCount((int) $r->application_id) : null;
+                return $r;
+            });
 
         // Aggregated in Postgres over the same filtered join — previously every
         // matching receipt was loaded into PHP just to count it. Its total is

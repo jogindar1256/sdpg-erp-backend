@@ -437,6 +437,7 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('schedule/search', [ExaminationController::class, 'scheduleSearch']);
             Route::get('schedule/options', [ExaminationController::class, 'scheduleOptions']);
             Route::get('schedule/subject-papers', [ExaminationController::class, 'scheduleSubjectPapers']);
+            Route::get('schedule/paper-lookup', [ExaminationController::class, 'schedulePaperLookup']);
 
             // Room Master
             Route::get('rooms', [ExaminationController::class, 'roomMasterIndex']);
@@ -451,7 +452,10 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::delete('innings/{id}', [ExaminationController::class, 'inningDestroy']);
 
             // Seating Plan
-            Route::post('seating-plan/create', [ExaminationController::class, 'seatingPlanCreate']);
+            Route::get('seating-plan/classes', [ExaminationController::class, 'seatingPlanClasses']);
+            Route::post('seating-plan/save', [ExaminationController::class, 'seatingPlanSave']);
+            Route::delete('seating-plan', [ExaminationController::class, 'seatingPlanDelete']);
+            Route::get('seating-plan/students', [ExaminationController::class, 'seatingPlanStudents']);
             Route::get('seating-plan/search-seat', [ExaminationController::class, 'searchSeat']);
             Route::post('seating-plan/self-p7', [ExaminationController::class, 'selfCreateP7']);
 

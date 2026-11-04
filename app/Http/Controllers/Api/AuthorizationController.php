@@ -209,11 +209,15 @@ class AuthorizationController extends Controller
             ->get([
                 'a.id as admission_id', 'a.admission_no', 'a.semester_no', 'a.created_at',
                 'sa.application_no', 'sa.declaration_at', 'dr.name', 'pr.short_name as course',
+                'dr.registration_no', 'dr.mobile', 'dr.domestic_state',
             ])
             ->map(fn($r) => [
                 'admission_id' => $r->admission_id,
                 'admission_no' => $r->admission_no,
                 'application_no' => $r->application_no,
+                'registration_no' => $r->registration_no,
+                'mobile' => $r->mobile,
+                'state' => $r->domestic_state,
                 'name' => $r->name,
                 'course' => $r->course,
                 'semester_no' => $r->semester_no,

@@ -249,7 +249,11 @@ class StudentRegistrationController extends Controller
                 'domestic_state' => $req->domestic_state,
 
                 'category' => $req->category,
-                'admission_category' => $req->admission_category,
+                // Domicile other than Uttar Pradesh → Admission Category is always General
+                // (the form locks it; enforced here too so a crafted request cannot change it).
+                'admission_category' => ($req->domestic_state && mb_strtolower(trim((string) $req->domestic_state)) !== 'uttar pradesh')
+                    ? 'General'
+                    : $req->admission_category,
                 'religion' => $req->religion,
                 'nationality' => $req->nationality ?: 'Indian',
 

@@ -1959,6 +1959,20 @@ class MasterSettingsController extends Controller
     // ══════════════════════════════════════════════════════════════════
     public function securityDepositIndex()
     {
+        // The master used to ship empty (nothing could be edited). Make sure every state / UT
+        // has a row — default "deposit not required".
+        $have = DB::table('state_security_deposits')->pluck('state_name')->map(fn($n) => mb_strtolower(trim($n)))->all();
+        $states = ['Andaman and Nicobar Islands', 'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chandigarh',
+            'Chhattisgarh', 'Dadra and Nagar Haveli and Daman and Diu', 'Delhi', 'Goa', 'Gujarat', 'Haryana', 'Himachal Pradesh',
+            'Jammu & Kashmir', 'Jharkhand', 'Karnataka', 'Kerala', 'Ladakh', 'Lakshadweep', 'Madhya Pradesh', 'Maharashtra',
+            'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Puducherry', 'Punjab', 'Rajasthan', 'Sikkim', 'Tamil Nadu',
+            'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal'];
+        $missing = array_values(array_filter($states, fn($s) => !in_array(mb_strtolower($s), $have, true)));
+        if ($missing) {
+            DB::table('state_security_deposits')->insert(array_map(fn($s) => [
+                'state_name' => $s, 'deposit_required' => false, 'created_at' => now(), 'updated_at' => now(),
+            ], $missing));
+        }
         return response()->json(DB::table('state_security_deposits')->orderBy('state_name')->get());
     }
 

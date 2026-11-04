@@ -632,7 +632,7 @@ class AmendmentController extends Controller
         $part4 = ($app && $app->part_4) ? json_decode($app->part_4, true) : null;
 
         $tcKeys = ['tc_condition', 'tc_org_name', 'tc_address', 'tc_contact', 'tc_serial_no', 'tc_ledger_no', 'tc_issue_date', 'tc_behavior', 'tc_statement_signed'];
-        $migKeys = ['has_migration', 'mig_condition', 'mig_university', 'mig_address', 'mig_state', 'mig_district', 'mig_pin', 'mig_last_institute', 'mig_inst_address', 'mig_inst_state', 'mig_inst_district', 'mig_inst_pin', 'mig_leave_year', 'mig_reason', 'mig_statement_signed'];
+        $migKeys = ['has_migration', 'mig_condition', 'mig_no', 'mig_university', 'mig_address', 'mig_state', 'mig_district', 'mig_pin', 'mig_last_institute', 'mig_inst_address', 'mig_inst_state', 'mig_inst_district', 'mig_inst_pin', 'mig_leave_year', 'mig_reason', 'mig_statement_signed'];
 
         return response()->json(array_merge((array) $student, [
             'application_id' => $app->id ?? null,

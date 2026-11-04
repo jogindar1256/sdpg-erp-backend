@@ -117,6 +117,15 @@ class ApplicationController extends Controller
             ? ($userNames[$latestDecision->released_by] ?? null)
             : null;
 
+        // fee_paid / paid_at / fee_receipt_id were dropped from student_applications
+        // (Phase 4) — project them from `payments`, or every client that reads
+        // them off this response shows a paid fee as "Pending".
+        $paidAppPayment = \App\Support\Payments::paidApplicationPayment((int) $sa->id);
+        $sa->fee_paid = (bool) $paidAppPayment;
+        $sa->paid_at = $paidAppPayment->paid_at ?? null;
+        $sa->fee_paid_at = $sa->paid_at;
+        $sa->fee_receipt_id = $paidAppPayment->fee_receipt_id ?? null;
+
         // Fee preview — computeApplicationFee() is read-only (no order
         // created)
         if ($sa->application_type !== 'back_paper') {
@@ -1035,6 +1044,14 @@ class ApplicationController extends Controller
         if ($target === 'approved') {
             $data['approved_by'] = $app->approved_by;
             $data['approved_at'] = $app->approved_at;
+            // The Admission No is allotted when the application is APPROVED (never at
+            // submit or fee payment). Deterministic per application, so re-approving
+            // after a hold / roll back gives the same number.
+            if (!$existing || $existing->admission_no === null || $existing->admission_no === '') {
+                $data['admission_no'] = $app->academic_year . '-' . str_pad((string) $app->id, 6, '0', STR_PAD_LEFT);
+            }
+        } elseif ($target === 'pending' && $existing && !in_array($existing->status, self::ADMISSION_FINAL_STATUSES, true)) {
+            $data['admission_no'] = null; // rolled back to the queue: not approved, so no number
         }
 
         if ($existing) {
@@ -1060,7 +1077,7 @@ class ApplicationController extends Controller
             'student_id' => null,
             'application_id' => $app->id,
             'admission_type' => $app->application_type === 'semester_upgrade' ? 'upgrade' : 'regular',
-            // admission_no is generated with the Student ID once the fee is paid (ensureStudentUid()).
+            // admission_no is allotted on approval (syncAdmissionForApplication), not here.
             'admission_date' => now()->toDateString(),
             'is_verified' => false,
             'status' => $target,
@@ -1070,7 +1087,7 @@ class ApplicationController extends Controller
 
     /**
      * Reserve the permanent 13-digit Student ID for a FIRST-TIME applicant
-     * (and generate the Admission No on the admissions row, for everyone).
+     * (the Admission No is NOT generated here — it is allotted on approval).
      *
      * Only the number is generated: it is stored on student_applications and
      * nothing is copied into students / admissions here — that still happens
@@ -1084,14 +1101,8 @@ class ApplicationController extends Controller
         if (!$fresh || !in_array($fresh->application_type, self::ADMISSION_APP_TYPES, true)) {
             return null;
         }
-        // The Admission No is generated at the same moment as the Student ID.
-        DB::table('admissions')
-            ->where('application_id', $fresh->id)
-            ->where(fn($q) => $q->whereNull('admission_no')->orWhere('admission_no', ''))
-            ->update([
-                'admission_no' => $fresh->academic_year . '-' . str_pad((string) $fresh->id, 6, '0', STR_PAD_LEFT),
-                'updated_at' => now(),
-            ]);
+        // NOTE: the Admission No is no longer generated here (fee payment). It is allotted
+        // when the application is approved — see syncAdmissionForApplication().
         if (!empty($fresh->student_uid)) {
             return $fresh->student_uid;
         }
@@ -1135,6 +1146,19 @@ class ApplicationController extends Controller
     }
 
     /** Subject summary for the verification card, from Part 6. */
+    /** Number of practical subjects the applicant chose (Fee Receipt Verification grid). */
+    public function practicalSubjectCount(int $appId): int
+    {
+        $app = DB::table('student_applications')->where('id', $appId)->first();
+        if (!$app) {
+            return 0;
+        }
+        $part6 = json_decode((string) ($app->part_6 ?? ''), true);
+        $out = $this->subjectSummary($app, is_array($part6) ? $part6 : []);
+        $names = array_filter(array_map('trim', explode(',', (string) ($out['practical_subject'] ?? ''))));
+        return count($names);
+    }
+
     private function subjectSummary(object $app, array $part6): array
     {
         $names = fn(array $ids) => $ids
@@ -1210,6 +1234,20 @@ class ApplicationController extends Controller
         $headNames = DB::table('fee_heads')
             ->whereIn('id', collect($fee['breakdown'])->merge($fee['college_breakdown'] ?? [])->pluck('fee_head_id')->filter()->all() ?: [0])
             ->pluck('name', 'id');
+        $headFavor = DB::table('fee_heads')
+            ->whereIn('id', collect($fee['breakdown'])->merge($fee['college_breakdown'] ?? [])->pluck('fee_head_id')->filter()->all() ?: [0])
+            ->pluck('in_favor_of', 'id');
+        // Fee Detail popup: every particular (online + paid-in-college), grouped by who it is
+        // "in favour of" — Government / College / University (Fee Head → In Favor Of).
+        $favor = ['Government' => [], 'College' => [], 'University' => []];
+        foreach (collect($fee['breakdown'])->merge($fee['college_breakdown'] ?? []) as $b) {
+            $who_ = $headFavor[$b['fee_head_id'] ?? 0] ?? 'College';
+            $who_ = array_key_exists($who_, $favor) ? $who_ : 'College';
+            $favor[$who_][] = [
+                'fee_head' => $b['label'] ?? ($headNames[$b['fee_head_id'] ?? 0] ?? 'Fee'),
+                'amount' => (float) $b['amount'],
+            ];
+        }
         // One payments lookup: applicationFeeReceiptId() is this payment's fee_receipt_id.
         $saAppPaidPayment = \App\Support\Payments::paidApplicationPayment((int) $sa->id);
         $saFeeReceiptId = $saAppPaidPayment->fee_receipt_id ?? null;
@@ -1280,6 +1318,14 @@ class ApplicationController extends Controller
                 'amount' => (float) $b['amount'],
             ])->values()->all(),
             'pass_out' => $fee['pass_out'],
+            'fee_by_favor' => $favor,
+            'grand_total_fee' => (float) collect($favor)->flatten(1)->sum('amount'),
+            'student_uid' => $sa->student_uid ?? ($sa->student->student_uid ?? null),
+            'roll_no' => $sa->student->university_roll_no ?? null,
+            'enrolment_no' => $sa->student->enrollment_no ?? null,
+            'abc_id' => $sa->part_1['abc_id'] ?? ($reg->abc_id ?? null),
+            'ddurn_id' => $sa->part_1['ddurn_id'] ?? ($reg->ddurn_no ?? null),
+            'family_id' => $sa->part_1['family_id'] ?? ($reg->family_id ?? null),
             'fee_breakdown' => collect($fee['breakdown'])->map(fn($b) => [
                 'fee_head' => $b['label'] ?? ($headNames[$b['fee_head_id']] ?? 'Fee'),
                 'amount' => (float) $b['amount'],
@@ -1451,6 +1497,8 @@ class ApplicationController extends Controller
                 'updated_at' => now(),
             ]);
         }
+        // Class A/C No (Course A/C on the exam pages) — nothing used to assign it, so it was always blank.
+        $svc->ensureClassAcNo((int) $admissionId);
 
         // Receipts issued at payment time, before the student existed.
         DB::table('fee_receipts')
@@ -2560,18 +2608,23 @@ class ApplicationController extends Controller
         $category = strtolower(trim((string) ($category ?: 'general')));
         $category = in_array($category, ['general', 'gen', 'ur', 'unreserved'], true) ? 'gen' : $category;
 
-        // Fee rule 2: SC / ST applicants from a Domestic State marked
-        // "deposit not required" in Master → State Security Deposit (that
-        // state sends no security fee) pay the General Male fee. Only an
-        // explicit row counts — a state missing from the master is unchanged.
-        if ($app && in_array($category, ['sc', 'st'], true)) {
+        // Fee rule 2: SC / ST / OBC applicants from OUTSIDE Uttar Pradesh pay the General Male fee
+        // (their Admission Category is forced to General at registration) — unless the
+        // Domestic State is explicitly marked "deposit required" in Master → State Security
+        // Deposit (that state sends the security deposit, so the SC/ST concession stays).
+        // A state with no row counts as "no deposit" (the master used to be empty, which made
+        // e.g. Bihar SC/ST pay the SC/ST fee).
+        if ($app && in_array($category, ['sc', 'st', 'obc'], true)) {
             $part1 = is_array($app->part_1 ?? null) ? $app->part_1 : (json_decode($app->part_1 ?? '{}', true) ?: []);
             $state = trim((string) (($this->registrationForApp($app)->domestic_state ?? null) ?: ($part1['domestic_state'] ?? '')));
-            if ($state !== '' && DB::table('state_security_deposits')
-                ->whereRaw('LOWER(TRIM(state_name)) = ?', [mb_strtolower($state)])
-                ->where('deposit_required', false)
-                ->exists()) {
-                return ['male', 'gen'];
+            if ($state !== '' && mb_strtolower($state) !== 'uttar pradesh') {
+                $depositRequired = DB::table('state_security_deposits')
+                    ->whereRaw('LOWER(TRIM(state_name)) = ?', [mb_strtolower($state)])
+                    ->where('deposit_required', true)
+                    ->exists();
+                if (!$depositRequired) {
+                    return ['male', 'gen'];
+                }
             }
         }
 

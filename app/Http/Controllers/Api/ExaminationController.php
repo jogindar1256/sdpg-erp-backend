@@ -47,6 +47,40 @@ class ExaminationController extends Controller
         ];
     }
 
+    /** Exam Form ID Entry is only for fresh students: Regular, Single Subject (SS), Single Subject 3rd only (SS3). */
+    private const FORM_ID_EXAM_TYPES = ['Regular', 'SS', 'SS3'];
+
+    /** Search box shared by Accept Exam Form / Exam Form ID Entry. Needs the s, sa, dr and ef aliases. */
+    private function applyFormSearch($q, ?string $term)
+    {
+        $term = trim((string) $term);
+        if ($term === '') return $q;
+        $like = '%' . $term . '%';
+        return $q->where(function ($w) use ($like) {
+            $w->where('sa.application_no', 'ilike', $like)
+              ->orWhere('s.university_roll_no', 'ilike', $like)
+              ->orWhere('s.enrollment_no', 'ilike', $like)
+              ->orWhere('s.student_uid', 'ilike', $like)
+              ->orWhere('sa.student_uid', 'ilike', $like)
+              ->orWhere('s.mobile', 'ilike', $like)
+              ->orWhere('dr.name', 'ilike', $like)
+              ->orWhere('dr.registration_no', 'ilike', $like)
+              ->orWhere('ef.form_id', 'ilike', $like);
+        });
+    }
+
+    /** Back-fill the Class A/C No of the admissions on screen (those created before it was assigned). */
+    private function backfillAcNo($rows): void
+    {
+        $svc = app(\App\Services\AdmissionNumberService::class);
+        foreach ($rows as $r) {
+            if (empty($r->account_no) && !empty($r->admission_id)) {
+                $svc->ensureClassAcNo((int) $r->admission_id);
+                $r->account_no = DB::table('admissions')->where('id', $r->admission_id)->value('account_no');
+            }
+        }
+    }
+
     private function decorate($row)
     {
         if (!$row) return $row;
@@ -80,8 +114,9 @@ class ExaminationController extends Controller
                 ->leftJoin('student_applications as sa', 'sa.id', 'a.application_id')
                 ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
         )
-            ->select(array_merge(['ef.*', 's.university_roll_no as roll_no', 's.mobile', 'sa.application_no', 'sa.id as application_id', 'drc.unique_code as code', 'a.account_no', 'p.short_name as course'], $this->identitySelect()))
+            ->select(array_merge(['ef.*', 's.university_roll_no as roll_no', 's.mobile', 'sa.application_no', 'sa.id as application_id', 'drc.unique_code as code', 'a.account_no', 'a.id as admission_id', 'p.short_name as course'], $this->identitySelect()))
             ->where('ef.session_year', $session)
+            ->tap(fn($q) => $this->applyFormSearch($q, $req->search))
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
             ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
@@ -90,6 +125,7 @@ class ExaminationController extends Controller
 
         $records = $q->paginate(50);
         $records->getCollection()->transform(fn ($r) => $this->decorate($r));
+        $this->backfillAcNo($records->getCollection());
 
         return response()->json($records);
     }
@@ -113,23 +149,26 @@ class ExaminationController extends Controller
         return response()->json(['message' => 'Status updated.']);
     }
 
+    // Accepts exactly the exam forms the office ticked (2 or more) — never "everything in the
+    // filter". Already-accepted forms are skipped.
     public function acceptFormBulk(Request $req)
     {
-        DB::table('exam_forms')
-            ->where('session_year', $req->session_year)
-            ->when($req->program_id,  fn($q) => $q->whereIn('admission_id',
-                DB::table('admissions')->where('program_id', $req->program_id)->pluck('id')))
-            ->when($req->semester_no, fn($q) => $q->where('semester_no', $req->semester_no))
+        $v = Validator::make($req->all(), ['ids' => 'required|array|min:2', 'ids.*' => 'integer']);
+        if ($v->fails()) return response()->json(['message' => 'Select at least 2 exam forms.', 'errors' => $v->errors()], 422);
+
+        $n = DB::table('exam_forms')
+            ->whereIn('id', $req->ids)
+            ->where('status', '!=', 'Accepted')
             ->update(['status' => 'Accepted', 'updated_at' => now()]);
 
-        return response()->json(['message' => 'All accepted.']);
+        return response()->json(['message' => "{$n} exam form(s) accepted.", 'accepted' => $n]);
     }
 
     // ══════════════════════════════════════════════════════════════
     // 2. EXAM FORM ID ENTRY
     // ══════════════════════════════════════════════════════════════
     // Accepted exam forms only — Form ID is entered after the form is accepted.
-    public function formIdIndex(Request $req)
+    public function formIdIndex(Request $req, bool $restrictTypes = true)
     {
         $q = $this->withIdentity(
             DB::table('exam_forms as ef')
@@ -142,6 +181,8 @@ class ExaminationController extends Controller
             ->select(array_merge(['ef.*', 's.personal_info->gender as gender', 's.university_roll_no as roll_no', 'a.account_no', 'sa.application_no', 'sa.id as application_id', 'drc.unique_code as code', 's.enrollment_no', 'p.short_name as course'], $this->identitySelect()))
             ->where('ef.status', 'Accepted')
             ->where('ef.session_year', $req->session_year ?? $this->sessionYear())
+            ->when($restrictTypes, fn($q) => $q->whereIn('ef.exam_type', self::FORM_ID_EXAM_TYPES))
+            ->tap(fn($q) => $this->applyFormSearch($q, $req->search))
             ->when($req->program_id,  fn($q) => $q->where('a.program_id',  $req->program_id))
             ->when($req->semester_no, fn($q) => $q->where('ef.semester_no', $req->semester_no))
             ->when($req->exam_type,   fn($q) => $q->where('ef.exam_type',   $req->exam_type))
@@ -158,7 +199,7 @@ class ExaminationController extends Controller
     // ══════════════════════════════════════════════════════════════
     public function rollUpdateIndex(Request $req)
     {
-        return $this->formIdIndex($req);
+        return $this->formIdIndex($req, false); // roll-no update covers every exam type
     }
 
     public function rollUpdateUpdate(Request $req, $id)
@@ -217,6 +258,10 @@ class ExaminationController extends Controller
         $v = Validator::make($req->all(), ['form_id' => 'required|string|max:50']);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
 
+        $type = DB::table('exam_forms')->where('id', $id)->value('exam_type');
+        if (!in_array($type, self::FORM_ID_EXAM_TYPES, true)) {
+            return response()->json(['message' => 'Form ID is entered only for Regular, SS and SS 3rd-only exam forms.'], 422);
+        }
         DB::table('exam_forms')->where('id', $id)
             ->update(['form_id' => $req->form_id, 'updated_at' => now()]);
         return response()->json(['message' => 'Form ID saved.']);
@@ -371,6 +416,69 @@ class ExaminationController extends Controller
         return response()->json($rows);
     }
 
+    /**
+     * Paper-code lookup for the schedule entry form. A numeric paper code
+     * resolves to the paper (name, course, semester, subject) plus the
+     * examinee counts for the session. The same code can exist under more
+     * than one course, so this returns every match and the UI lets the user
+     * pick when there is more than one.
+     */
+    public function schedulePaperLookup(Request $req)
+    {
+        $code = strtoupper(trim((string) $req->paper_code));
+        if ($code === '') return response()->json([]);
+        $session = $req->session_year ?? $this->sessionYear();
+
+        // Typeahead: codes starting with what has been typed so far.
+        if ($req->boolean('suggest')) {
+            return response()->json(DB::table('subject_papers as sp')
+                ->join('programs as p', 'p.id', 'sp.program_id')
+                ->whereRaw('upper(trim(sp.paper_code)) like ?', [str_replace(['%', '_'], '', $code) . '%'])
+                ->orderBy('sp.paper_code')->orderBy('p.short_name')->limit(10)
+                ->get(['sp.paper_code', 'sp.paper_name', 'sp.semester_no', 'p.short_name as course']));
+        }
+
+        $papers = DB::table('subject_papers as sp')
+            ->join('programs as p', 'p.id', 'sp.program_id')
+            ->join('subjects as sub', 'sub.id', 'sp.subject_id')
+            ->whereRaw('upper(trim(sp.paper_code)) = ?', [$code])
+            ->orderBy('p.short_name')->orderBy('sp.semester_no')
+            ->get(['sp.paper_code', 'sp.paper_name', 'sp.program_id', 'sp.semester_no', 'sub.id as subject_id', 'sub.name as subject_name', 'p.short_name as course']);
+
+        $out = $papers->map(function ($pp) use ($code, $session) {
+            $lower = "lower(coalesce(s.personal_info->>'gender', ''))";
+            $c = DB::table('exam_form_papers as efp')
+                ->join('exam_forms as ef', 'ef.id', 'efp.exam_form_id')
+                ->join('admissions as a', 'a.id', 'ef.admission_id')
+                ->join('students as s', 's.id', 'a.student_id')
+                ->whereRaw('upper(trim(efp.paper_code)) = ?', [$code])
+                ->where('ef.session_year', $session)
+                ->where('ef.semester_no', (string) $pp->semester_no)
+                ->where('a.program_id', $pp->program_id)
+                ->where('ef.status', 'Accepted')
+                ->selectRaw("
+                    count(*) filter (where efp.exam_type = 'Regular') as regular,
+                    count(*) filter (where efp.exam_type = 'Back Paper') as back_paper,
+                    count(*) filter (where ef.exam_type = 'SS') as ss,
+                    count(*) filter (where ef.exam_type = 'SS3') as ss3,
+                    count(*) filter (where $lower = 'male') as male,
+                    count(*) filter (where $lower = 'female') as female,
+                    count(*) filter (where $lower not in ('male', 'female')) as trans,
+                    count(*) as total")
+                ->first();
+
+            return [
+                'paper_code' => $pp->paper_code, 'paper_name' => $pp->paper_name,
+                'program_id' => $pp->program_id, 'course' => $pp->course,
+                'semester_no' => (string) $pp->semester_no,
+                'subject_id' => $pp->subject_id, 'subject_name' => $pp->subject_name,
+                'counts' => collect((array) $c)->map(fn ($v) => (int) $v),
+            ];
+        })->values();
+
+        return response()->json($out);
+    }
+
     public function scheduleUpdate(Request $req, $id)
     {
         DB::table('exam_schedules')->where('id', $id)->update(array_merge(
@@ -459,78 +567,191 @@ class ExaminationController extends Controller
         return response()->json(['message' => 'Deleted.']);
     }
 
-    public function seatingPlanCreate(Request $req)
+    // ══════════════════════════════════════════════════════════════
+    // SEATING PLAN — per exam date + inning. Rooms are picked per class
+    // by hand; classes may share a room (seats continue after the previous
+    // class); seats are given in roll-number order; a room holds
+    // capacity + extra seats.
+    // ══════════════════════════════════════════════════════════════
+
+    /** Schedule entries (classes) written on the given date + inning. */
+    private function seatingSchedules(string $session, string $date, int $inningId)
     {
-        $v = Validator::make($req->all(), [
-            'session_year' => 'required|string',
-            'exam_date'    => 'required|date',
-            'inning_id'    => 'required|exists:exam_innings,id',
-            'exam_type'    => 'required|in:Regular,Back Paper',
-            'gender'       => 'nullable|in:male,female,transgender,All',
-        ]);
-        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
+        $inning = DB::table('exam_innings')->where('id', $inningId)->value('inning_name');
+        return DB::table('exam_schedules as es')
+            ->join('programs as p', 'p.id', 'es.program_id')
+            ->join('subjects as sub', 'sub.id', 'es.subject_id')
+            ->where('es.session_year', $session)->where('es.exam_date', $date)->where('es.inning', $inning)
+            ->orderBy('p.short_name')->orderBy('es.semester_no')->orderBy('es.paper_code')
+            ->get(['es.id', 'es.program_id', 'es.semester_no', 'es.exam_mode', 'es.paper_code', 'p.short_name as course', 'sub.name as subject']);
+    }
 
-        $schedules = DB::table('exam_schedules')
-            ->where('session_year', $req->session_year)
-            ->where('exam_date', $req->exam_date)
-            ->where('inning', DB::table('exam_innings')->where('id', $req->inning_id)->value('inning_name'))
-            ->pluck('paper_code');
-
-        $students = DB::table('exam_form_papers as efp')
+    /** Accepted examinees of one schedule entry, in roll-number order. */
+    private function seatingExaminees(object $sch, string $session, array $types, array $genders)
+    {
+        $q = DB::table('exam_form_papers as efp')
             ->join('exam_forms as ef', 'ef.id', 'efp.exam_form_id')
             ->join('admissions as a', 'a.id', 'ef.admission_id')
             ->join('students as s', 's.id', 'a.student_id')
-            ->whereIn('efp.paper_code', $schedules)
-            ->where('ef.session_year', $req->session_year)
-            ->where('ef.exam_type', $req->exam_type)
-            ->when($req->gender && $req->gender !== 'All', fn($q) => $q->where('s.personal_info->gender', $req->gender))
+            ->whereRaw('upper(trim(efp.paper_code)) = ?', [strtoupper(trim($sch->paper_code))])
+            ->where('ef.session_year', $session)
+            ->where('ef.semester_no', $sch->semester_no)
+            ->where('a.program_id', $sch->program_id)
             ->where('ef.status', 'Accepted')
-            ->select('s.id as student_id', 's.university_roll_no as roll_no', 'efp.paper_code')
-            ->get();
+            ->whereIn('efp.exam_type', $types ?: ['Regular', 'Back Paper']);
 
-        $rooms = DB::table('exam_rooms')->where('is_active', true)->orderBy('building_name')->orderBy('room_no')->get();
-
-        $seats = [];
-        $seatRows = [];
-        $roomIdx = 0;
-        $seatIdx = 0;
-        $now = now();
-
-        foreach ($students as $student) {
-            if ($roomIdx >= $rooms->count()) break;
-            $room = $rooms[$roomIdx];
-            $capacity = $room->capacity + ($room->extra_seat ?? 0);
-
-            $row = intdiv($seatIdx, $room->columns) + 1;
-            $col = ($seatIdx % $room->columns) + 1;
-
-            // Keyed by the exam_seating_unique columns: a repeated student+paper
-            // keeps the last allocation (as the old per-row updateOrInsert did),
-            // and one upsert statement can't touch the same row twice anyway.
-            $seatRows[$student->student_id . '|' . $student->paper_code] = [
-                'session_year' => $req->session_year, 'exam_date' => $req->exam_date,
-                'student_id' => $student->student_id, 'paper_code' => $student->paper_code,
-                'room_id' => $room->id, 'row_no' => $row, 'col_no' => $col,
-                'created_at' => $now, 'updated_at' => $now,
-            ];
-            $seats[] = ['roll' => $student->roll_no, 'room' => $room->room_no, 'row' => $row, 'col' => $col];
-
-            $seatIdx++;
-            if ($seatIdx >= $capacity) { $roomIdx++; $seatIdx = 0; }
+        $g = array_values(array_intersect($genders, ['Male', 'Female', 'Trans']));
+        if ($g && count($g) < 3) {
+            $q->where(function ($w) use ($g) {
+                $lower = "lower(coalesce(s.personal_info->>'gender', ''))";
+                if (in_array('Male', $g, true)) $w->orWhereRaw("$lower = 'male'");
+                if (in_array('Female', $g, true)) $w->orWhereRaw("$lower = 'female'");
+                if (in_array('Trans', $g, true)) $w->orWhereRaw("$lower not in ('male', 'female')");
+            });
         }
 
-        // One upsert per 500 seats instead of two queries per student.
-        DB::transaction(function () use ($seatRows) {
-            foreach (array_chunk(array_values($seatRows), 500) as $chunk) {
-                DB::table('exam_seating')->upsert(
-                    $chunk,
-                    ['session_year', 'exam_date', 'student_id', 'paper_code'],
-                    ['room_id', 'row_no', 'col_no', 'updated_at']
-                );
+        return $q->select('s.id as student_id', 's.university_roll_no as roll_no')
+            ->distinct()->orderByRaw('s.university_roll_no asc nulls last')->orderBy('s.id')->get();
+    }
+
+    private function seatingInput(Request $req): array
+    {
+        return [
+            $req->input('session_year', $this->sessionYear()),
+            (string) $req->input('exam_date'),
+            (int) $req->input('inning_id'),
+            array_values(array_filter((array) $req->input('exam_types', ['Regular']))),
+            array_values(array_filter((array) $req->input('genders', ['Male', 'Female', 'Trans']))),
+        ];
+    }
+
+    /** GET seating-plan/classes — classes on that date + inning, examinee counts, room list and any saved plan. */
+    public function seatingPlanClasses(Request $req)
+    {
+        $v = Validator::make($req->all(), ['exam_date' => 'required|date', 'inning_id' => 'required|exists:exam_innings,id']);
+        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
+        [$session, $date, $inningId, $types, $genders] = $this->seatingInput($req);
+
+        $schedules = $this->seatingSchedules($session, $date, $inningId);
+        $seated = DB::table('exam_seating')
+            ->where('session_year', $session)->where('exam_date', $date)->where('inning_id', $inningId)
+            ->selectRaw('paper_code, room_id, count(*) as seated, min(id) as first_id')
+            ->groupBy('paper_code', 'room_id')->orderBy('first_id')->get()->groupBy('paper_code');
+
+        $classes = $schedules->map(function ($sch) use ($session, $types, $genders, $seated) {
+            $ex = $this->seatingExaminees($sch, $session, $types, $genders);
+            // Why a count can be 0: accepted forms of this class / how many carry this paper.
+            $accepted = DB::table('exam_forms as ef')->join('admissions as a', 'a.id', 'ef.admission_id')
+                ->where('ef.session_year', $session)->where('ef.semester_no', $sch->semester_no)
+                ->where('a.program_id', $sch->program_id)->where('ef.status', 'Accepted');
+            return [
+                'schedule_id' => $sch->id, 'course' => $sch->course, 'semester_no' => $sch->semester_no,
+                'exam_mode' => $sch->exam_mode, 'subject' => $sch->subject, 'paper_code' => $sch->paper_code,
+                'students' => $ex->count(),
+                'no_roll' => $ex->whereNull('roll_no')->count(),
+                'accepted_forms' => (clone $accepted)->count(),
+                'forms_with_papers' => (clone $accepted)->whereExists(fn ($q) => $q->selectRaw('1')->from('exam_form_papers as p')->whereColumn('p.exam_form_id', 'ef.id'))->count(),
+                'rooms' => ($seated->get($sch->paper_code) ?? collect())->map(fn ($r) => ['room_id' => (int) $r->room_id, 'seated' => (int) $r->seated])->values(),
+            ];
+        })->values();
+
+        $rooms = DB::table('exam_rooms')->where('is_active', true)->orderBy('room_no')
+            ->get(['id', 'room_no', 'building_name', 'rows', 'columns', 'capacity', 'extra_seat'])
+            ->map(fn ($r) => (array) $r + ['total' => (int) $r->capacity + (int) ($r->extra_seat ?? 0)]);
+
+        return response()->json(['classes' => $classes, 'rooms' => $rooms, 'saved' => $seated->isNotEmpty()]);
+    }
+
+    /**
+     * POST seating-plan/save — {session_year, exam_date, inning_id, exam_types[], genders[],
+     * classes: [{schedule_id, room_ids: []}]}. Replaces the plan of that date + inning.
+     * Classes are seated in the order sent; each class fills its rooms in the order sent, roll-number order.
+     */
+    public function seatingPlanSave(Request $req)
+    {
+        $v = Validator::make($req->all(), [
+            'exam_date' => 'required|date', 'inning_id' => 'required|exists:exam_innings,id',
+            'classes' => 'required|array|min:1', 'classes.*.schedule_id' => 'required|integer',
+            'classes.*.room_ids' => 'array', 'classes.*.room_ids.*' => 'integer|exists:exam_rooms,id',
+        ]);
+        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
+        [$session, $date, $inningId, $types, $genders] = $this->seatingInput($req);
+
+        $schedules = $this->seatingSchedules($session, $date, $inningId)->keyBy('id');
+        $rooms = DB::table('exam_rooms')->where('is_active', true)->get()->keyBy('id');
+        $used = [];   // room_id => seats taken so far
+        $rows = [];
+        $now = now();
+
+        foreach ($req->input('classes') as $c) {
+            $sch = $schedules->get((int) $c['schedule_id']);
+            if (!$sch) {
+                return response()->json(['message' => 'A selected class is not scheduled on this date and inning.'], 422);
+            }
+            $students = $this->seatingExaminees($sch, $session, $types, $genders)->values();
+            if ($noRoll = $students->whereNull('roll_no')->count()) {
+                return response()->json(['message' => "{$sch->course} · {$sch->subject} ({$sch->paper_code}): {$noRoll} student(s) have no University Roll No. — assign it in University Roll No. Update first."], 422);
+            }
+            $i = 0;
+            foreach (array_values(array_unique($c['room_ids'] ?? [])) as $rid) {
+                $room = $rooms->get($rid);
+                if (!$room) continue;
+                $free = (int) $room->capacity + (int) ($room->extra_seat ?? 0) - ($used[$rid] ?? 0);
+                for (; $free > 0 && $i < $students->count(); $free--, $i++) {
+                    $seat = ($used[$rid] = ($used[$rid] ?? 0) + 1);
+                    $cols = max(1, (int) $room->columns);
+                    $rows[] = [
+                        'session_year' => $session, 'exam_date' => $date, 'inning_id' => $inningId,
+                        'student_id' => $students[$i]->student_id, 'paper_code' => $sch->paper_code,
+                        'room_id' => $rid, 'seat_no' => $seat,
+                        'row_no' => intdiv($seat - 1, $cols) + 1, 'col_no' => ($seat - 1) % $cols + 1,
+                        'created_at' => $now, 'updated_at' => $now,
+                    ];
+                }
+            }
+            if ($i < $students->count()) {
+                return response()->json(['message' => "{$sch->course} · {$sch->subject} ({$sch->paper_code}): " . ($students->count() - $i) . ' of ' . $students->count() . ' students have no seat — add a room or more capacity.'], 422);
+            }
+        }
+
+        DB::transaction(function () use ($session, $date, $inningId, $rows) {
+            DB::table('exam_seating')->where('session_year', $session)->where('exam_date', $date)->where('inning_id', $inningId)->delete();
+            foreach (array_chunk($rows, 500) as $chunk) {
+                DB::table('exam_seating')->insert($chunk);
             }
         });
 
-        return response()->json(['message' => count($seats) . ' seats allocated.', 'count' => count($seats)]);
+        return response()->json(['message' => count($rows) . ' seats saved.', 'count' => count($rows)]);
+    }
+
+    /** DELETE seating-plan — remove the plan of that date + inning. */
+    public function seatingPlanDelete(Request $req)
+    {
+        $v = Validator::make($req->all(), ['exam_date' => 'required|date', 'inning_id' => 'required|exists:exam_innings,id']);
+        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
+        [$session, $date, $inningId] = $this->seatingInput($req);
+        $n = DB::table('exam_seating')->where('session_year', $session)->where('exam_date', $date)->where('inning_id', $inningId)->delete();
+        return response()->json(['message' => "Plan deleted ({$n} seats removed).", 'count' => $n]);
+    }
+
+    /** GET seating-plan/students — seated students of a room (and optionally one paper) for that date + inning; all rooms without room_id. */
+    public function seatingPlanStudents(Request $req)
+    {
+        $v = Validator::make($req->all(), ['exam_date' => 'required|date', 'inning_id' => 'required|exists:exam_innings,id']);
+        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
+        [$session, $date, $inningId] = $this->seatingInput($req);
+
+        $rows = $this->withIdentity(
+            DB::table('exam_seating as es')
+                ->join('students as s', 's.id', 'es.student_id')
+                ->join('exam_rooms as r', 'r.id', 'es.room_id')
+                ->where('es.session_year', $session)->where('es.exam_date', $date)->where('es.inning_id', $inningId)
+                ->when($req->room_id, fn ($q, $v) => $q->where('es.room_id', $v))
+                ->when($req->paper_code, fn ($q, $v) => $q->where('es.paper_code', $v))
+        )->orderBy('r.room_no')->orderBy('es.seat_no')
+            ->get(array_merge(['es.paper_code', 'es.seat_no', 'r.room_no', 'r.building_name', 's.university_roll_no as roll_no', 's.mobile'], $this->identitySelect()));
+
+        return response()->json($this->decorateCollection($rows)->values());
     }
 
     public function searchSeat(Request $req)
