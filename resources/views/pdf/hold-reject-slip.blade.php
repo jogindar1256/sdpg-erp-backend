@@ -9,10 +9,10 @@
     $fmtDt = fn($d) => $d ? \Illuminate\Support\Carbon::parse($d)->format('d-M-Y h:i A') : null;
     $val = fn($v) => ($v === null || $v === '') ? '—' : $v;
 
-    $collegeName = $org->name ?? 'Swami Devanand P.G. College';
-    $collegeAddr = trim(implode(', ', array_filter([$org->address ?? 'Math-Lar', $org->district ?? 'Deoria'])))
-        . ' (' . ($org->state ?? 'Uttar Pradesh') . ') ' . ($org->pin_code ?? '');
-    $affiliation = $org->university_name ?? 'Deen Dayal Upadhyay Gorakhpur University, Gorakhpur';
+    $collegeName = \App\Support\OrgBrand::name($org);
+    $logo = \App\Support\OrgBrand::logoDataUri($org);
+    $collegeAddr = \App\Support\OrgBrand::fullAddress($org);
+    $affiliation = trim((string) (($org ?? \App\Support\OrgBrand::current())->university_name ?? ''));
 
     $isHold = $decision->decision === 'hold';
     $objections = $decision->objections ? (json_decode($decision->objections, true) ?? []) : [];
@@ -75,9 +75,10 @@
         <tr>
             <td style="width: 75%; padding-right: 4px;">
                 <div class="banner">
-                    <div class="banner-name">{{ strtoupper($collegeName) }}</div>
+                    @if($logo)<img src="{{ $logo }}" style="height:44px;float:left;margin-right:8px;" alt="">@endif
+<div class="banner-name">{{ strtoupper($collegeName) }}</div>
                     <div class="banner-addr">{{ $collegeAddr }}</div>
-                    <div class="banner-affil">Affiliated By&mdash; {{ $affiliation }}</div>
+                    @if($affiliation)<div class="banner-affil">Affiliated By&mdash; {{ $affiliation }}</div>@endif
                 </div>
             </td>
             <td style="width: 25%;">

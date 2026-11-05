@@ -62,7 +62,7 @@ class NotificationService
 
         if (!empty($student->email)) {
             try {
-                Mail::raw($text, fn ($m) => $m->to($student->email)->subject($subject ?? ($template->name ?: 'SDPG College Notification')));
+                Mail::raw($text, fn ($m) => $m->to($student->email)->subject($subject ?? ($template->name ?: (\App\Support\OrgBrand::name() . ' Notification'))));
             } catch (\Throwable $e) {
                 Log::error("[Notify] email send failed for event_trigger={$eventTrigger}: " . $e->getMessage());
             }

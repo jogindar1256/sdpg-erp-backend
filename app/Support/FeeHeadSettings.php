@@ -20,10 +20,9 @@ use Illuminate\Support\Facades\DB;
  */
 class FeeHeadSettings
 {
-    /** Institute names that mean "this college". */
-    // "Swami Devanand" / "Dewanand" — the V spelling never matched before.
-    private const SDPGC_RE = '/\bS\.?\s*D\.?\s*P\.?\s*G\b|SWAMI\s+DE?[VW]A?NAND/i';
-    /** Board / university names that mean DDU Gorakhpur University. */
+    // "This college" is identified from the Institute Profile (college code,
+    // name, short name) — see OrgBrand::isOwnInstitute — not hard-coded names.
+    /** Spelling variants of DDU Gorakhpur University; used only when this college is itself DDU-affiliated. */
     private const DDU_RE = '/DEEN\s*DAYAL|\bD\.?\s*D\.?\s*U\b|GORAKHPUR\s+UNIVERSITY|UNIVERSITY\s+OF\s+GORAKHPUR/i';
 
     /** fee_head_id => settings row, for one configuration. A semester-specific row wins over semester 0. */
@@ -69,14 +68,17 @@ class FeeHeadSettings
         }
 
         // 2) Part 3 education records: institute / board-university names.
+        $org = !empty($sa->organization_id)
+            ? DB::table('organizations')->where('id', $sa->organization_id)->first()
+            : OrgBrand::current();
         $part3 = $sa->part_3 ?? null;
         $part3 = is_string($part3) ? (json_decode($part3, true) ?: []) : (array) $part3;
         foreach ((array) ($part3['education_records'] ?? []) as $rec) {
             $rec = (array) $rec;
-            if (preg_match(self::SDPGC_RE, (string) ($rec['institute_name'] ?? ''))) {
+            if (OrgBrand::isOwnInstitute((string) ($rec['institute_name'] ?? ''), (string) ($rec['institute_code'] ?? ''), $org)) {
                 $out['sdpgc'] = true;
             }
-            if (preg_match(self::DDU_RE, (string) ($rec['board_university'] ?? ''))) {
+            if (OrgBrand::isOwnUniversity((string) ($rec['board_university'] ?? ''), $org, self::DDU_RE)) {
                 $out['ddu'] = true;
             }
         }

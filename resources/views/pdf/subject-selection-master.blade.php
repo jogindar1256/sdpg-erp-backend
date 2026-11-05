@@ -1,5 +1,5 @@
 @php
-    $collegeName = $org->name ?? 'Swami Devanand Post Graduate College, Math Lar';
+    $collegeName = \App\Support\OrgBrand::name($org);
     $courseName = $program->full_name ?? $program->short_name ?? '';
 @endphp
 <!DOCTYPE html>

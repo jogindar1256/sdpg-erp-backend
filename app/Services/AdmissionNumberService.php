@@ -171,6 +171,11 @@ class AdmissionNumberService
     // ── helpers ────────────────────────────────────────────────────────────
     private function centreCode(): string
     {
+        // Code the affiliating university assigned to this college (Institute Profile).
+        $code = \App\Support\OrgBrand::collegeCode();
+        if ($code !== null) {
+            return ctype_digit($code) ? str_pad($code, 3, '0', STR_PAD_LEFT) : $code;
+        }
         return (string) config('college.centre_code', '145');
     }
 

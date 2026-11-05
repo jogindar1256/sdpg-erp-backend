@@ -1,7 +1,8 @@
 @php
     $fmt = fn ($d) => $d ? \Illuminate\Support\Carbon::parse($d)->format('d-M-Y') : '—';
     $val = fn ($v) => ($v === null || $v === '') ? '—' : $v;
-    $collegeName = $org->name ?? 'Swami Devanand Post Graduate College, Math Lar';
+    $collegeName = \App\Support\OrgBrand::name($org);
+    $logo = \App\Support\OrgBrand::logoDataUri($org);
     $course = \App\Models\Program::label($program) ?? '—';
     $total = collect($papers)->count();
 @endphp
@@ -36,7 +37,8 @@
 <body>
 
     <div class="head">
-        <div class="college">{{ $collegeName }}</div>
+        @if($logo)<img src="{{ $logo }}" style="height:44px;float:left;margin-right:8px;" alt="">@endif
+<div class="college">{{ $collegeName }}</div>
         <div class="sub">Back Paper Application Form &mdash; Session {{ $sa->academic_year }}</div>
     </div>
 

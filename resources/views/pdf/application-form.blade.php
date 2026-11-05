@@ -14,8 +14,9 @@
     $p    = fn (int $n) => $parts[$n] ?? [];
     $p1 = $p(1); $p2 = $p(2); $p3 = $p(3); $p4 = $p(4); $p5 = $p(5); $p6 = $p(6); $p7 = $p(7); $p8 = $p(8);
 
-    $collegeName = $org->name ?? 'Swami Devanand Post Graduate College';
-    $collegeAddr = $org->address ?? 'Math Lar, Deoria (Uttar Pradesh)';
+    $collegeName = \App\Support\OrgBrand::name($org);
+    $logo = \App\Support\OrgBrand::logoDataUri($org);
+    $collegeAddr = \App\Support\OrgBrand::fullAddress($org);
     $course      = \App\Models\Program::label($program) ?? '—';
 
     $studentName = $p1['name_english'] ?? $reg->name ?? $student->name ?? '—';
@@ -113,7 +114,8 @@
     <table class="letterhead">
         <tr>
             <td>
-                <div class="name">{{ $collegeName }}</div>
+                @if($logo)<img src="{{ $logo }}" style="height:44px;float:left;margin-right:8px;" alt="">@endif
+<div class="name">{{ $collegeName }}</div>
                 <div class="addr">{{ $collegeAddr }}</div>
             </td>
             <td class="appno" style="width:150px;">

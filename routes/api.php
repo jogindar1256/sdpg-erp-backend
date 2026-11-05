@@ -11,11 +11,14 @@ use App\Http\Controllers\Api\StudentController;
 use App\Http\Controllers\Api\ApplicationController;
 use App\Http\Controllers\Api\FeeReceiptController;
 use App\Http\Controllers\Api\OrganizationController;
+use App\Http\Controllers\Api\StaffController;
 use App\Http\Controllers\Api\ProgramController;
 use App\Http\Controllers\Api\StudentRegistrationController;
 use App\Http\Controllers\Api\SubjectController;
 use App\Http\Controllers\Api\AdmissionController;
 use App\Http\Controllers\Api\ExaminationController;
+use App\Http\Controllers\Api\ExamPrintController;
+use App\Http\Controllers\Api\ExamListPrintController;
 use App\Http\Controllers\Api\AmendmentController;
 use App\Http\Controllers\Api\CertificateController;
 use App\Http\Controllers\Api\DashboardController;
@@ -41,6 +44,9 @@ Route::prefix('auth')->group(function () {
     Route::post('student/forgot-password', [AuthController::class, 'studentForgotPassword']);
     Route::post('student/reset-password', [AuthController::class, 'studentResetPassword']);
 });
+
+// Institute brand (name / address / logo) for login + registration screens
+Route::get('public/organization', [OrganizationController::class, 'publicProfile']);
 
 Route::prefix('student/register')->group(function () {
     // Public catalog for the registration form (form is public — must not need auth)
@@ -238,6 +244,21 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('organization', [OrganizationController::class, 'show']);
         Route::put('organization', [OrganizationController::class, 'update']);
         Route::post('organization/logo', [OrganizationController::class, 'uploadLogo']);
+
+        // Academic Staff
+        Route::get('organization/staff', [StaffController::class, 'index']);
+        Route::get('organization/staff/options', [StaffController::class, 'options']);
+        Route::get('organization/staff/lookup', [StaffController::class, 'lookup']);
+        Route::post('organization/staff', [StaffController::class, 'store']);
+        Route::get('organization/staff/{id}', [StaffController::class, 'show']);
+        Route::put('organization/staff/{id}', [StaffController::class, 'update']);
+        Route::delete('organization/staff/{id}', [StaffController::class, 'destroy']);
+        Route::post('organization/staff/{id}/media', [StaffController::class, 'uploadMedia']);
+        Route::post('organization/staff/{id}/documents', [StaffController::class, 'uploadDocument']);
+        Route::get('organization/staff/{id}/documents/{docId}', [StaffController::class, 'downloadDocument']);
+        Route::delete('organization/staff/{id}/documents/{docId}', [StaffController::class, 'deleteDocument']);
+        Route::get('organization/profile', [OrganizationController::class, 'profile']);
+        Route::match(['put', 'post'], 'organization/profile', [OrganizationController::class, 'updateProfile']);
 
         // Fee Settings
         Route::apiResource('fee-heads', FeeHeadController::class);
@@ -460,14 +481,27 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::post('seating-plan/self-p7', [ExaminationController::class, 'selfCreateP7']);
 
             // Exam Conduct
+            Route::get('conduct/schedule', [ExaminationController::class, 'conductSchedule']);
             Route::get('conduct/p1', [ExaminationController::class, 'conductP1Index']);
             Route::post('conduct/p1', [ExaminationController::class, 'conductP1Store']);
+            Route::delete('conduct/p1/{id}/line', [ExaminationController::class, 'conductP1DeleteLine'])->whereNumber('id');
+            Route::get('conduct/p1/{id}', [ExaminationController::class, 'conductP1Show'])->whereNumber('id');
+            Route::delete('conduct/p1/{id}', [ExaminationController::class, 'conductP1Destroy'])->whereNumber('id');
+            Route::get('conduct/student', [ExaminationController::class, 'conductStudent']);
             Route::get('conduct/p3', [ExaminationController::class, 'conductP3Index']);
             Route::post('conduct/p3', [ExaminationController::class, 'conductP3Store']);
+            Route::put('conduct/p3/{id}', [ExaminationController::class, 'conductP3Update'])->whereNumber('id');
+            Route::delete('conduct/p3/{id}', [ExaminationController::class, 'conductP3Destroy'])->whereNumber('id');
             Route::get('conduct/p4', [ExaminationController::class, 'conductP4Index']);
             Route::post('conduct/p4', [ExaminationController::class, 'conductP4Store']);
+            Route::put('conduct/p4/{id}', [ExaminationController::class, 'conductP4Update'])->whereNumber('id');
+            Route::delete('conduct/p4/{id}', [ExaminationController::class, 'conductP4Destroy'])->whereNumber('id');
             Route::get('conduct/p9', [ExaminationController::class, 'conductP9Index']);
             Route::post('conduct/p9', [ExaminationController::class, 'conductP9Store']);
+            Route::post('conduct/p9/packet', [ExaminationController::class, 'conductP9Packet']);
+            Route::delete('conduct/p9/{id}/line', [ExaminationController::class, 'conductP9DeleteLine'])->whereNumber('id');
+            Route::get('conduct/p9/{id}', [ExaminationController::class, 'conductP9Show'])->whereNumber('id');
+            Route::delete('conduct/p9/{id}', [ExaminationController::class, 'conductP9Destroy'])->whereNumber('id');
 
             // Nominal Roll
             Route::get('nominal-roll', [ExaminationController::class, 'nominalRollIndex']);
@@ -492,6 +526,12 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::put('centres/{id}', [ExaminationController::class, 'examCentreUpdate']);
             Route::delete('centres/{id}', [ExaminationController::class, 'examCentreDestroy']);
             Route::get('centres/students', [ExaminationController::class, 'examCentreStudents']);
+
+            // Server-side PDF prints (seating plan, room plan, P1, P4, P6, P7, P9)
+            Route::get('print/{doc}', [ExamPrintController::class, 'show'])->where('doc', '[a-z0-9-]+');
+
+            // College-level lists (accept list, form-ID list, marksheet distribution, result) under the college letter-head
+            Route::get('print-list/{doc}', [ExamListPrintController::class, 'show'])->where('doc', '[a-z-]+');
 
             // Helpers
             Route::get('lookup-student', [ExaminationController::class, 'lookupStudent']);

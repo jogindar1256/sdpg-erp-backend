@@ -461,8 +461,8 @@ class StudentRegistrationController extends Controller
 
         try {
             Mail::raw(
-                "Your SDPG College email verification OTP is: {$otp}\n\nValid for 10 minutes. Do not share it with anyone.",
-                fn($m) => $m->to($req->email)->subject('SDPG College — Email Verification OTP')
+                "Your " . \App\Support\OrgBrand::name() . " email verification OTP is: {$otp}\n\nValid for 10 minutes. Do not share it with anyone.",
+                fn($m) => $m->to($req->email)->subject(\App\Support\OrgBrand::name() . ' — Email Verification OTP')
             );
         } catch (\Throwable $e) {
             Log::error('Pre email OTP failed: ' . $e->getMessage());
@@ -917,9 +917,9 @@ class StudentRegistrationController extends Controller
 
         try {
             Mail::raw(
-                "Your SDPG College email verification OTP is: {$otp}\n\n"
+                "Your " . \App\Support\OrgBrand::name() . " email verification OTP is: {$otp}\n\n"
                 . "Valid for 10 minutes. Do not share it with anyone.",
-                fn($m) => $m->to($reg->email)->subject('SDPG College — Email Verification OTP')
+                fn($m) => $m->to($reg->email)->subject(\App\Support\OrgBrand::name() . ' — Email Verification OTP')
             );
         } catch (\Throwable $e) {
             Log::error('Email OTP send failed: ' . $e->getMessage());
@@ -1823,19 +1823,20 @@ class StudentRegistrationController extends Controller
         $program = $reg->program_id ? DB::table('programs')->find($reg->program_id) : null;
         $course = $program->full_name ?? $program->short_name ?? $reg->reg_type;
         $fee = (int) ($reg->fee_amount ?: (self::FEES[$reg->reg_type] ?? 0));
-        $portal = rtrim(config('app.frontend_url', env('FRONTEND_URL', 'https://erp.sdpgcollege.ac.in')), '/');
+        $orgName = \App\Support\OrgBrand::name();
+        $portal = \App\Support\OrgBrand::portalUrl();
 
         $subject = $paid
-            ? 'SDPG College — Registration Complete & Login Credentials'
-            : 'SDPG College — Registration Saved (Payment Pending)';
+            ? "{$orgName} — Registration Complete & Login Credentials"
+            : "{$orgName} — Registration Saved (Payment Pending)";
 
         $payLine = $paid
             ? "Registration Fee : Rs. {$fee} — PAID"
             : "Registration Fee : Rs. {$fee} — PENDING (log in and pay to complete your registration)";
 
         $intro = $paid
-            ? "Congratulations! Your registration at SDPG College is complete."
-            : "Your registration at SDPG College has been saved, but the fee payment was not confirmed.";
+            ? "Congratulations! Your registration at {$orgName} is complete."
+            : "Your registration at {$orgName} has been saved, but the fee payment was not confirmed.";
 
         $body = "Dear {$reg->name},\n\n{$intro}\n\n"
             . "==============================\n"
@@ -1854,7 +1855,7 @@ class StudentRegistrationController extends Controller
             . ($paid
                 ? "Please change your password after your first login.\n\n"
                 : "Log in with the above credentials and pay Rs. {$fee} from the student portal to complete your registration.\n\n")
-            . "Regards,\nSDPG College ERP\n"
+            . "Regards,\n{$orgName} ERP\n"
             . "(Do not share your password with anyone.)";
 
         try {

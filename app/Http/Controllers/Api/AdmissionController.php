@@ -198,7 +198,7 @@ class AdmissionController extends Controller
             $count = Student::where('organization_id', $admission->organization_id)
                 ->whereNotNull('enrollment_no')->count() + 1;
             $student->update([
-                'enrollment_no' => 'SDPG-' . $year . '-' . str_pad($count, 5, '0', STR_PAD_LEFT),
+                'enrollment_no' => (preg_replace('/[^A-Za-z0-9]/', '', (string) \DB::table('organizations')->where('id', $admission->organization_id)->value('code')) ?: 'ORG') . '-' . $year . '-' . str_pad($count, 5, '0', STR_PAD_LEFT),
             ]);
         }
 

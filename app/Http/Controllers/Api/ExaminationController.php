@@ -823,147 +823,446 @@ class ExaminationController extends Controller
     // 5. EXAM CONDUCT
     // ══════════════════════════════════════════════════════════════
 
-    public function conductP1Index(Request $req)
+    // ══════════════════════════════════════════════════════════════
+    // CREATE P1 / CREATE PACKET NO. (P9)
+    // One record per session + exam date + inning + centre; `lines` is the
+    // exam schedule of that date + inning, snapshotted on save. P9 also
+    // carries a packet number per paper (kept stable on re-save).
+    // ══════════════════════════════════════════════════════════════
+
+    private function conductTable(string $kind): string
     {
-        return response()->json(
-            DB::table('exam_conduct_p1')
-                ->where('session_year', $req->session_year ?? $this->sessionYear())
-                ->when($req->exam_date, fn($q) => $q->where('exam_date', $req->exam_date))
-                ->orderBy('created_at', 'desc')->paginate(30)
-        );
+        return $kind === 'p9' ? 'exam_packets' : 'exam_conduct_p1';
     }
 
-    public function conductP1Store(Request $req)
+    /** Exam schedule of a date + inning: examinee counts and, from the saved seating plan, the rooms of every paper. */
+    private function conductScheduleLines(string $session, string $date, int $inningId): array
+    {
+        $all = ['Regular', 'Back Paper'];
+        $key = fn ($q) => $q->where('exam_date', $date)->where('inning_id', $inningId);
+
+        $seated = DB::table('exam_seating as es')->join('exam_rooms as r', 'r.id', 'es.room_id')
+            ->where('es.session_year', $session)->where('es.exam_date', $date)->where('es.inning_id', $inningId)
+            ->groupBy('es.paper_code', 'es.room_id', 'r.room_no', 'r.building_name')
+            ->orderBy('r.room_no')
+            ->get(['es.paper_code', 'es.room_id', 'r.room_no', 'r.building_name', DB::raw('count(*) as seated')])
+            ->groupBy('paper_code');
+        $abs = $key(DB::table('exam_absent'))->groupBy('paper_code', 'room_id')
+            ->get(['paper_code', 'room_id', DB::raw('count(*) as n')])->groupBy('paper_code');
+        $ufm = $key(DB::table('exam_ufm'))->groupBy('paper_code', 'room_id')
+            ->get(['paper_code', 'room_id', DB::raw('count(*) as n')])->groupBy('paper_code');
+        $count = fn ($grp, $code, $rid) => (int) (($grp->get($code) ?? collect())->firstWhere('room_id', $rid)->n ?? 0);
+
+        return $this->seatingSchedules($session, $date, $inningId)->map(function ($sch) use ($session, $all, $seated, $abs, $ufm, $count) {
+            $total = $this->seatingExaminees($sch, $session, $all, [])->count();
+            $bp = $this->seatingExaminees($sch, $session, ['Back Paper'], [])->count();
+            $rooms = ($seated->get($sch->paper_code) ?? collect())->map(function ($r) use ($sch, $abs, $ufm, $count) {
+                $a = $count($abs, $sch->paper_code, $r->room_id);
+                return [
+                    'room_id' => (int) $r->room_id, 'room_no' => $r->room_no, 'building_name' => $r->building_name,
+                    'seated' => (int) $r->seated, 'abs' => $a, 'ufm' => $count($ufm, $sch->paper_code, $r->room_id),
+                    'required' => max(0, (int) $r->seated - $a),
+                    'copy_in_room' => null, 'received_copy' => null, 'locked' => false,
+                ];
+            })->values()->all();
+            return [
+                'schedule_id' => $sch->id, 'course' => $sch->course, 'semester_no' => (string) $sch->semester_no,
+                'subject' => $sch->subject, 'paper_code' => $sch->paper_code, 'exam_mode' => $sch->exam_mode,
+                'total' => $total, 'regular' => max(0, $total - $bp), 'back_paper' => $bp,
+                'rooms' => $rooms,
+                'absent' => array_sum(array_column($rooms, 'abs')), 'ufm' => array_sum(array_column($rooms, 'ufm')),
+                'total_copy' => null, 'catch_no' => null, 'packet_no' => null,
+                'ufm_total_copy' => null, 'ufm_catch_no' => null, 'ufm_packet_no' => null,
+            ];
+        })->values()->all();
+    }
+
+    /**
+     * Lay the saved values of a record over a fresh schedule. $edits (from the screen) are applied
+     * only to rows that are not locked in the saved record; a row may always be unlocked.
+     */
+    private function conductMerge(array $fresh, array $saved, array $edits = []): array
+    {
+        $savedBy = collect($saved)->keyBy('paper_code');
+        $editBy = collect($edits)->keyBy('paper_code');
+        foreach ($fresh as &$ln) {
+            $old = $savedBy->get($ln['paper_code'], []);
+            $ed = $editBy->get($ln['paper_code'], []);
+            $oldRooms = collect($old['rooms'] ?? [])->keyBy('room_id');
+            $edRooms = collect($ed['rooms'] ?? [])->keyBy('room_id');
+            foreach ($ln['rooms'] as &$rm) {
+                $o = $oldRooms->get($rm['room_id'], []);
+                $e = $edRooms->get($rm['room_id'], []);
+                $rm['copy_in_room'] = $o['copy_in_room'] ?? null;
+                $rm['received_copy'] = $o['received_copy'] ?? null;
+                $rm['locked'] = (bool) ($o['locked'] ?? false);
+                if ($e) {
+                    if (!$rm['locked']) {
+                        $rm['copy_in_room'] = isset($e['copy_in_room']) && $e['copy_in_room'] !== '' ? max(0, (int) $e['copy_in_room']) : null;
+                        $rm['received_copy'] = isset($e['received_copy']) && $e['received_copy'] !== '' ? max(0, (int) $e['received_copy']) : null;
+                    }
+                    if (array_key_exists('locked', $e)) $rm['locked'] = (bool) $e['locked'];
+                }
+            }
+            unset($rm);
+            $ln['packet_no'] = $old['packet_no'] ?? null;
+            $ln['total_copy'] = $old['total_copy'] ?? null;
+            $ln['catch_no'] = $old['catch_no'] ?? null;
+            $ln['ufm_packet_no'] = $old['ufm_packet_no'] ?? null;
+            $ln['ufm_total_copy'] = $old['ufm_total_copy'] ?? null;
+            $ln['ufm_catch_no'] = $old['ufm_catch_no'] ?? null;
+            if ($ed) {
+                if (array_key_exists('ufm_total_copy', $ed)) $ln['ufm_total_copy'] = $ed['ufm_total_copy'] !== '' && $ed['ufm_total_copy'] !== null ? max(0, (int) $ed['ufm_total_copy']) : null;
+                if (array_key_exists('ufm_catch_no', $ed)) $ln['ufm_catch_no'] = trim((string) $ed['ufm_catch_no']) !== '' ? trim((string) $ed['ufm_catch_no']) : null;
+                if (array_key_exists('total_copy', $ed)) $ln['total_copy'] = $ed['total_copy'] !== '' && $ed['total_copy'] !== null ? max(0, (int) $ed['total_copy']) : null;
+                if (array_key_exists('catch_no', $ed)) $ln['catch_no'] = trim((string) $ed['catch_no']) !== '' ? trim((string) $ed['catch_no']) : null;
+            }
+        }
+        return $fresh;
+    }
+
+    private function conductDecorate(object $r)
+    {
+        $r->lines = is_string($r->lines ?? null) ? (json_decode($r->lines, true) ?: []) : ($r->lines ?? []);
+        $r->total_examinee = array_sum(array_column($r->lines, 'total'));
+        $r->paper_count = count($r->lines);
+        return $r;
+    }
+
+    private function conductRecord(string $kind, string $session, string $date, int $inningId, string $center): ?object
+    {
+        return DB::table($this->conductTable($kind))->where([
+            'session_year' => $session, 'exam_date' => $date, 'inning_id' => $inningId, 'center_code' => $center,
+        ])->first();
+    }
+
+    /** GET conduct/schedule?kind&session_year&exam_date&inning_id&center_code — the grid: schedule + rooms, with any saved values. */
+    public function conductSchedule(Request $req)
+    {
+        $v = Validator::make($req->all(), ['exam_date' => 'required|date', 'inning_id' => 'required|exists:exam_innings,id', 'kind' => 'nullable|in:p1,p9']);
+        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
+        $session = $req->input('session_year', $this->sessionYear());
+        $kind = $req->input('kind', 'p1');
+        $fresh = $this->conductScheduleLines($session, $req->exam_date, (int) $req->inning_id);
+        $rec = $req->center_code ? $this->conductRecord($kind, $session, $req->exam_date, (int) $req->inning_id, $req->center_code) : null;
+        $saved = $rec ? (is_string($rec->lines) ? json_decode($rec->lines, true) : ($rec->lines ?? [])) : [];
+        return response()->json([
+            'lines' => $this->conductMerge($fresh, $saved ?: []),
+            'saved_id' => $rec?->id,
+            'p1_saved' => $kind === 'p9' ? (bool) ($req->center_code && $this->conductRecord('p1', $session, $req->exam_date, (int) $req->inning_id, $req->center_code)) : (bool) $rec,
+        ]);
+    }
+
+    private function conductIndex(Request $req, string $kind)
+    {
+        $t = $this->conductTable($kind);
+        $q = DB::table("{$t} as c")->join('exam_innings as i', 'i.id', 'c.inning_id')
+            ->where('c.session_year', $req->session_year ?? $this->sessionYear());
+        $term = trim((string) $req->q);
+        if ($term !== '') {
+            $like = '%' . $term . '%';
+            $clean = str_replace(['%', '_', '"'], '', $term);
+            match ($req->search_by) {
+                'inning' => $q->where('i.inning_name', 'ilike', $like),
+                'center' => $q->where('c.center_code', 'ilike', $like),
+                'paper_code' => $q->whereRaw('c.lines::text ilike ?', ['%"paper_code":"%' . $clean . '%']),
+                'packet_no' => $q->whereRaw('c.lines::text ilike ?', ['%"packet_no":"%' . $clean . '%']),
+                default => $q->where(fn ($w) => $w->whereRaw("to_char(c.exam_date, 'DD/MM/YYYY') ilike ?", [$like])->orWhereRaw('c.exam_date::text ilike ?', [$like])),
+            };
+        }
+        $rows = $q->orderByDesc('c.exam_date')->orderBy('i.inning_name')->limit(200)
+            ->get(['c.*', 'i.inning_name', 'i.time_start', 'i.time_end']);
+        return response()->json($rows->map(fn ($r) => $this->conductDecorate($r))->values());
+    }
+
+    private function conductShow(int $id, string $kind)
+    {
+        $r = DB::table("{$this->conductTable($kind)} as c")->join('exam_innings as i', 'i.id', 'c.inning_id')
+            ->where('c.id', $id)->first(['c.*', 'i.inning_name', 'i.time_start', 'i.time_end']);
+        return $r ? response()->json($this->conductDecorate($r)) : response()->json(['message' => 'Record not found.'], 404);
+    }
+
+    /** Create/refresh the record of a date + inning + centre. $edits: the screen's editable values; $mutate: extra change of the merged lines. */
+    private function conductPersist(Request $req, string $kind, array $edits, ?callable $mutate = null)
     {
         $v = Validator::make($req->all(), [
-            'session_year'   => 'required|string',
-            'exam_date'      => 'required|date',
-            'inning_id'      => 'required|exists:exam_innings,id',
-            'center_code'    => 'required|string',
+            'session_year' => 'required|string', 'exam_date' => 'required|date',
+            'inning_id' => 'required|exists:exam_innings,id', 'center_code' => 'required|string|max:20',
+            'creation_date' => 'nullable|date',
         ]);
-        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
+        if ($v->fails()) return [null, response()->json(['errors' => $v->errors()], 422)];
+        $d = $v->validated();
+        $t = $this->conductTable($kind);
 
-        $id = DB::table('exam_conduct_p1')->insertGetId(array_merge($v->validated(), [
-            'created_at' => now(), 'updated_at' => now(),
-        ]));
-        return response()->json(['id' => $id, 'message' => 'P1 created.'], 201);
+        $fresh = $this->conductScheduleLines($d['session_year'], $d['exam_date'], (int) $d['inning_id']);
+        if (!$fresh) {
+            return [null, response()->json(['message' => 'No exam is scheduled on this date and inning — set it in Exam Time Table first.'], 422)];
+        }
+        $key = ['session_year' => $d['session_year'], 'exam_date' => $d['exam_date'], 'inning_id' => $d['inning_id'], 'center_code' => $d['center_code']];
+
+        $id = DB::transaction(function () use ($t, $key, $d, $fresh, $edits, $mutate, $req) {
+            $existing = DB::table($t)->where($key)->lockForUpdate()->first();
+            $saved = $existing ? (is_string($existing->lines) ? json_decode($existing->lines, true) : ($existing->lines ?? [])) : [];
+            $lines = $this->conductMerge($fresh, $saved ?: [], $edits);
+            if ($mutate) $lines = $mutate($lines);
+            $row = ['creation_date' => $d['creation_date'] ?? ($existing->creation_date ?? now()->toDateString()), 'lines' => json_encode($lines), 'updated_at' => now()];
+            if ($existing) {
+                DB::table($t)->where('id', $existing->id)->update($row);
+                return $existing->id;
+            }
+            return DB::table($t)->insertGetId($key + $row + ['created_by' => $req->user()?->id, 'created_at' => now()]);
+        });
+        return [$id, null];
     }
 
-    public function conductP3Store(Request $req)
+    private function conductStore(Request $req, string $kind)
     {
-        $v = Validator::make($req->all(), [
-            'roll_no'        => 'required|string',
-            'paper_code'     => 'required|string',
-            'exam_date'      => 'required|date',
-            'inning_id'      => 'required|exists:exam_innings,id',
-            'room_id'        => 'required|exists:exam_rooms,id',
-            'issued_copy_no' => 'required|string',
-            'invigilator1'   => 'required|string',
-            'ufm_by'         => 'required|string',
-            'authority_name' => 'required|string',
-            'ufm_copy_no2'   => 'required|string',
-        ]);
-        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
-
-        $admission = DB::table('admissions as a')
-            ->join('students as s', 's.id', 'a.student_id')
-            ->where('s.university_roll_no', $req->roll_no)
-            ->select('a.id')
-            ->first();
-        if (!$admission) return response()->json(['message' => 'Roll number not found.'], 404);
-
-        $id = DB::table('exam_ufm')->insertGetId(array_merge(
-            $v->validated(),
-            ['admission_id' => $admission->id, 'session_year' => $req->session_year ?? $this->sessionYear(),
-             'created_at' => now(), 'updated_at' => now()]
-        ));
-        return response()->json(['id' => $id, 'message' => "UFM recorded. Ref No: UFM/{$id}"], 201);
+        [$id, $err] = $this->conductPersist($req, $kind, (array) $req->input('edits', []));
+        if ($err) return $err;
+        return response()->json(['id' => $id, 'message' => $kind === 'p9' ? 'P9 saved.' : 'P1 saved.'], 201);
     }
 
-    public function conductP3Index(Request $req)
+    /** POST conduct/p9/packet {…keys, paper_codes?: []} — give a packet number to the listed papers (all papers without one if omitted). */
+    public function conductP9Packet(Request $req)
     {
-        $q = $this->withIdentity(
-            DB::table('exam_ufm as u')
-                ->join('admissions as a', 'a.id', 'u.admission_id')
+        $only = array_values(array_filter((array) $req->input('paper_codes', [])));
+        [$id, $err] = $this->conductPersist($req, 'p9', (array) $req->input('edits', []), function (array $lines) use ($req, $only) {
+            $center = (string) $req->input('center_code');
+            $last = 0;
+            DB::table('exam_packets')->where('session_year', $req->session_year)->where('center_code', $center)->pluck('lines')
+                ->each(function ($l) use (&$last) {
+                    foreach ((is_string($l) ? json_decode($l, true) : $l) ?: [] as $x) {
+                        if (preg_match('/(\d+)$/', (string) ($x['packet_no'] ?? ''), $m)) $last = max($last, (int) $m[1]);
+                    }
+                });
+            foreach ($lines as &$ln) {
+                $pick = !$only || in_array($ln['paper_code'], $only, true);
+                if (empty($ln['packet_no']) && $pick) {
+                    $ln['packet_no'] = sprintf('%s-%04d', $center, ++$last);
+                }
+                if (empty($ln['ufm_packet_no']) && ($ln['ufm'] ?? 0) > 0 && $pick) {
+                    $ln['ufm_packet_no'] = sprintf('%s-%04d', $center, ++$last);
+                }
+            }
+            return $lines;
+        });
+        if ($err) return $err;
+        return response()->json(['id' => $id, 'message' => 'Packet number created.']);
+    }
+
+    /** DELETE conduct/{kind}/{id}/line?paper_code — clear what was saved for one paper (its row stays on the schedule, blank). */
+    private function conductDeleteLine(Request $req, int $id, string $kind)
+    {
+        $t = $this->conductTable($kind);
+        $rec = DB::table($t)->where('id', $id)->first();
+        if (!$rec) return response()->json(['message' => 'Record not found.'], 404);
+        $code = (string) $req->input('paper_code');
+        $lines = collect(is_string($rec->lines) ? json_decode($rec->lines, true) : ($rec->lines ?? []))->map(function ($ln) use ($code) {
+            if (($ln['paper_code'] ?? null) !== $code) return $ln;
+            foreach ($ln['rooms'] ?? [] as $i => $_) {
+                $ln['rooms'][$i]['copy_in_room'] = null; $ln['rooms'][$i]['received_copy'] = null; $ln['rooms'][$i]['locked'] = false;
+            }
+            $ln['total_copy'] = null; $ln['catch_no'] = null; $ln['packet_no'] = null;
+            $ln['ufm_total_copy'] = null; $ln['ufm_catch_no'] = null; $ln['ufm_packet_no'] = null;
+            return $ln;
+        })->values()->all();
+        DB::table($t)->where('id', $id)->update(['lines' => json_encode($lines), 'updated_at' => now()]);
+        return response()->json(['message' => 'Cleared.']);
+    }
+
+    private function conductDelete(int $id, string $kind)
+    {
+        DB::table($this->conductTable($kind))->where('id', $id)->delete();
+        return response()->json(['message' => 'Deleted.']);
+    }
+
+    public function conductP1DeleteLine(Request $req, int $id) { return $this->conductDeleteLine($req, $id, 'p1'); }
+    public function conductP9DeleteLine(Request $req, int $id) { return $this->conductDeleteLine($req, $id, 'p9'); }
+
+    public function conductP1Index(Request $req) { return $this->conductIndex($req, 'p1'); }
+    public function conductP1Show(int $id)       { return $this->conductShow($id, 'p1'); }
+    public function conductP1Store(Request $req) { return $this->conductStore($req, 'p1'); }
+    public function conductP1Destroy(int $id)    { return $this->conductDelete($id, 'p1'); }
+    public function conductP9Index(Request $req) { return $this->conductIndex($req, 'p9'); }
+    public function conductP9Show(int $id)       { return $this->conductShow($id, 'p9'); }
+    public function conductP9Store(Request $req) { return $this->conductStore($req, 'p9'); }
+    public function conductP9Destroy(int $id)    { return $this->conductDelete($id, 'p9'); }
+
+    // ══════════════════════════════════════════════════════════════
+    // P3 — UNFAIR MEANS (UFM) and P4 — ABSENT (ABS), per student + paper.
+    // Exam date, inning and room are never typed: they come from the exam
+    // time table and the student's seat in the saved Seating Plan.
+    // ══════════════════════════════════════════════════════════════
+
+    private function conductAddress($raw): string
+    {
+        $a = is_string($raw) ? (json_decode($raw, true) ?? $raw) : $raw;
+        if (is_array($a)) {
+            $a = implode(', ', array_filter(array_map('trim', array_map('strval', array_filter([
+                $a['house_no'] ?? null, $a['mohalla'] ?? null, $a['post_office'] ?? null, $a['sub_district'] ?? null,
+                $a['district'] ?? null, $a['state'] ?? null, $a['pin_code'] ?? null,
+            ])))));
+        }
+        return trim((string) $a);
+    }
+
+    /** The student (by university roll no.) with exam form, papers, schedule, seat and ABS/UFM state. */
+    private function conductStudentData(string $roll, string $session): ?array
+    {
+        $row = $this->withIdentity(
+            DB::table('admissions as a')
                 ->join('students as s', 's.id', 'a.student_id')
-        )
-            ->select(array_merge(['u.*', 's.university_roll_no as roll_no'], $this->identitySelect()))
-            ->where('u.session_year', $req->session_year ?? $this->sessionYear())
-            ->paginate(30);
+                ->join('programs as p', 'p.id', 'a.program_id')
+                ->leftJoin('student_applications as sa', 'sa.id', 'a.application_id')
+                ->leftJoin('direct_registrations as drc', 'drc.id', 'sa.direct_registration_id')
+        )->whereNull('a.deleted_at')->where('s.university_roll_no', $roll)->orderByDesc('a.id')
+            ->first(array_merge([
+                'a.id as admission_id', 'a.program_id', 'a.application_id', 's.id as student_id', 's.mobile',
+                's.address_info->permanent_address as address', 'p.short_name as course', 'sa.application_no',
+                'drc.registration_no',
+            ], $this->identitySelect()));
+        if (!$row) return null;
+        $row = $this->decorate($row);
 
-        $q->getCollection()->transform(fn ($r) => $this->decorate($r));
+        $forms = DB::table('exam_forms')->where('admission_id', $row->admission_id)->where('session_year', $session)
+            ->orderByDesc('id')->get();
+        $form = $forms->first();
+        $paperRows = $forms->isEmpty() ? collect() : DB::table('exam_form_papers as efp')
+            ->join('exam_forms as ef', 'ef.id', 'efp.exam_form_id')
+            ->leftJoin('subjects as sub', 'sub.id', 'efp.subject_id')
+            ->whereIn('efp.exam_form_id', $forms->pluck('id'))
+            ->get(['efp.paper_code', 'sub.name as subject', 'ef.semester_no'])->unique('paper_code')->values();
 
-        return response()->json($q);
+        $sched = DB::table('exam_schedules as es')->join('exam_innings as i', DB::raw('i.inning_name'), '=', 'es.inning')
+            ->where('es.session_year', $session)->where('es.program_id', $row->program_id)
+            ->whereIn('es.paper_code', $paperRows->pluck('paper_code'))
+            ->get(['es.paper_code', 'es.exam_date', 'es.exam_start', 'es.exam_end', 'es.inning', 'i.id as inning_id'])
+            ->unique('paper_code')->keyBy('paper_code');
+        $seats = DB::table('exam_seating as es')->join('exam_rooms as r', 'r.id', 'es.room_id')
+            ->where('es.session_year', $session)->where('es.student_id', $row->student_id)
+            ->get(['es.paper_code', 'es.exam_date', 'es.room_id', 'r.room_no'])->keyBy(fn ($x) => $x->paper_code . '|' . substr((string) $x->exam_date, 0, 10));
+        $abs = DB::table('exam_absent')->where('admission_id', $row->admission_id)->where('session_year', $session)->get()->keyBy('paper_code');
+        $ufm = DB::table('exam_ufm')->where('admission_id', $row->admission_id)->where('session_year', $session)->get()->keyBy('paper_code');
+        $subNames = DB::table('subject_papers')->where('program_id', $row->program_id)->whereIn('paper_code', $paperRows->pluck('paper_code'))
+            ->pluck('paper_name', 'paper_code');
+        $today = now()->toDateString();
+
+        $papers = $paperRows->map(function ($p) use ($sched, $seats, $abs, $ufm, $subNames, $today) {
+            $sc = $sched->get($p->paper_code);
+            $date = $sc ? substr((string) $sc->exam_date, 0, 10) : null;
+            $seat = $date ? $seats->get($p->paper_code . '|' . $date) : null;
+            return [
+                'paper_code' => $p->paper_code, 'subject' => $p->subject, 'paper_name' => $subNames[$p->paper_code] ?? null,
+                'exam_date' => $date, 'inning_id' => $sc->inning_id ?? null, 'inning' => $sc->inning ?? null,
+                'time_start' => $sc->exam_start ?? null, 'time_end' => $sc->exam_end ?? null,
+                'room_id' => $seat->room_id ?? null, 'room_no' => $seat->room_no ?? null,
+                'abs_id' => $abs->get($p->paper_code)->id ?? null, 'ufm_id' => $ufm->get($p->paper_code)->id ?? null,
+                'status' => isset($abs[$p->paper_code]) ? 'ABS' : (!$date ? 'Not scheduled' : ($date <= $today ? 'Appear' : 'Awaited')),
+            ];
+        })->sortBy(fn ($p) => ($p['exam_date'] ?? '9999') . $p['paper_code'])->values()->all();
+
+        $docs = $row->application_id
+            ? \App\Support\FileUrls::forDocuments(DB::table('student_application_documents')->where('application_id', $row->application_id)->get())
+            : collect();
+        $part6 = $row->application_id ? (json_decode((string) DB::table('student_applications')->where('id', $row->application_id)->value('part_6'), true) ?: []) : [];
+
+        return [
+            'admission_id' => (int) $row->admission_id, 'student_id' => (int) $row->student_id, 'roll_no' => $roll,
+            'name' => $row->name, 'father_name' => $row->father_name, 'address' => $this->conductAddress($row->address),
+            'exam_form_no' => $form->form_id ?? null, 'registration_no' => $row->registration_no, 'application_no' => $row->application_no,
+            'course' => $row->course, 'semester_no' => $form->semester_no ?? null, 'mobile' => $row->mobile,
+            'photo_url' => $docs->firstWhere('document_type', 'photo')->url ?? null,
+            'signature_url' => $docs->firstWhere('document_type', 'signature')->url ?? null,
+            'subjects' => collect($papers)->pluck('subject')->filter()->unique()->values()->all(),
+            'itrp_subject' => $part6['itrp_subject'] ?? null, 'drop_subject' => $part6['drop_subject'] ?? null,
+            'papers' => $papers,
+        ];
     }
 
-    public function conductP4Store(Request $req)
+    /** GET conduct/student?roll_no&session_year */
+    public function conductStudent(Request $req)
     {
-        $v = Validator::make($req->all(), [
-            'roll_no'        => 'required|string',
-            'paper_code'     => 'required|string',
-            'exam_date'      => 'required|date',
-            'inning_id'      => 'required|exists:exam_innings,id',
-            'room_id'        => 'required|exists:exam_rooms,id',
-            'issued_copy_no' => 'required|string',
-            'invigilator1'   => 'required|string',
-        ]);
+        $v = Validator::make($req->all(), ['roll_no' => 'required|string']);
         if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
-
-        $admission = DB::table('admissions as a')
-            ->join('students as s', 's.id', 'a.student_id')
-            ->where('s.university_roll_no', $req->roll_no)
-            ->select('a.id')
-            ->first();
-        if (!$admission) return response()->json(['message' => 'Roll number not found.'], 404);
-
-        $id = DB::table('exam_absent')->insertGetId(array_merge(
-            $v->validated(),
-            ['admission_id' => $admission->id, 'session_year' => $req->session_year ?? $this->sessionYear(),
-             'created_at' => now(), 'updated_at' => now()]
-        ));
-        return response()->json(['id' => $id, 'message' => "ABS recorded. Ref No: ABS/{$id}"], 201);
+        $d = $this->conductStudentData(trim($req->roll_no), $req->input('session_year', $this->sessionYear()));
+        return $d ? response()->json($d) : response()->json(['message' => 'No student found with this Roll Number.'], 404);
     }
 
-    public function conductP4Index(Request $req)
+    private function conductMarkTable(string $kind): string
     {
-        $q = $this->withIdentity(
-            DB::table('exam_absent as ab')
-                ->join('admissions as a', 'a.id', 'ab.admission_id')
-                ->join('students as s', 's.id', 'a.student_id')
-        )
-            ->select(array_merge(['ab.*', 's.university_roll_no as roll_no'], $this->identitySelect()))
-            ->where('ab.session_year', $req->session_year ?? $this->sessionYear())
-            ->paginate(30);
-
-        $q->getCollection()->transform(fn ($r) => $this->decorate($r));
-
-        return response()->json($q);
+        return $kind === 'ufm' ? 'exam_ufm' : 'exam_absent';
     }
 
-    public function conductP9Store(Request $req)
+    /** GET conduct/p3|p4?roll_no&session_year — the saved records of one student. */
+    private function conductMarkIndex(Request $req, string $kind)
     {
-        $v = Validator::make($req->all(), [
-            'session_year' => 'required|string',
-            'exam_date'    => 'required|date',
-            'inning_id'    => 'required|exists:exam_innings,id',
-            'center_code'  => 'required|string',
-        ]);
-        if ($v->fails()) return response()->json(['errors' => $v->errors()], 422);
-
-        $id = DB::table('exam_packets')->insertGetId(array_merge($v->validated(), [
-            'created_at' => now(), 'updated_at' => now(),
-        ]));
-        return response()->json(['id' => $id, 'message' => "Packet No. P9/{$id} created."], 201);
+        $session = $req->input('session_year', $this->sessionYear());
+        $stu = $this->conductStudentData(trim((string) $req->roll_no), $session);
+        if (!$stu) return response()->json([]);
+        $names = collect($stu['papers'])->keyBy('paper_code');
+        $rows = DB::table($this->conductMarkTable($kind) . ' as m')->join('exam_innings as i', 'i.id', 'm.inning_id')->join('exam_rooms as r', 'r.id', 'm.room_id')
+            ->where('m.admission_id', $stu['admission_id'])->where('m.session_year', $session)->orderBy('m.exam_date')
+            ->get(['m.*', 'i.inning_name', 'r.room_no']);
+        return response()->json($rows->map(function ($r) use ($names) {
+            $r->subject = $names[$r->paper_code]['subject'] ?? null;
+            $r->paper_name = $names[$r->paper_code]['paper_name'] ?? null;
+            $r->exam_date = substr((string) $r->exam_date, 0, 10);
+            return $r;
+        })->values());
     }
 
-    public function conductP9Index(Request $req)
+    /** POST (id null) / PUT conduct/p3|p4 — submit or edit one ABS / UFM record. */
+    private function conductMarkSave(Request $req, string $kind, ?int $id = null)
     {
-        return response()->json(
-            DB::table('exam_packets')
-                ->where('session_year', $req->session_year ?? $this->sessionYear())
-                ->orderBy('exam_date')->paginate(30)
-        );
+        $rules = [
+            'roll_no' => 'required|string', 'paper_code' => 'required|string',
+            'invigilator1' => 'required|string|max:255', 'invigilator2' => 'nullable|string|max:255',
+            'issued_copy_no' => $kind === 'ufm' ? 'required|string|max:50' : 'nullable|string|max:50',
+        ];
+        if ($kind === 'ufm') {
+            $rules += ['ufm_by' => 'required|string|max:255', 'authority_name' => 'required|string|max:255', 'ufm_copy_no2' => 'required|string|max:50'];
+        }
+        $v = Validator::make($req->all(), $rules);
+        if ($v->fails()) return response()->json(['errors' => $v->errors(), 'message' => $v->errors()->first()], 422);
+        $d = $v->validated();
+        $session = $req->input('session_year', $this->sessionYear());
+        $t = $this->conductMarkTable($kind);
+
+        $stu = $this->conductStudentData(trim($d['roll_no']), $session);
+        if (!$stu) return response()->json(['message' => 'No student found with this Roll Number.'], 404);
+        $paper = collect($stu['papers'])->firstWhere('paper_code', strtoupper(trim($d['paper_code']))) ?? collect($stu['papers'])->first(fn ($p) => strcasecmp($p['paper_code'], trim($d['paper_code'])) === 0);
+        if (!$paper) return response()->json(['message' => 'This paper is not in the student\'s exam form.'], 422);
+        if (!$paper['exam_date']) return response()->json(['message' => 'This paper has no exam date in the Exam Time Table.'], 422);
+        if (!$paper['room_id']) return response()->json(['message' => 'The student has no seat for this paper — save the Seating Plan for that date and inning first.'], 422);
+
+        $dup = DB::table($t)->where('admission_id', $stu['admission_id'])->where('session_year', $session)->where('paper_code', $paper['paper_code'])
+            ->when($id, fn ($q) => $q->where('id', '!=', $id))->exists();
+        if ($dup) return response()->json(['message' => ($kind === 'ufm' ? 'UFM' : 'ABS') . ' is already submitted for this paper — open it from the list to edit.'], 422);
+
+        $row = [
+            'admission_id' => $stu['admission_id'], 'roll_no' => $stu['roll_no'], 'paper_code' => $paper['paper_code'], 'session_year' => $session,
+            'exam_date' => $paper['exam_date'], 'inning_id' => $paper['inning_id'], 'room_id' => $paper['room_id'],
+            'issued_copy_no' => $d['issued_copy_no'] ?? null, 'invigilator1' => $d['invigilator1'], 'invigilator2' => $d['invigilator2'] ?? null,
+            'updated_at' => now(),
+        ];
+        if ($kind === 'ufm') $row += ['ufm_by' => $d['ufm_by'], 'authority_name' => $d['authority_name'], 'ufm_copy_no2' => $d['ufm_copy_no2']];
+
+        if ($id) {
+            DB::table($t)->where('id', $id)->update($row);
+            return response()->json(['id' => $id, 'message' => ($kind === 'ufm' ? 'UFM' : 'ABS') . ' updated.']);
+        }
+        $newId = DB::table($t)->insertGetId($row + ['created_at' => now()]);
+        return response()->json(['id' => $newId, 'message' => $kind === 'ufm' ? "UFM Detail generated successfully. Ref No: UFM/{$newId}" : "ABS Detail generated successfully. Ref No: ABS/{$newId}"], 201);
     }
+
+    public function conductP3Index(Request $req) { return $this->conductMarkIndex($req, 'ufm'); }
+    public function conductP3Store(Request $req) { return $this->conductMarkSave($req, 'ufm'); }
+    public function conductP3Update(Request $req, int $id) { return $this->conductMarkSave($req, 'ufm', $id); }
+    public function conductP3Destroy(int $id) { DB::table('exam_ufm')->where('id', $id)->delete(); return response()->json(['message' => 'Deleted.']); }
+    public function conductP4Index(Request $req) { return $this->conductMarkIndex($req, 'abs'); }
+    public function conductP4Store(Request $req) { return $this->conductMarkSave($req, 'abs'); }
+    public function conductP4Update(Request $req, int $id) { return $this->conductMarkSave($req, 'abs', $id); }
+    public function conductP4Destroy(int $id) { DB::table('exam_absent')->where('id', $id)->delete(); return response()->json(['message' => 'Deleted.']); }
 
     // ══════════════════════════════════════════════════════════════
     // 6. NOMINAL ROLL

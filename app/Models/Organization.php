@@ -14,7 +14,8 @@ class Organization extends Model
         'name', 'short_name', 'code', 'type', 'affiliation_no',
         'address', 'city', 'district', 'state', 'pin_code',
         'phone', 'mobile', 'email', 'website', 'logo_path',
-        'principal_name', 'university_name', 'university_code', 'is_active',
+        'principal_name', 'principal_mobile', 'university_name', 'university_code',
+        'established_year', 'naac_grade', 'university_college_code', 'tagline', 'is_active',
     ];
 
     protected $casts = ['is_active' => 'boolean'];

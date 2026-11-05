@@ -7,7 +7,11 @@
     $fmt = fn($d) => $d ? \Illuminate\Support\Carbon::parse($d)->format('d-M-Y') : '';
     $money = fn($v) => number_format((float) ($v ?? 0), 2);
     $v = fn($x) => ($x === null || $x === '') ? '' : $x;
-    $collegeName = $org->name ?? 'Swami Devanand P.G. College';
+    $collegeName = \App\Support\OrgBrand::name($org);
+    $logo = \App\Support\OrgBrand::logoDataUri($org);
+    $collegeAddr = \App\Support\OrgBrand::fullAddress($org);
+    $affiliation = trim((string) (($org ?? \App\Support\OrgBrand::current())->university_name ?? ''));
+    $collegeDistrict = ($org ?? \App\Support\OrgBrand::current())->district ?? '';
     $session = $receipt->academic_year;
     $half = (int) ceil(count($feeRows) / 2);
     $left = array_slice($feeRows, 0, $half);
@@ -55,9 +59,10 @@
 
 {{-- ───────────── STUDENT COPY ───────────── --}}
 <div class="banner">
-    <div class="n">{{ strtoupper($collegeName) }}</div>
-    <div class="a">MATH-LAR, DEORIA.(Uttar Pradesh) 274502 &nbsp;·&nbsp; Affiliated By- Deen Dayal Upadhyay Gorakhpur University, Gorakhpur</div>
-    <div class="g">Grant-in-aid by Uttar Pradesh Government</div>
+    @if($logo)<img src="{{ $logo }}" style="height:44px;float:left;margin-right:8px;" alt="">@endif
+<div class="n">{{ strtoupper($collegeName) }}</div>
+    <div class="a">{{ $collegeAddr }}@if($affiliation) &nbsp;·&nbsp; Affiliated By- {{ $affiliation }}@endif</div>
+    @if(!empty($org->tagline ?? \App\Support\OrgBrand::current()->tagline ?? null))<div class="g">{{ $org->tagline ?? \App\Support\OrgBrand::current()->tagline }}</div>@endif
 </div>
 <table class="title"><tr>
     <td class="t">Final Fee Receipt (Provisional) For Session- {{ $session }}</td>
@@ -146,7 +151,7 @@
 
 {{-- ───────────── OFFICE COPY ───────────── --}}
 <table class="title"><tr><td></td><td class="c">(Office Copy)</td></tr></table>
-<div class="officetitle">{{ $collegeName }} Math-Lar, Deoria</div>
+<div class="officetitle">{{ $collegeName }}{{ $collegeDistrict ? ', '.$collegeDistrict : '' }}</div>
 <div class="officesub">Final Fee Receipt (Provisional) For Session- {{ $session }}</div>
 
 <table class="box"><tr>

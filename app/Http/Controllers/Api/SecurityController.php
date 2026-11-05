@@ -193,8 +193,9 @@ class SecurityController extends Controller
             $loginPath   = $user->portal === 'student' ? '/student/login' : '/login';
             $loginId     = $user->portal === 'student' ? ($user->mobile ?? $user->email) : $user->email;
 
+            $orgName = \App\Support\OrgBrand::name();
             $body = "Dear {$user->name},\n\n"
-                . "Your password for the SDPG College {$portalLabel} Portal has been reset by an administrator.\n\n"
+                . "Your password for the {$orgName} {$portalLabel} Portal has been reset by an administrator.\n\n"
                 . "==============================\n"
                 . "NEW LOGIN CREDENTIALS\n"
                 . "==============================\n"
@@ -202,11 +203,11 @@ class SecurityController extends Controller
                 . "Login ID : {$loginId}\n"
                 . "Password : {$plain}\n\n"
                 . "Please log in and change this password as soon as possible.\n\n"
-                . "Regards,\nSDPG College ERP\n"
+                . "Regards,\n{$orgName} ERP\n"
                 . "(Do not share your password with anyone. If you did not request this, contact the office immediately.)";
 
             try {
-                Mail::raw($body, fn ($m) => $m->to($user->email)->subject('Your SDPG College ERP password has been reset'));
+                Mail::raw($body, fn ($m) => $m->to($user->email)->subject("Your {$orgName} ERP password has been reset"));
             } catch (\Throwable $e) {
                 Log::error("Password reset email failed for user {$user->id}: " . $e->getMessage());
                 return response()->json([

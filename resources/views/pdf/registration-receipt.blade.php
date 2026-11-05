@@ -29,11 +29,13 @@
     @php
         $paid    = ($reg->payment_status === 'paid');
         $course  = \App\Models\Program::label($program) ?? $reg->reg_type;
-        $orgName = $org->name ?? 'S.D.P.G. College, Mukhed';
+        $orgName = \App\Support\OrgBrand::name($org);
+        $logo = \App\Support\OrgBrand::logoDataUri($org);
     @endphp
 
     <div class="sheet">
         <div class="head">
+            @if($logo)<img src="{{ $logo }}" style="height:44px;" alt=""><br>@endif
             <h1>{{ strtoupper($orgName) }}</h1>
             <p>Online Student Registration — Fee Receipt</p>
         </div>

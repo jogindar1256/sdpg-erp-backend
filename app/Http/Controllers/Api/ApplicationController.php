@@ -4083,8 +4083,8 @@ class ApplicationController extends Controller
 
         try {
             Mail::raw(
-                "Your SDPG College email verification OTP is: {$otp}\n\nValid for 10 minutes. Do not share it with anyone.",
-                fn($m) => $m->to($req->new_email)->subject('SDPG College — Email Verification OTP')
+                "Your " . \App\Support\OrgBrand::name() . " email verification OTP is: {$otp}\n\nValid for 10 minutes. Do not share it with anyone.",
+                fn($m) => $m->to($req->new_email)->subject(\App\Support\OrgBrand::name() . ' — Email Verification OTP')
             );
         } catch (\Throwable $e) {
             Log::error('Application email OTP send failed: ' . $e->getMessage());

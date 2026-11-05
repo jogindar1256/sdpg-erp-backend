@@ -21,10 +21,10 @@
     $val = fn($v) => ($v === null || $v === '') ? '—' : $v;
     $money = fn($v) => number_format((float) ($v ?? 0), 2);
 
-    $collegeName = $org->name ?? 'Swami Devanand P.G. College';
-    $collegeAddr = trim(implode(', ', array_filter([$org->address ?? 'Math-Lar', $org->district ?? 'Deoria'])))
-        . ' (' . ($org->state ?? 'Uttar Pradesh') . ') ' . ($org->pin_code ?? '');
-    $affiliation = $org->university_name ?? 'Deen Dayal Upadhyay Gorakhpur University, Gorakhpur';
+    $collegeName = \App\Support\OrgBrand::name($org);
+    $logo = \App\Support\OrgBrand::logoDataUri($org);
+    $collegeAddr = \App\Support\OrgBrand::fullAddress($org);
+    $affiliation = trim((string) (($org ?? \App\Support\OrgBrand::current())->university_name ?? ''));
 
     $p1 = $parts[1] ?? [];
     $p2 = $parts[2] ?? [];
@@ -157,9 +157,10 @@
         <tr>
             <td style="width: 75%; padding-right: 4px;">
                 <div class="banner">
-                    <div class="banner-name">{{ strtoupper($collegeName) }}</div>
+                    @if($logo)<img src="{{ $logo }}" style="height:44px;float:left;margin-right:8px;" alt="">@endif
+<div class="banner-name">{{ strtoupper($collegeName) }}</div>
                     <div class="banner-addr">{{ $collegeAddr }}</div>
-                    <div class="banner-affil">Affiliated By&mdash; {{ $affiliation }}</div>
+                    @if($affiliation)<div class="banner-affil">Affiliated By&mdash; {{ $affiliation }}</div>@endif
                 </div>
             </td>
             <td style="width: 25%;">
