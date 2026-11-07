@@ -12,7 +12,7 @@ class FeeReceipt extends Model
 
     protected $fillable = [
         'organization_id', 'student_id', 'admission_id', 'academic_year', 'semester_no',
-        'receipt_type', 'receipt_no', 'receipt_date',
+        'receipt_type', 'receipt_no', 'final_receipt_no', 'receipt_date',
         'total_amount', 'late_fine', 'concession', 'net_amount',
         'payment_mode', 'transaction_id', 'bank_name', 'dd_no', 'dd_date',
         'fee_breakdown', 'is_verified', 'verified_by', 'verified_at',

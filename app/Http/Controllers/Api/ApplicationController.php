@@ -639,10 +639,8 @@ class ApplicationController extends Controller
         if ($paidApp && $paidAppFeePaid && in_array($paidApp->application_type, self::ADMISSION_APP_TYPES, true)) {
             $knownStudent = $paidApp->student_id
                 ?: ($paidApp->user_id ? DB::table('students')->where('user_id', $paidApp->user_id)->value('id') : null);
-            $paidAppReceiptId = \App\Support\Payments::applicationFeeReceiptId((int) $paidApp->id);
-            $receiptVerified = $paidAppReceiptId
-                && DB::table('fee_receipts')->where('id', $paidAppReceiptId)->value('is_verified');
-            if ($knownStudent || $receiptVerified) {
+            // A first-time applicant becomes a student at Generate ID, not here.
+            if ($knownStudent) {
                 DB::transaction(fn() => $this->confirmStudentAndCreateAdmission($paidApp, (int) $req->user()->id));
             }
         }
@@ -1127,6 +1125,39 @@ class ApplicationController extends Controller
     }
 
     /**
+     * Generate ID — the ONE place a Student ID is assigned. Reuses a number that
+     * was reserved earlier on the application (data from before this rule),
+     * otherwise issues the next one. Idempotent: an existing ID is never replaced.
+     */
+    public function assignStudentUidOnGenerate(object $sa): ?string
+    {
+        $fresh = DB::table('student_applications')->where('id', $sa->id)->first();
+        if (!$fresh) {
+            return null;
+        }
+        $studentId = $fresh->student_id
+            ?: ($fresh->user_id ? DB::table('students')->where('user_id', $fresh->user_id)->value('id') : null);
+        $student = $studentId ? Student::flat(DB::table('students')->where('id', $studentId)->first()) : null;
+
+        if ($student) {
+            if (!empty($student->student_uid)) {
+                return $student->student_uid;
+            }
+            $program = DB::table('programs')->where('id', $fresh->program_id)->first();
+            if (!$program) {
+                return null;
+            }
+            $uid = $fresh->student_uid
+                ?: app(AdmissionNumberService::class)->studentId((string) $fresh->academic_year, $program, $student->category ?? null);
+            Student::groupedUpdate($studentId, ['student_uid' => $uid, 'updated_at' => now()]);
+            return $uid;
+        }
+
+        // No students row yet (not verified): number only, kept on the application.
+        return $this->ensureStudentUid($fresh);
+    }
+
+    /**
      * Called when college staff verify the fee receipt — the point at which
      * a first-time applicant finally becomes a student. Safe to call more
      * than once, and a no-op for anything that isn't approved + paid.
@@ -1240,12 +1271,16 @@ class ApplicationController extends Controller
         // Fee Detail popup: every particular (online + paid-in-college), grouped by who it is
         // "in favour of" — Government / College / University (Fee Head → In Favor Of).
         $favor = ['Government' => [], 'College' => [], 'University' => []];
-        foreach (collect($fee['breakdown'])->merge($fee['college_breakdown'] ?? []) as $b) {
+        $collegeLines = $fee['college_breakdown'] ?? [];
+        foreach (collect($fee['breakdown'])->map(fn($b) => $b + ['_kind' => !empty($b['misc']) ? 'misc' : 'edu'])
+            ->merge(collect($collegeLines)->map(fn($b) => $b + ['_kind' => 'counselling'])) as $b) {
             $who_ = $headFavor[$b['fee_head_id'] ?? 0] ?? 'College';
             $who_ = array_key_exists($who_, $favor) ? $who_ : 'College';
             $favor[$who_][] = [
                 'fee_head' => $b['label'] ?? ($headNames[$b['fee_head_id'] ?? 0] ?? 'Fee'),
                 'amount' => (float) $b['amount'],
+                // edu = paid online at college, misc = Misc. receipt, counselling = already paid at the counselling centre
+                'kind' => $b['_kind'],
             ];
         }
         // One payments lookup: applicationFeeReceiptId() is this payment's fee_receipt_id.
@@ -1290,6 +1325,8 @@ class ApplicationController extends Controller
             'category' => $who['category'] ?? null,
             'gender' => $who['gender'] ?? null,
             'state' => $who['state'] ?? null,
+            // Domestic state (from the registration) — the one fees depend on; `state` above is the permanent-address state.
+            'domestic_state' => ($reg->domestic_state ?? null) ?: ($who['state'] ?? null),
             'mobile' => $who['mobile'] ?? null,
             'aadhar_no' => $who['aadhar_no'] ?? null,
             'photo_url' => $sa->photo_url,
@@ -1308,6 +1345,11 @@ class ApplicationController extends Controller
             'fee_receipt_id' => $receipt->id ?? null,
             'fee_receipt_verified' => (bool) ($receipt->is_verified ?? false),
 
+            // Educational vs Misc. split of what is collected online, plus the counselling-paid part.
+            'misc_fee' => (float) ($fee['misc_total'] ?? 0),
+            'edu_fee' => (float) $fee['total'] - (float) ($fee['misc_total'] ?? 0),
+            'counselling_fee' => (float) $fee['college_total'],
+            'edu_fee_paid_at' => $saAppPaidPayment->paid_at ?? ($receipt->receipt_date ?? null),
             'required_fee' => $required,
             'pending_fee' => $required === null ? null : max(0, $required - $paid),
             'fine_amount' => (float) ($receipt->late_fine ?? 0),
@@ -1513,15 +1555,8 @@ class ApplicationController extends Controller
             'updated_at' => now(),
         ];
 
-        // Assign the permanent Student ID once, on first confirmation only.
-        if ($student && empty($student->student_uid) && $program) {
-            try {
-                $reserved = DB::table('student_applications')->where('id', $app->id)->value('student_uid');
-                $studentUpdate['student_uid'] = $reserved ?: $svc->studentId($app->academic_year, $program, $student->category);
-            } catch (\Throwable $e) {
-                Log::warning("student_uid generation failed for student {$studentId}: " . $e->getMessage());
-            }
-        }
+        // The permanent Student ID is NOT assigned here (verification / approval).
+        // It is assigned once, by Generate ID — see assignStudentUidOnGenerate().
 
         Student::groupedUpdate($studentId, $studentUpdate);
     }
@@ -2546,8 +2581,7 @@ class ApplicationController extends Controller
 
     /**
      * Practical fee lines (fee rule 1): one per subject the applicant chose
-     * that is allotted to the course with a practical fee (Course → Allotted
-     * Subjects shows subjects.has_practical / practical_fee). U.G. chooses
+     * with has_practical and a practical_fee in the Subject master. U.G. chooses
      * subjects; P.G. / B.Ed. choose papers, whose subjects count.
      */
     private function practicalFeeLines(object $sa, $pfHeadId): array
@@ -2562,10 +2596,10 @@ class ApplicationController extends Controller
             return [];
         }
 
-        return DB::table('allotted_subjects as al')
-            ->join('subjects as s', 's.id', '=', 'al.subject_id')
-            ->where('al.program_id', $sa->program_id)
-            ->whereIn('al.subject_id', $subjectIds)
+        // The chosen subjects are already validated against the course at registration
+        // (subjects.program_id); gating on Allotted Subjects dropped valid practical subjects.
+        return DB::table('subjects as s')
+            ->whereIn('s.id', $subjectIds)
             ->where('s.has_practical', true)
             ->where('s.practical_fee', '>', 0)
             ->orderBy('s.name')
@@ -2863,7 +2897,7 @@ class ApplicationController extends Controller
             // Someone who is already a student (semester / year upgrade) is
             // confirmed on payment as before. A first-time applicant has no
             // students row yet and does not get one here — that happens when
-            // college staff verify this receipt (finalizeAdmissionAfterReceipt()).
+            // college staff click Generate ID (finalizeAdmissionAfterReceipt() from FeesController::generateId()).
             $knownStudentId = $sa->student_id
                 ?: ($sa->user_id ? DB::table('students')->where('user_id', $sa->user_id)->value('id') : null);
             // …and only once approved: a fee collected by the office before
@@ -2953,12 +2987,10 @@ class ApplicationController extends Controller
             Log::warning("Receipt PDF job could not be queued for receipt {$receipt->id}: " . $e->getMessage());
         }
 
-        // First-time applicant: generate the Student ID now (number only —
-        // no students / admissions data is created here).
-        $studentUid = $this->ensureStudentUid($sa);
-
+        // The Student ID is NOT generated here any more: it is assigned only when
+        // office staff click Generate ID (Fee Receipt Generate).
         return response()->json([
-            'student_uid' => $studentUid,
+            'student_uid' => null,
             'admission_no' => DB::table('admissions')->where('application_id', $sa->id)->orderByDesc('id')->value('admission_no'),
             'message' => $sa->status !== 'approved'
                 ? 'Education fee paid successfully. The application can now be approved.'

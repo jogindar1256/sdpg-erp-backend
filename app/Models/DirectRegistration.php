@@ -21,7 +21,7 @@ class DirectRegistration extends Model
         'dob', 'gender', 'domestic_state',
         'category', 'admission_category', 'religion', 'nationality',
         'caste_cert_no', 'eligibility_class', 'is_divyang', 'caste_cert_date',
-        'passing_year', 'aadhar_no', 'caste_cert_state', 'caste_cert_district', 'eligibility_roll_no',
+        'passing_year', 'aadhar_no', 'caste_cert_state', 'caste_cert_district', 'eligibility_roll_no', 'eligibility_marks_type', 'eligibility_marks',
         'email', 'mobile',
         'ug_university', 'ug_institute', 'ug_session', 'ug_roll_no',
         'stream', 'entrance_session', 'entrance_roll_no', 'state_rank', 'category_rank', 'cut_off',

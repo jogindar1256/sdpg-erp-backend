@@ -31,6 +31,9 @@ class AdmissionNumberService
     /** Fee-receipt mode codes. */
     private const MODE = ['regular' => '101', 'self_finance' => '201', 'back_paper' => '301', 'other' => '401'];
 
+    /** Final Fee Receipt No (issued by Generate ID) — its own series so it never meets a payment receipt's number. */
+    private const FINAL_MODE = ['regular' => '501', 'self_finance' => '601', 'back_paper' => '701'];
+
     /** Fee Ref. ID category codes (Gen/OBC/SC/ST/EWS — the labels the Fee Structure UI already shows, not the numeric Student-ID codes above). */
     private const FEE_REF_CATEGORY = ['general' => 'GEN', 'gen' => 'GEN', 'obc' => 'OBC', 'sc' => 'SC', 'st' => 'ST', 'ews' => 'EWS'];
 
@@ -63,6 +66,14 @@ class AdmissionNumberService
         $prefix = $this->endYY($session) . $code;
 
         return $prefix . $this->nextSerial('fee_receipts', 'receipt_no', $prefix, 4);
+    }
+
+    /** Final Fee Receipt No: YY + mode(3) + serial(4), counted over fee_receipts.final_receipt_no. */
+    public function finalReceiptNo(string $session, string $mode): string
+    {
+        $prefix = $this->endYY($session) . (self::FINAL_MODE[$mode] ?? self::FINAL_MODE['regular']);
+
+        return $prefix . $this->nextSerial('fee_receipts', 'final_receipt_no', $prefix, 4);
     }
 
     /** Derive the fee-receipt mode from admission type + program self-finance flag. */

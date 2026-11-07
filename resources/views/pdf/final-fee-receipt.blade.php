@@ -113,7 +113,7 @@
     <td style="width:36%;">
         <table class="inner">
             <tr><td class="k">Student ID :-</td><td><b>{{ $studentUid }}</b></td></tr>
-            <tr><td class="k">Fee Receipt No :-</td><td><b>{{ $receipt->receipt_no }}</b></td></tr>
+            <tr><td class="k">Fee Receipt No :-</td><td><b>{{ $receipt->final_receipt_no ?: $receipt->receipt_no }}</b></td></tr>
             <tr><td class="k">Date Of Receipt :-</td><td>{{ $fmt($receipt->receipt_date) }}</td></tr>
         </table>
     </td>
@@ -169,13 +169,14 @@
     </td>
     <td style="width:50%;">
         <table class="inner">
-            <tr><td class="k">Fee Receipt No :-</td><td><b>{{ $receipt->receipt_no }}</b></td></tr>
+            <tr><td class="k">Fee Receipt No :-</td><td><b>{{ $receipt->final_receipt_no ?: $receipt->receipt_no }}</b></td></tr>
             <tr><td class="k">Course Name :-</td><td>{{ $courseName }} &nbsp;&nbsp;&nbsp;<b>Sem :</b> {{ $semester }}</td></tr>
             <tr><td class="k">Subjects :-</td><td>{{ $subjects }}</td></tr>
             <tr><td class="k">A/C :-</td><td>{{ $classAc }}</td></tr>
             <tr><td class="k">TC Status :-</td><td>{{ $tcStatus }}</td></tr>
             <tr><td class="k">Admission Mode :-</td><td>{{ $admissionMode }}</td></tr>
             <tr><td class="k">Payment Ref. No :-</td><td>{{ $receipt->transaction_id }}</td></tr>
+            <tr><td class="k">Payment Receipt No :-</td><td>{{ $receipt->receipt_no }}</td></tr>
             <tr><td class="k">Date Of Issue :-</td><td>{{ $fmt($receipt->receipt_date) }}</td></tr>
         </table>
     </td>

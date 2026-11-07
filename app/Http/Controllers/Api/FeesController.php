@@ -190,6 +190,7 @@ class FeesController extends Controller
                     $w->where('dr.name', 'ilike', "%{$v}%")
                         ->orWhere('dr.registration_no', 'ilike', "%{$v}%")
                         ->orWhere('fr.receipt_no', 'ilike', "%{$v}%")
+                        ->orWhere('fr.final_receipt_no', 'ilike', "%{$v}%")
                         ->orWhere('sa.application_no', 'ilike', "%{$v}%")
                         ->orWhere('a.admission_no', 'ilike', "%{$v}%")
                         ->orWhere('sa.student_uid', 'ilike', "%{$v}%")
@@ -201,7 +202,7 @@ class FeesController extends Controller
             ->orderByDesc('fr.id')
             ->limit(500)
             ->get([
-                'fr.id', 'fr.receipt_no', 'fr.semester_no', 'fr.net_amount', 'fr.receipt_date',
+                'fr.id', 'fr.receipt_no', 'fr.final_receipt_no', 'fr.semester_no', 'fr.net_amount', 'fr.receipt_date',
                 'fr.final_receipt_generated_at',
                 'dr.registration_no',
                 'a.admission_no', 'sa.application_no', 'sa.student_uid as app_student_uid',
@@ -212,12 +213,16 @@ class FeesController extends Controller
             ->map(function ($r) {
                 $info = is_string($r->s_info) ? (json_decode($r->s_info, true) ?: []) : [];
                 $name = $r->reg_name ?: trim(implode(' ', array_filter([$info['first_name'] ?? null, $info['middle_name'] ?? null, $info['last_name'] ?? null])));
+                // Student ID / Receipt No are shown only once Generate ID has run.
+                $generated = !empty($r->final_receipt_generated_at);
                 return [
                     'id' => $r->id,
-                    'receipt_no' => $r->receipt_no,
+                    // The Final Fee Receipt No — exists only once Generate ID has run.
+                    'receipt_no' => $generated ? ($r->final_receipt_no ?: $r->receipt_no) : null,
+                    'receipt_ref' => $r->receipt_no,   // payment receipt no: lookup key for the Generate link only
                     'student' => ['name' => $name ?: null],
                     'roll_no' => $r->university_roll_no,
-                    'student_uid' => $r->student_student_uid ?: $r->app_student_uid,
+                    'student_uid' => $generated ? ($r->student_student_uid ?: $r->app_student_uid) : null,
                     'registration_no' => $r->registration_no,
                     'application_no' => $r->application_no,
                     'admission_no' => $r->admission_no,
@@ -225,7 +230,7 @@ class FeesController extends Controller
                     'semester' => $r->semester_no ?: 1,
                     'fee_amount' => (float) $r->net_amount,
                     'receipt_date' => $r->receipt_date,
-                    'receipt_generated' => !empty($r->final_receipt_generated_at),
+                    'receipt_generated' => $generated,
                 ];
             });
 
@@ -264,6 +269,7 @@ class FeesController extends Controller
                     ->orWhereRaw('LOWER(sa.student_uid) = ?', [$lower])
                     ->orWhereRaw('LOWER(a.admission_no) = ?', [$lower])
                     ->orWhereRaw('LOWER(fr.receipt_no) = ?', [$lower])
+                    ->orWhereRaw('LOWER(fr.final_receipt_no) = ?', [$lower])
                     ->orWhere('dr.mobile', $q)
                     ->orWhere('s.mobile', $q);
             })
@@ -334,7 +340,7 @@ class FeesController extends Controller
         return response()->json([
             'receipt' => [
                 'id' => $receipt->id,
-                'receipt_no' => $receipt->receipt_no,
+                'receipt_no' => $receipt->final_receipt_generated_at ? ($receipt->final_receipt_no ?: $receipt->receipt_no) : $receipt->receipt_no,
                 'type' => $type,
                 'generated' => !empty($receipt->final_receipt_generated_at),
             ],
@@ -349,8 +355,9 @@ class FeesController extends Controller
             'semester_no' => $receipt->semester_no ?: ($admission->semester_no ?: 1),
             'course_year' => $receipt->academic_year,
             'enrolled' => [
-                'student_uid' => ($student->student_uid ?? null) ?: ($app->student_uid ?? null),
-                'receipt_no' => $receipt->receipt_no,
+                // Blank until Generate ID has run.
+                'student_uid' => $receipt->final_receipt_generated_at ? (($student->student_uid ?? null) ?: ($app->student_uid ?? null)) : null,
+                'receipt_no' => $receipt->final_receipt_generated_at ? ($receipt->final_receipt_no ?: $receipt->receipt_no) : null,
                 'account_no' => $admission->account_no ?? null,
                 'file_no' => $admission->file_no ?? null,
                 'record_no' => $admission->record_no ?? null,
@@ -408,11 +415,31 @@ class FeesController extends Controller
             ->orderBy('sp.subject_id')->orderBy('sp.paper_code')
             ->get(['sp.subject_id', 'sub.name as subject_name', 'sp.paper_code', 'sp.paper_type']);
 
-        return $papers->groupBy('subject_id')->map(fn($ps) => [
+        $rows = $papers->groupBy('subject_id')->map(fn($ps) => [
             'subject' => $ps->first()->subject_name,
             'nature' => $ps->contains(fn($p) => strtolower((string) $p->paper_type) === 'practical') ? 'Practical' : 'Theory',
             'paper_codes' => $ps->pluck('paper_code')->filter()->unique()->implode(', '),
         ])->values()->all();
+
+        // Vocational Paper Master picks (Part 6): AEC, SEC and every "Additional Paper"
+        // group. These are vocational_papers ids, not subject_papers ids.
+        $vocIds = collect($part6['additional_papers'] ?? [])
+            ->flatMap(fn($a) => (array) ($a['paper_ids'] ?? []))
+            ->merge([$part6['aec_subject'] ?? null, $part6['sec_subject'] ?? null])
+            ->filter()->map(fn($v) => (int) $v)->unique()->values()->all();
+        if ($vocIds) {
+            $voc = DB::table('vocational_papers')->whereIn('id', $vocIds)->orderBy('group_no')->orderBy('paper_name')
+                ->get(['paper_name', 'paper_code', 'group_name']);
+            foreach ($voc as $v) {
+                $rows[] = [
+                    'subject' => $v->paper_name,
+                    'nature' => trim((string) $v->group_name) !== '' ? $v->group_name : 'Additional',
+                    'paper_codes' => (string) $v->paper_code,
+                ];
+            }
+        }
+
+        return $rows;
     }
 
     private function generateTypeLabel(string $type): string
@@ -630,7 +657,25 @@ class FeesController extends Controller
                     . 'Mark it returned there, then click Generate ID again.');
         }
 
-        // ready — the fee matches (or every difference is settled)
+        // ready — the fee matches (or every difference is settled).
+        // Generate ID is where a first-time applicant becomes a student: the students row
+        // and the confirmed admission are created here, then the Student ID and the
+        // Final Fee Receipt No. (Fee Receipt Verification only checks the payment.)
+        try {
+            $appCtl->finalizeAdmissionAfterReceipt((int) $sa->id, (int) ($request->user()?->id ?? 0));
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::error("Generate ID: admission confirmation failed for application {$sa->id}: " . $e->getMessage());
+            return $respond('The admission could not be confirmed. Try again.', 500);
+        }
+        if ($receipt->receipt_type === 'regular_admission') {
+            $freshApp = DB::table('student_applications')->where('id', $sa->id)->first();
+            $hasStudent = $freshApp && ($freshApp->student_id
+                || ($freshApp->user_id && DB::table('students')->where('user_id', $freshApp->user_id)->exists()));
+            if (!$hasStudent) {
+                return $respond('The admission could not be confirmed — ' . (ApplicationController::$lastStudentError
+                    ?? 'the application must be approved (Admission Verification) and its fee paid first') . '.', 422);
+            }
+        }
         try {
             app(\App\Services\FinalFeeReceiptService::class)->generate(\App\Models\FeeReceipt::findOrFail($receipt->id), $request->user()?->id);
         } catch (\Throwable $e) {
@@ -639,6 +684,10 @@ class FeesController extends Controller
         }
         DB::table('student_applications')->where('id', $sa->id)->update(['fee_due_amount' => null, 'updated_at' => now()]);
         $sa = DB::table('student_applications')->where('id', $sa->id)->first();
+        $receipt = DB::table('fee_receipts')->where('id', $receipt->id)->first();   // now carries student_id + final_receipt_no
+        if ($receipt->admission_id) {
+            \App\Support\ExamFormSeeder::ensureForAdmission((int) $receipt->admission_id);   // self-guarding
+        }
         $ids = $this->ids($sa, $receipt);
 
         // Fresh admissions get the Student ID / receipt message.
@@ -646,12 +695,12 @@ class FeesController extends Controller
         if ($receipt->receipt_type === 'regular_admission' && ($channels = $this->notifyChannels($target, $sa, 'admission_receipt'))) {
             $who = \App\Models\Student::fullName($target)
                 ?: (string) DB::table('direct_registrations')->where('id', $sa->direct_registration_id)->value('name');
-            $notify->sendByTrigger($target, 'admission_receipt', [$who ?: 'Student', $ids['student_uid'] ?? '-', $receipt->receipt_no], 'Final admission fee receipt');
+            $notify->sendByTrigger($target, 'admission_receipt', [$who ?: 'Student', $ids['student_uid'] ?? '-', $ids['receipt_no'] ?? $receipt->receipt_no], 'Final admission fee receipt');
         }
         [$c] = $this->feeCheck($id);
         return $respond($syncNote . ($receipt->receipt_type === 'regular_admission' && !empty($ids['student_uid'])
                 ? "Student ID {$ids['student_uid']} generated. " : '')
-            . "Final Fee Receipt {$receipt->receipt_no} is ready to print."
+            . "Final Fee Receipt " . ($receipt->final_receipt_no ?: $receipt->receipt_no) . " is ready to print."
             . ($channels ? ' The student was told by ' . implode(' and ', $channels) . '.' : ''),
             200, $ids + ['channels' => $channels]);
     }
@@ -664,7 +713,7 @@ class FeesController extends Controller
         return [
             'student_uid' => $studentUid,
             'admission_no' => DB::table('admissions')->where('id', $receipt->admission_id)->value('admission_no'),
-            'receipt_no' => $receipt->receipt_no,
+            'receipt_no' => $receipt->final_receipt_no ?: null,
         ];
     }
 
@@ -852,21 +901,8 @@ class FeesController extends Controller
                     ]);
                     \App\Support\Payments::markVerified($id, Auth::id());
 
-                    // Verifying the receipt is what turns a first-time applicant into a
-                    // student: the students row is created and the admission becomes
-                    // active (linked to that student) for exams, ledgers and the rest.
-                    if ($appId) {
-                        app(ApplicationController::class)->finalizeAdmissionAfterReceipt((int) $appId, (int) Auth::id());
-
-                        $app = DB::table('student_applications')->where('id', $appId)->first();
-                        $mustBeStudent = $app
-                            && $app->status === 'approved'
-                            && \App\Support\Payments::applicationFeePaid((int) $appId);
-                        $admStudent = DB::table('admissions')->where('application_id', $appId)->orderByDesc('id')->value('student_id');
-                        if ($mustBeStudent && !$admStudent) {
-                            throw new \RuntimeException('student_not_created');
-                        }
-                    }
+                    // Verifying only confirms the payment. The student record and the
+                    // confirmed admission are created later, by Generate ID (Fee Receipt Generate).
                 });
             } catch (\RuntimeException $e) {
                 if ($e->getMessage() !== 'student_not_created') throw $e;

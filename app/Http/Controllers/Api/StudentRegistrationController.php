@@ -76,6 +76,8 @@ class StudentRegistrationController extends Controller
             'eligibility_class' => 'nullable|in:' . implode(',', self::eligibilityFor($req->reg_type)),
             'passing_year' => 'nullable|integer|between:2002,' . now()->year,
             'marital_status' => 'nullable|in:unmarried,married,widowed',
+            'eligibility_marks_type' => 'nullable|in:Mark,CGPA',
+            'eligibility_marks' => 'nullable|numeric|min:0|max:100',
         ]);
 
         if ($v->fails()) {
@@ -151,6 +153,9 @@ class StudentRegistrationController extends Controller
         }
         if ($e = $this->registrationSubjectError($req, (int) $req->program_id, $regType)) {
             return response()->json(['errors' => $e], 422);
+        }
+        if ($msg = $this->eligibilityMarksError($req)) {
+            return response()->json(['errors' => ['eligibility_marks' => [$msg]]], 422);
         }
 
         // Was missing 'email' here — direct_registrations_email_unique_active
@@ -266,6 +271,8 @@ class StudentRegistrationController extends Controller
                 'caste_cert_state' => $req->caste_cert_state,
                 'caste_cert_district' => $req->caste_cert_district,
                 'eligibility_roll_no' => $req->eligibility_roll_no,
+                'eligibility_marks_type' => $req->eligibility_marks !== null && $req->eligibility_marks !== '' ? ($req->eligibility_marks_type === 'CGPA' ? 'CGPA' : 'Mark') : null,
+                'eligibility_marks' => $req->eligibility_marks !== null && $req->eligibility_marks !== '' ? $req->eligibility_marks : null,
 
                 'email' => $req->email,
                 'mobile' => $req->mobile,
@@ -2056,11 +2063,100 @@ class StudentRegistrationController extends Controller
                 ->first();
         }
 
+        if ($condition && is_string($condition->category_requirements ?? null)) {
+            $condition->category_requirements = json_decode($condition->category_requirements, true);
+        }
+
         return response()->json([
             'session_year' => $session,
             'fee' => $fee,
             'admission_condition' => $condition,
         ]);
+    }
+
+    /** Applicant's obtained CGPA is converted to a percentage at this factor (office rule). */
+    public const CGPA_TO_PERCENT = 9.5;
+
+    /**
+     * Required eligibility figure from the Master Admission Condition for this
+     * course / session / admission category / gender, or null when nothing is
+     * required (no condition, "Through Counselling" — those marks come from
+     * the counselling record — or no % set). Domicile outside Uttar Pradesh
+     * always counts as General.
+     * Mirror of src/lib/eligibilityMarks.ts.
+     *
+     * @return array{required: float, type: string}|null
+     */
+    public static function eligibilityRequirement(?int $programId, ?string $session, ?string $category, ?string $gender, ?string $domesticState = null): ?array
+    {
+        if (!$programId) {
+            return null;
+        }
+        $cond = DB::table('admission_conditions')
+            ->where('program_id', $programId)
+            ->when($session, fn($q) => $q->where('session_year', $session))
+            ->orderByDesc('id')->first();
+        if (!$cond || $cond->condition_type === 'Through Counselling' || !$cond->category_requirements) {
+            return null;
+        }
+        $cr = json_decode($cond->category_requirements, true);
+        if (!is_array($cr)) {
+            return null;
+        }
+        $outsideUp = $domesticState && mb_strtolower(trim($domesticState)) !== 'uttar pradesh';
+        $key = $outsideUp ? 'gen' : (['general' => 'gen', 'gen' => 'gen', 'ur' => 'gen', 'unreserved' => 'gen',
+            'obc' => 'obc', 'sc' => 'sc', 'st' => 'st', 'ews' => 'ews'][mb_strtolower(trim((string) $category))] ?? 'gen');
+        $row = $cr[$key] ?? null;
+        if (!is_array($row)) {
+            return null;
+        }
+        $g = mb_strtolower(trim((string) $gender));
+        $gKey = str_starts_with($g, 'f') ? 'female' : (str_starts_with($g, 't') ? 'trans' : 'male');
+        $required = (float) ($row[$gKey] ?? 0);
+        if ($required <= 0) {
+            return null;
+        }
+        return ['required' => $required, 'type' => ($row['mark_type'] ?? 'Mark') === 'CGPA' ? 'CGPA' : 'Mark'];
+    }
+
+    /** Error message when the applicant's marks / CGPA are below the Master requirement; null when fine. */
+    private function eligibilityMarksError(Request $req): ?string
+    {
+        $need = self::eligibilityRequirement(
+            $req->program_id ? (int) $req->program_id : null,
+            (string) $req->session,
+            (string) ($req->admission_category ?: $req->category),
+            (string) $req->gender,
+            (string) $req->domestic_state,
+        );
+        if (!$need) {
+            return null;
+        }
+        $entered = $req->eligibility_marks_type === 'CGPA' ? 'CGPA' : 'Mark';
+        $value = $req->eligibility_marks;
+        if ($value === null || $value === '' || !is_numeric($value) || (float) $value <= 0) {
+            return 'Enter your obtained ' . ($entered === 'CGPA' ? 'CGPA' : 'marks %') . ' in the eligibility course.';
+        }
+        $v = (float) $value;
+        if ($entered === 'CGPA' && $v > 10) {
+            return 'CGPA cannot be more than 10.';
+        }
+
+        $obtained = $v;
+        $note = '';
+        if ($need['type'] === 'Mark' && $entered === 'CGPA') {
+            $obtained = round($v * self::CGPA_TO_PERCENT, 2);
+            $note = "CGPA {$v} (= {$obtained}%)";
+        } elseif ($need['type'] === 'CGPA' && $entered === 'Mark') {
+            $obtained = round($v / self::CGPA_TO_PERCENT, 2);
+            $note = "{$v}% (= {$obtained} CGPA)";
+        }
+        if ($obtained + 1e-9 >= $need['required']) {
+            return null;
+        }
+        $unit = $need['type'] === 'CGPA' ? ' CGPA' : '%';
+        $req_ = rtrim(rtrim(number_format($need['required'], 2, '.', ''), '0'), '.');
+        return "Your eligibility obtained " . ($note ?: "{$obtained}{$unit}") . " is less than the required {$req_}{$unit}. You are not eligible for registration.";
     }
 
     private function generateRegNo(string $session, $programId): string

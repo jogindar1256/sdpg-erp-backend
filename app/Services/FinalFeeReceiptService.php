@@ -22,7 +22,7 @@ class FinalFeeReceiptService
     /** Storage path + download name for a receipt. */
     public static function fileName(FeeReceipt $r): string
     {
-        return 'final-fee-receipt-' . $r->receipt_no . '.pdf';
+        return 'final-fee-receipt-' . ($r->final_receipt_no ?: $r->receipt_no) . '.pdf';
     }
 
     /** Render, store and stamp the receipt. Returns the stored path. */
@@ -30,8 +30,10 @@ class FinalFeeReceiptService
     {
         $sa = $this->applicationFor($receipt);
         if ($sa) {
-            app(ApplicationController::class)->ensureStudentUid($sa); // number only
+            app(ApplicationController::class)->assignStudentUidOnGenerate($sa); // Generate ID = the only place a Student ID is issued
         }
+
+        $this->assignReceiptNo($receipt);
 
         $pdf = Pdf::loadView('pdf.final-fee-receipt', $this->data($receipt, $byUserId))->setPaper('a4');
         $path = "final-receipts/{$receipt->organization_id}/{$receipt->academic_year}/" . self::fileName($receipt);
@@ -44,6 +46,29 @@ class FinalFeeReceiptService
         ]);
 
         return $path;
+    }
+
+    /** The Final Fee Receipt No is issued here, once — never at payment. */
+    private function assignReceiptNo(FeeReceipt $receipt): void
+    {
+        if ($receipt->final_receipt_no) {
+            return;
+        }
+        $isSelf = (bool) DB::table('admissions as a')->join('programs as p', 'p.id', '=', 'a.program_id')
+            ->where('a.id', $receipt->admission_id)->value('p.is_self_finance');
+        $mode = $receipt->receipt_type === 'back_paper' ? 'back_paper' : ($isSelf ? 'self_finance' : 'regular');
+
+        for ($try = 1; ; $try++) {
+            $no = app(AdmissionNumberService::class)->finalReceiptNo((string) $receipt->academic_year, $mode);
+            try {
+                $receipt->update(['final_receipt_no' => $no]);
+                return;
+            } catch (\Illuminate\Database\QueryException $e) {   // two clicks at once picked the same serial
+                if ($try >= 3) {
+                    throw $e;
+                }
+            }
+        }
     }
 
     private function applicationFor(FeeReceipt $receipt): ?object

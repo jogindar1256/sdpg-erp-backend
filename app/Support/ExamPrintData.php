@@ -152,6 +152,7 @@ class ExamPrintData
                 'rooms' => $mine->groupBy('room_id')->map(fn ($g) => (object) ['room_id' => $g[0]->room_id, 'room_no' => $g[0]->room_no, 'building' => $g[0]->building_name, 'seats' => $g->values()])
                     ->sortBy(fn ($r) => $r->room_no, SORT_NATURAL)->values(),
                 'absent' => ($absent->get($key) ?? collect())->pluck('roll_no')->all(),
+                'absent_rolls_by_room' => ($absent->get($key) ?? collect())->groupBy('room_id')->map(fn ($g) => $g->pluck('roll_no')->all())->all(),
                 'absent_by_room' => ($absent->get($key) ?? collect())->groupBy('room_id')->map->count()->all(),
                 'ufm' => ($ufm->get($key) ?? collect())->pluck('roll_no')->all(),
                 'ufm_by_room' => ($ufm->get($key) ?? collect())->groupBy('room_id')->map->count()->all(),

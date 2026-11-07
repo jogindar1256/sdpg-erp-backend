@@ -34,7 +34,7 @@ class ExamPrintController extends Controller
         'p4'           => ['pdf.exam.p4', 'a4', 'portrait', 'P4'],
         'p6'           => ['pdf.exam.p6', 'a4', 'portrait', 'P6'],
         'p9'           => ['pdf.exam.p9', 'a4', 'portrait', 'P9'],
-        'p1'           => ['pdf.exam.p1', 'a4', 'portrait', 'P1'],
+        'p1'           => ['pdf.exam.p1', 'letter', 'portrait', 'P1'],
     ];
 
     public function show(Request $req, string $doc)
@@ -61,7 +61,7 @@ class ExamPrintController extends Controller
             $data = ExamPrintData::load($req->session_year, $date, (int) $req->inning_id, $req->paper_code ?: null, $req->room_id ? (int) $req->room_id : null, $doc === 'desk-slip');
 
             if ($doc === 'p1' && $mode === 'blank') {
-                $data['papers'] = [(object) ['paper_code' => '', 'course' => '', 'semester' => '', 'subject' => '', 'rooms' => collect(), 'seats' => collect(), 'absent' => [], 'ufm' => [], 'absent_by_room' => [], 'ufm_by_room' => [], 'p1' => null]];
+                $data['papers'] = [(object) ['paper_code' => '', 'course' => '', 'semester' => '', 'subject' => '', 'rooms' => collect(), 'seats' => collect(), 'absent' => [], 'ufm' => [], 'absent_by_room' => [], 'absent_rolls_by_room' => [], 'ufm_by_room' => [], 'p1' => null]];
             } elseif (empty($data['papers'])) {
                 return response()->json(['message' => 'No exam is scheduled for this date and inning.'], 422);
             }

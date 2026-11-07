@@ -30,7 +30,7 @@
 
     <table width="100%" class="t" style="table-layout:fixed;">
         <tr>@for($i = 1; $i <= 12; $i++)<th width="{{ $w[$i - 1] }}%">{!! H::img('p9c_' . $i) !!}</th>@endfor</tr>
-        @php $minRows = 14; @endphp
+        @php $minRows = 17; @endphp
         @foreach($rows as $i => $p)
             <tr>
                 <td>{{ $i + 1 }}</td><td>{{ D::dmy($date) }}</td><td>{{ substr($weekday, 0, 3) }}</td><td>{{ $inning->inning_name }}</td>
@@ -52,7 +52,7 @@
                 <td width="{{ $w[10] }}%">{{ $p->p9['ufm_packet_no'] ?? '' }}</td><td width="{{ $w[11] }}%">&nbsp;</td>
             </tr>
         @endforeach
-        @for($i = $ufmRows->count(); $i < max(5, $ufmRows->count()); $i++)<tr>@for($k = 0; $k < 12; $k++)<td width="{{ $w[$k] }}%">&nbsp;</td>@endfor</tr>@endfor
+        @for($i = $ufmRows->count(); $i < max(6, $ufmRows->count()); $i++)<tr>@for($k = 0; $k < 12; $k++)<td width="{{ $w[$k] }}%">&nbsp;</td>@endfor</tr>@endfor
     </table>
 
     <table width="100%" class="box" style="margin-top:0;">
