@@ -1076,7 +1076,12 @@ class StudentRegistrationController extends Controller
             (float) ($reg->fee_amount ?: $payment->amount), null, $receiptNo);
 
         $reg = $this->findReg($reg->id); // refresh
-        $this->provisionAccount($reg, paid: true);
+        // A semester (2..n) registration belongs to a student who already has a login —
+        // never provision / re-mail credentials for it.
+        $isSemesterReg = (int) ($reg->semester_no ?? 1) > 1;
+        if (!$isSemesterReg) {
+            $this->provisionAccount($reg, paid: true);
+        }
 
         // registration_success — this status ('registered') is set in
         // exactly one place in the whole codebase, right above, so this is
@@ -1098,7 +1103,9 @@ class StudentRegistrationController extends Controller
         );
 
         return response()->json([
-            'message' => 'Payment successful. Login credentials have been emailed to you.',
+            'message' => $isSemesterReg
+                ? 'Payment successful. Your semester registration is complete.'
+                : 'Payment successful. Login credentials have been emailed to you.',
             'registration_id' => $reg->id,
             'reg_no' => $reg->registration_no,
             'receipt_no' => $receiptNo,
@@ -1121,7 +1128,9 @@ class StudentRegistrationController extends Controller
         $this->markFailed($reg);
 
         return response()->json([
-            'message' => 'Registration saved but not paid. Login credentials emailed. Pay the fee from the student portal to complete it.',
+            'message' => (int) ($reg->semester_no ?? 1) > 1
+                ? 'Payment not completed. Pay the registration fee from your registration dashboard to continue.'
+                : 'Registration saved but not paid. Login credentials emailed. Pay the fee from the student portal to complete it.',
             'registration_id' => $reg->id,
             'reg_no' => $reg->registration_no,
         ]);
@@ -1136,7 +1145,9 @@ class StudentRegistrationController extends Controller
         ]);
 
         $reg = $this->findReg($reg->id);
-        $this->provisionAccount($reg, paid: false);
+        if ((int) ($reg->semester_no ?? 1) <= 1) {
+            $this->provisionAccount($reg, paid: false);
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -1882,7 +1893,8 @@ class StudentRegistrationController extends Controller
         $reg = $this->findReg($id);
         if (!$reg)
             return response()->json(['message' => 'Registration not found.'], 404);
-        if (!\App\Support\Payments::registrationFeePaid((int) $reg->id)) {
+        $freeAndRegistered = $reg->status === 'registered' && (float) ($reg->fee_amount ?? 0) <= 0;
+        if (!$freeAndRegistered && !\App\Support\Payments::registrationFeePaid((int) $reg->id)) {
             return response()->json(['message' => 'Registration slip is available only after payment.'], 422);
         }
 
@@ -2159,7 +2171,7 @@ class StudentRegistrationController extends Controller
         return "Your eligibility obtained " . ($note ?: "{$obtained}{$unit}") . " is less than the required {$req_}{$unit}. You are not eligible for registration.";
     }
 
-    private function generateRegNo(string $session, $programId): string
+    public function generateRegNo(string $session, $programId): string
     {
         [$ys, $ye] = $this->sessionYears($session);
         $progCode = str_pad((string) ($programId ?: 0), 2, '0', STR_PAD_LEFT);

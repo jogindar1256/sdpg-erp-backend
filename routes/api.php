@@ -9,6 +9,7 @@ use App\Http\Controllers\Api\RegistrationController;
 use App\Http\Controllers\Api\SmsTemplateController;
 use App\Http\Controllers\Api\StudentController;
 use App\Http\Controllers\Api\ApplicationController;
+use App\Http\Controllers\Api\UpgradeController;
 use App\Http\Controllers\Api\FeeReceiptController;
 use App\Http\Controllers\Api\OrganizationController;
 use App\Http\Controllers\Api\StaffController;
@@ -275,6 +276,15 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('students/{student}/signature', [StudentController::class, 'uploadSignature']);
         Route::post('students/{student}/block', [StudentController::class, 'blockUnblock']);
         Route::get('students/{student}/ledger', [StudentController::class, 'ledger']);
+
+        // Semester Upgrade (semesters 2-8) — office
+        Route::prefix('upgrade')->group(function () {
+            Route::get('context', [UpgradeController::class, 'officeContext']);
+            Route::get('not-admitted', [UpgradeController::class, 'notAdmitted']);
+            Route::post('registration', [UpgradeController::class, 'officeStartRegistration']);
+            Route::post('save', [UpgradeController::class, 'officeSave']);
+            Route::post('{id}/cancel', [UpgradeController::class, 'officeCancel'])->whereNumber('id');
+        });
 
         // Applications (Office view)
         Route::prefix('applications')->group(function () {
@@ -844,6 +854,14 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('programs', [ApplicationController::class, 'studentPrograms']);
         // Numeric-only so it does not swallow /student/applications, /student/profile, etc.
         Route::get('/{id}', [ApplicationController::class, 'studentShow'])->whereNumber('id');
+
+        // Semester Upgrade (semesters 2-8) — student self-service
+        Route::prefix('upgrade')->group(function () {
+            Route::get('context', [UpgradeController::class, 'studentContext']);
+            Route::post('registration', [UpgradeController::class, 'studentStartRegistration']);
+            Route::post('save', [UpgradeController::class, 'studentSave']);
+            Route::post('{id}/cancel', [UpgradeController::class, 'studentCancel'])->whereNumber('id');
+        });
 
         Route::prefix('applications')->group(function () {
 

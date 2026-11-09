@@ -12,7 +12,7 @@ class DirectRegistration extends Model
 
     protected $fillable = [
         'organization_id', 'program_id', 'user_id', 'student_id',
-        'registration_no', 'reg_type', 'session_year', 'reg_date',
+        'registration_no', 'reg_type', 'session_year', 'semester_no', 'reg_group_id', 'reg_date',
         'ddurn_no', 'abc_id', 'family_id',
         'subject_1', 'subject_2', 'subject_3', 'subject_id',
         'name', 'name_hindi', 'id_proof_type', 'id_proof_no',

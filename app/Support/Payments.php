@@ -61,7 +61,7 @@ class Payments
             'purpose' => 'registration',
             'direct_registration_id' => $reg->id,
             'academic_year' => $reg->session_year ?? null,
-            'semester_no' => 1,
+            'semester_no' => (int) ($reg->semester_no ?? 1),
         ];
     }
 

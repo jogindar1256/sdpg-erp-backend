@@ -2436,7 +2436,7 @@ class ApplicationController extends Controller
         ];
     }
 
-    private function computeApplicationFee(object $sa): array
+    public function computeApplicationFee(object $sa): array
     {
         // Fee Structure → Exam Mode: "Regular" for admissions, "Upgrade" for
         // semester-upgrade applications (no fallback to Regular — a missing

@@ -521,7 +521,8 @@ class RegistrationController extends Controller
 
         $dashRegPaid = Payments::latestPaidRegistrationPayments();
 
-        $reg = DB::table('direct_registrations as dr')
+        // Every registration of this student (semester 1 + one per later semester).
+        $rows = DB::table('direct_registrations as dr')
             ->leftJoin('programs as p', 'p.id', '=', 'dr.program_id')
             ->leftJoinSub($dashRegPaid, 'drp', 'drp.direct_registration_id', '=', 'dr.id')
             ->leftJoin('payments as drpay', 'drpay.id', '=', 'drp.id')
@@ -534,45 +535,76 @@ class RegistrationController extends Controller
             ->whereNull('dr.deleted_at')
             ->orderByDesc('dr.id')
             ->select(
-                'dr.id as registration_id',
-                'dr.registration_no',
-                'dr.reg_type',
-                'dr.name',
-                'dr.father_name',
-                'dr.dob',
-                'dr.session_year as session',
-                'dr.status',
+                'dr.id as registration_id', 'dr.registration_no', 'dr.reg_type', 'dr.name', 'dr.father_name', 'dr.dob',
+                'dr.session_year as session', 'dr.status', 'dr.semester_no', 'dr.reg_group_id', 'dr.fee_amount',
                 DB::raw("CASE WHEN drpay.id IS NOT NULL THEN 'paid' ELSE 'pending' END as payment_status"),
-                'drpay.paid_at as paid_at',
-                'dr.reg_date',
-                'drpay.receipt_no as receipt_no',
-                'dr.updated_at',
-                'dr.program_id',
-                'p.short_name as course',
-                'p.full_name as program_name'
+                'drpay.paid_at as paid_at', 'dr.reg_date', 'drpay.receipt_no as receipt_no', 'dr.updated_at',
+                'dr.program_id', 'p.short_name as course', 'p.full_name as program_name'
             )
-            ->first();
+            ->get();
 
-        if (!$reg) {
+        if ($rows->isEmpty()) {
             return response()->json(['data' => null]);
         }
 
-        // Fresh registration is semester 1; use the latest admission if the
-        // student has already progressed beyond registration.
+        // The latest registration's group = the registrations shown, oldest semester first.
+        $latest = $rows->first();
+        $groupId = (int) ($latest->reg_group_id ?: $latest->registration_id);
+        $group = $rows->filter(fn($r) => (int) ($r->reg_group_id ?: $r->registration_id) === $groupId)
+            ->sortBy([['semester_no', 'asc'], ['registration_id', 'asc']])->values();
+        $reg = $group->first(); // identity card source = the semester-1 / first registration
+
         $semester = 1;
         $student = Student::flat(DB::table('students')->where('user_id', $user->id)->first());
         if ($student) {
-            $adm = DB::table('admissions')->where('student_id', $student->id)
+            $adm = DB::table('admissions')->where('student_id', $student->id)->where('status', 'active')
                 ->orderByDesc('id')->first();
             if ($adm) {
-                $semester = $adm->semester_no;
+                $semester = (int) $adm->semester_no;
             }
         }
 
-        // Same fix as registrationStatus() above — 'registered' is the real
-        // completion status, not merely "not incomplete".
-        $regComplete = $reg->status === 'registered';
-        $feePaid = $reg->payment_status === 'paid';
+        $registrations = $group->map(function ($r) {
+            $paid = $r->payment_status === 'paid';
+            $free = (float) $r->fee_amount <= 0;
+            $complete = $r->status === 'registered';
+            return [
+                'registration_id' => (int) $r->registration_id,
+                'registration_no' => $r->registration_no,
+                'semester' => (int) ($r->semester_no ?: 1),
+                'session' => $r->session,
+                'status' => $r->status,
+                'reg_complete' => $complete,
+                'fee' => (float) $r->fee_amount,
+                'free' => $free,
+                // A zero-fee registration has nothing to pay: "paid" once it is registered.
+                'reg_fee_paid' => $paid || ($free && $complete),
+                'payment_status' => $paid ? 'paid' : 'pending',
+                'receipt_available' => $paid && !empty($r->receipt_no),
+                'receipt_no' => $r->receipt_no,
+                'slip_available' => $complete && ($paid || $free),
+                'reg_date' => $r->reg_date,
+                'paid_at' => $paid ? $r->paid_at : null,
+                'updated_at' => $r->updated_at,
+                // Semester registrations copy the verified identity — only the original is editable, and only until paid.
+                'can_edit' => (int) ($r->semester_no ?: 1) === 1 && !$paid,
+                'cancelled' => $r->status === 'cancelled',
+            ];
+        })->values()->all();
+
+        // The next semester's registration, if the upgrade rules allow it (or the reason it is closed).
+        $upgrade = null;
+        try {
+            $ctx = app(\App\Http\Controllers\Api\UpgradeController::class)->studentContext($req)->getData(true);
+            if (!empty($ctx['target_semester'])) {
+                $upgrade = array_intersect_key($ctx, array_flip([
+                    'eligible', 'reason', 'target_semester', 'course_year', 'program', 'form_type', 'window',
+                    'pay_before_approval', 'registration', 'registration_gate', 'registration_preview', 'registration_fee', 'form_open',
+                ]));
+            }
+        } catch (\Throwable $e) {
+            report($e);
+        }
 
         return response()->json([
             'data' => [
@@ -587,16 +619,9 @@ class RegistrationController extends Controller
                 'program_name' => $reg->program_name,
                 'semester' => $semester,
                 'session' => $reg->session,
-                'status' => $reg->status,
-                'payment_status' => $reg->payment_status,
-                'reg_complete' => $regComplete,
-                'reg_fee_paid' => $feePaid,
-                'receipt_available' => $feePaid && !empty($reg->receipt_no),
-                'receipt_no' => $reg->receipt_no,
-                'reg_date' => $reg->reg_date,
-                'paid_at' => $reg->paid_at,
-                'updated_at' => $reg->updated_at,
-            ] + \App\Support\StudentSemesters::cards($user, $reg->program_id ? (int) $reg->program_id : null),
+                'registrations' => $registrations,
+                'upgrade' => $upgrade,
+            ],
         ]);
     }
 }
