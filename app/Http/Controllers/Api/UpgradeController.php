@@ -414,8 +414,9 @@ class UpgradeController extends Controller
             'late_fee_applicable' => (bool) ($sched->late_fee_applicable ?? false),
             'late_fee' => (float) ($sched->late_fee ?? 0),
         ];
-        // Student: only inside the window. Office: any semester that has a schedule row.
-        $windowOk = $mode === 'college' ? (bool) $sched : $state === 'open';
+        // Student: only inside the window. Office: may proceed without / outside it (the form shows a
+        // "semester upgrade is not started" notice first) — `window.state` tells the form which case it is.
+        $windowOk = $mode === 'college' ? true : $state === 'open';
         if (!$windowOk) {
             $out['reason'] = match (true) {
                 $state === 'not_scheduled' => "No Admission Schedule is set for semester {$sem}, session {$session}.",

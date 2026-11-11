@@ -2438,9 +2438,10 @@ class ApplicationController extends Controller
 
     public function computeApplicationFee(object $sa): array
     {
-        // Fee Structure → Exam Mode: "Regular" for admissions, "Upgrade" for
-        // semester-upgrade applications (no fallback to Regular — a missing
-        // Upgrade structure must show as not configured, not as a wrong fee).
+        // Fee Structure lookup is fixed per application type (no fallback between types):
+        //   admission         -> Exam Mode "Regular"
+        //   semester upgrade  -> Exam Mode "Upgrade"
+        // Misc-term particulars are read from the same Exam Mode.
         $admissionType = ($sa->application_type ?? 'regular') === 'semester_upgrade' ? 'upgrade' : 'regular';
         [$gender, $category] = $this->feeGenderCategory($sa->student_id, $sa);
         // A first-time 'regular' admission has no semester_no on the row — it is semester 1.
@@ -2594,6 +2595,21 @@ class ApplicationController extends Controller
             : array_map('intval', Part6Rules::subjectSlots($part6));
         if (!$subjectIds) {
             return [];
+        }
+
+        // Semester upgrade: a practical fee is charged only for a subject that has a Practical
+        // paper configured for this course, session and semester (Course → Subject Papers).
+        if (($sa->application_type ?? null) === 'semester_upgrade') {
+            $subjectIds = DB::table('subject_papers')
+                ->where('program_id', $sa->program_id)
+                ->where('session_year', $sa->academic_year)
+                ->where('semester_no', (string) max(1, (int) $sa->semester_no))
+                ->whereRaw("LOWER(paper_type) = 'practical'")
+                ->whereIn('subject_id', $subjectIds)
+                ->pluck('subject_id')->map(fn($v) => (int) $v)->unique()->values()->all();
+            if (!$subjectIds) {
+                return [];
+            }
         }
 
         // The chosen subjects are already validated against the course at registration
@@ -3659,6 +3675,9 @@ class ApplicationController extends Controller
                     ->orWhere('dr.user_id', $userId);
             })
             ->whereNull('sa.deleted_at')
+            // A 'regular' application hanging off a semester 2..n registration is invalid (those are upgrades).
+            ->where(fn($q) => $q->where('sa.application_type', '!=', 'regular')
+                ->orWhereNull('dr.semester_no')->orWhere('dr.semester_no', '<=', 1))
             ->when($typeFilter, fn($q) => $q->where('sa.application_type', $typeFilter))
             ->select([
                 'sa.id',

@@ -37,27 +37,29 @@ class RegistrationController extends Controller
         // every session's history.
         $sessionRegIds = DB::table('direct_registrations')->select('id')
             ->where('session_year', $sessionYear)->whereNull('deleted_at');
-        $sessionStudentIds = DB::table('students')->select('id')
-            ->whereIn('user_id', DB::table('direct_registrations')->select('user_id')
-                ->where('session_year', $sessionYear)->whereNull('deleted_at')->whereNotNull('user_id'));
-
+        // A semester (2..n) registration is only ever applied for through the Semester Upgrade form —
+        // a 'regular' application hanging off one is invalid and must not mask the real application.
         $latestApp = DB::table('student_applications')
             ->select('direct_registration_id', DB::raw('MAX(id) as sa_id'))
             ->whereIn('direct_registration_id', $sessionRegIds)
             ->whereNull('deleted_at')
+            ->whereRaw("NOT (application_type = 'regular' AND direct_registration_id IN (SELECT id FROM direct_registrations WHERE semester_no > 1))")
             ->groupBy('direct_registration_id');
 
-        // Latest admission per student
+        // Latest admission PER APPLICATION (not per student: a student has one admission per semester,
+        // and every semester row must show its own receipt, not the student's latest one).
+        $sessionAppIds = DB::table('student_applications')->select('id')
+            ->whereIn('direct_registration_id', $sessionRegIds)->whereNull('deleted_at');
         $latestAdm = DB::table('admissions')
-            ->select('student_id', DB::raw('MAX(id) as adm_id'))
-            ->whereIn('student_id', $sessionStudentIds)
+            ->select('application_id', DB::raw('MAX(id) as adm_id'))
+            ->whereIn('application_id', $sessionAppIds)
             ->whereNull('deleted_at')
-            ->groupBy('student_id');
+            ->groupBy('application_id');
 
         // Latest active fee receipt per admission ("Educational Receipt")
         $latestRcpt = DB::table('fee_receipts')
             ->select('admission_id', DB::raw('MAX(id) as fr_id'))
-            ->whereIn('admission_id', DB::table('admissions')->select('id')->whereIn('student_id', $sessionStudentIds))
+            ->whereIn('admission_id', DB::table('admissions')->select('id')->whereIn('application_id', $sessionAppIds))
             ->where('status', 'active')
             ->groupBy('admission_id');
 
@@ -93,10 +95,9 @@ class RegistrationController extends Controller
 
         $inner = DB::table('direct_registrations as dr')
             ->leftJoin('programs as p', 'p.id', 'dr.program_id')
-            ->leftJoin('students as s', 's.user_id', '=', 'dr.user_id')
             ->leftJoinSub($latestApp, 'la', 'la.direct_registration_id', '=', 'dr.id')
             ->leftJoin('student_applications as sa', 'sa.id', '=', 'la.sa_id')
-            ->leftJoinSub($latestAdm, 'lad', 'lad.student_id', '=', 's.id')
+            ->leftJoinSub($latestAdm, 'lad', 'lad.application_id', '=', 'sa.id')
             ->leftJoin('admissions as adm', 'adm.id', '=', 'lad.adm_id')
             ->leftJoinSub($latestRcpt, 'lr', 'lr.admission_id', '=', 'adm.id')
             ->leftJoin('fee_receipts as fr', 'fr.id', '=', 'lr.fr_id')
@@ -120,6 +121,7 @@ class RegistrationController extends Controller
                 'dr.id',
                 'dr.registration_no',
                 'dr.reg_type',
+                'dr.semester_no',
                 'dr.name',
                 'dr.father_name',
                 'dr.mobile',

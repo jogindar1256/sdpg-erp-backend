@@ -546,6 +546,14 @@ class StudentRegistrationController extends Controller
         if (!$reg->program_id) {
             return response()->json(['message' => 'This registration has no program/class set — cannot start an application.'], 422);
         }
+        // Semester 2..n registrations are applied for through the Semester Upgrade form, never as a fresh admission.
+        if ((int) ($reg->semester_no ?? 1) > 1) {
+            return response()->json([
+                'message' => 'This is a semester ' . (int) $reg->semester_no . ' registration — use the Semester Upgrade form.',
+                'upgrade' => true,
+                'semester_no' => (int) $reg->semester_no,
+            ], 422);
+        }
 
         // Repair a missing unique_code in place, right here, the moment the
         // office actually tries to use this registration. Legacy rows from
